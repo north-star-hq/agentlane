@@ -2,6 +2,12 @@
 
 Newest first.
 
+## Unreleased
+
+### Changed
+
+- **`init` in a terminal is a proper TUI.** It asks which agents you use with an arrow-key picker (space toggles, Enter confirms), with the agents it found checked and the file that gave each away beside it. It shows the files it wrote with skills grouped by folder, streams the package manager's output inside the frame while it adds agentlane and collapses it when that succeeds, and ends with each agent's next step. Output that isn't a terminal, such as an agent or CI running `init`, is unchanged.
+
 ## 0.4.0
 
 ### New

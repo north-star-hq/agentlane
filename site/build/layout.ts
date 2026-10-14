@@ -176,6 +176,7 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
     })
     .join('');
   const recent = releases
+    .filter(r => r.version !== 'Unreleased')
     .slice(0, 2)
     .map(
       r =>

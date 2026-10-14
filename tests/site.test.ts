@@ -126,7 +126,7 @@ describe('the docs site', () => {
     });
 
     test('finds a link to an anchor the target page lacks', () => {
-      const problems = plant('index.html', html => html.replace('href="changelog.html#0-3-0"', 'href="changelog.html#9-9-9"'));
+      const problems = plant('index.html', html => html.replace(/href="changelog\.html#[^"]+"/, 'href="changelog.html#9-9-9"'));
       assert.deepEqual(problems, ["index.html: changelog.html#9-9-9 points at an id changelog.html doesn't have"]);
     });
 

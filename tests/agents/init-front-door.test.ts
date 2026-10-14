@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { stripVTControlCharacters } from 'node:util';
 import { test } from 'node:test';
 import { runAgentCommand } from '../../src/agents/cli.ts';
 import type { Terminal } from '../../src/agents/detect.ts';
@@ -182,60 +183,69 @@ test('with no agent found and no terminal, init exits 2, says so and names --age
   }
 });
 
-function fakeTerminal(answers: string[]): { terminal: Terminal; shown: () => string } {
+const KEY = { down: '\x1b[B', space: ' ', enter: '\r', interrupt: '\x03' };
+
+function fakeTerminal(keys: string[]): { terminal: Terminal; shown: () => string } {
   const input = new PassThrough();
   const output = new PassThrough();
   let shown = '';
+  let typing = false;
   output.on('data', (chunk: Buffer) => {
     shown += chunk.toString();
-    if (shown.endsWith(': ')) {
-      const answer = answers.shift();
-      if (answer === undefined) input.end();
-      else input.write(`${answer}\n`);
-    }
+    if (typing || !shown.includes('Which agents do you use in this project?')) return;
+    typing = true;
+    const type = () => {
+      const key = keys.shift();
+      if (key === undefined) return;
+      input.write(key);
+      setTimeout(type, 20);
+    };
+    setTimeout(type, 20);
   });
-  return { terminal: { input, output }, shown: () => shown };
+  return { terminal: { input, output }, shown: () => stripVTControlCharacters(shown) };
 }
 
-test('in a terminal, init shows every agent with the ones it found checked, and takes Enter, numbers or names', async () => {
+test('in a terminal, init offers every agent with the ones it found checked; Enter takes them, arrows and space change them', async () => {
   const p = project({ 'package.json': PACKAGE, 'GEMINI.md': '# app\n' });
   try {
-    const accept = fakeTerminal(['']);
+    const accept = fakeTerminal([KEY.enter]);
     const accepted = await init(p, [], { terminal: accept.terminal });
     assert.equal(accepted.code, 0, accepted.stderr);
-    assert.match(
-      accept.shown(),
-      /^Which agents do you use in this project\?\n {2}1\. \[ \] claude\n {2}2\. \[ \] codex\n {2}3\. \[ \] cursor\n {2}4\. \[ \] copilot\n {2}5\. \[x\] gemini {7}GEMINI\.md\n {2}6\. \[ \] antigravity\nPress Enter to wire gemini, or type the numbers or names to wire instead \(such as 1,3 or claude,codex\): $/,
-    );
-    assert.match(accepted.stdout, /agentlane init in .+ for gemini:/);
+    const menu = accept.shown();
+    for (const name of ['Claude Code', 'Codex', 'Cursor', 'GitHub Copilot', 'Gemini CLI (GEMINI.md)', 'Antigravity'])
+      assert.ok(menu.includes(name), `${name} in ${menu}`);
+    assert.match(menu, /Wrote the files for Gemini CLI/);
+    assert.match(menu, /Added agentlane@[^ ]+ to package\.json with npm/);
+    assert.match(menu, /Then ask your agent: "Set this project up with agentlane\."/);
+    assert.equal(accepted.stdout, '');
 
-    const change = fakeTerminal(['kiro', '2, cursor']);
+    const keys = [KEY.down, KEY.space, KEY.down, KEY.space, KEY.down, KEY.down, KEY.space, KEY.enter];
+    const change = fakeTerminal(keys);
     const changed = await init(p, [], { terminal: change.terminal });
     assert.equal(changed.code, 0, changed.stderr);
-    assert.match(change.shown(), /'kiro' is not one of the agents above\.\nPress Enter to wire gemini/);
-    assert.match(changed.stdout, /agentlane init in .+ for codex, cursor:/);
+    assert.match(change.shown(), /the files for Codex, Cursor/);
+    assert.ok(fs.existsSync(path.join(p.dir, '.codex')));
+    assert.ok(fs.existsSync(path.join(p.dir, '.cursor')));
   } finally {
     p.cleanup();
   }
 });
 
-test('in a terminal with nothing found, Enter alone asks again, and closing the input wires nothing', async () => {
+test('in a terminal with nothing found, Enter alone asks for an agent, and Ctrl-C wires nothing', async () => {
   const p = project({ 'package.json': PACKAGE });
   try {
-    const none = fakeTerminal(['', '1']);
+    const none = fakeTerminal([KEY.enter, KEY.space, KEY.enter]);
     const run = await init(p, [], { terminal: none.terminal });
     assert.equal(run.code, 0, run.stderr);
-    assert.match(
-      none.shown(),
-      /Type the numbers or names of the agents to wire .*: Nothing is checked, so name at least one agent\./,
-    );
-    assert.match(run.stdout, /for claude:/);
+    assert.match(none.shown(), /Please select at least one option/);
+    assert.match(none.shown(), /the files for Claude Code/);
 
     const q = project({ 'package.json': PACKAGE });
     try {
-      const closed = await init(q, [], { terminal: fakeTerminal([]).terminal });
+      const stopped = fakeTerminal([KEY.interrupt]);
+      const closed = await init(q, [], { terminal: stopped.terminal });
       assert.equal(closed.code, 2);
-      assert.match(closed.stderr, /no agents chosen, so init wrote nothing/);
+      assert.match(stopped.shown(), /No agents chosen, so init wrote nothing\./);
       assert.deepEqual(fs.readdirSync(q.dir).sort(), ['.git', 'package.json']);
     } finally {
       q.cleanup();
@@ -244,7 +254,6 @@ test('in a terminal with nothing found, Enter alone asks again, and closing the 
     p.cleanup();
   }
 });
-
 test('each package manager gets its own add command, from the packageManager field, a lockfile, or what ran init', () => {
   const cases: { files: Record<string, string>; env?: NodeJS.ProcessEnv; expected: string }[] = [
     { files: { 'pnpm-lock.yaml': '' }, expected: 'pnpm add --save-dev agentlane@1.2.3' },

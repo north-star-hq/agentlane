@@ -13,10 +13,12 @@ import { commandUsage, groupUsage, type UsageGroup } from '../usage.ts';
 import type { PluginSource } from './claude-plugin.ts';
 import { describePluginSource } from './claude-plugin.ts';
 import type { Terminal } from './detect.ts';
-import { chooseAgents, describeDetections, detectAgents } from './detect.ts';
+import { describeDetections, detectAgents } from './detect.ts';
 import type { FilePlan, InitPlan } from './init.ts';
 import { applyInit, planInit } from './init.ts';
-import type { Installer } from './package.ts';
+import type { InitScreen, InstallStep } from './init-screen.ts';
+import { terminalScreen } from './init-screen.ts';
+import type { InstallResult, Installer } from './package.ts';
 import {
   addCommand,
   installedVersion,
@@ -108,16 +110,20 @@ function parseAgents(raw: string, all: boolean): Agent[] {
   return AGENTS.filter(agent => names.includes(agent));
 }
 
-async function agentsToWire(values: { agents?: string; all: boolean }, root: string, deps: AgentCliDeps): Promise<Agent[]> {
-  if (values.agents !== undefined) return parseAgents(values.agents, values.all);
-  if (values.all) return [...AGENTS];
+async function agentsToWire(
+  values: { agents?: string; all: boolean },
+  root: string,
+  deps: AgentCliDeps,
+  screen: InitScreen | null,
+): Promise<Agent[] | null> {
+  if (values.agents !== undefined || values.all) {
+    const agents = values.agents !== undefined ? parseAgents(values.agents, values.all) : [...AGENTS];
+    screen?.wiring(agents);
+    return agents;
+  }
   const detected = detectAgents(root, deps.env);
   const choose = `pass --agents with the ones you use (${AGENTS.join(',')}), or --all`;
-  if (deps.terminal) {
-    const chosen = await chooseAgents(detected, deps.terminal);
-    if (chosen === null) throw new UsageError('no agents chosen, so init wrote nothing', choose);
-    return chosen;
-  }
+  if (screen) return screen.chooseAgents(detected);
   if (detected.length === 0)
     throw new UsageError(
       `found no agent's files in ${root} and no agent's variable in this shell, so init doesn't know which agents to wire`,
@@ -129,6 +135,7 @@ async function agentsToWire(values: { agents?: string; all: boolean }, root: str
 
 interface PackageOutcome {
   notes: string[];
+  added: string | null;
   failed: { command: string; dir: string; problem: string } | null;
 }
 
@@ -136,7 +143,12 @@ function ignoredByGit(dir: string, name: string): boolean {
   return spawnSync('git', ['-C', dir, 'check-ignore', '-q', name]).status === 0;
 }
 
-function provideToolkit(root: string, env: NodeJS.ProcessEnv, install: Installer): PackageOutcome {
+async function provideToolkit(
+  root: string,
+  env: NodeJS.ProcessEnv,
+  installer: Installer,
+  present: (step: InstallStep) => Promise<InstallResult>,
+): Promise<PackageOutcome> {
   const top = resolveFolder(root).worktree;
   const own = toolVersion();
   const override = env[PACKAGE_SPEC_ENV];
@@ -159,19 +171,21 @@ function provideToolkit(root: string, env: NodeJS.ProcessEnv, install: Installer
         notes.push(
           `${manifest} lists ${TOOL} ${range}, with ${installed} installed; init left it as it is. This init is ${own}: ${shellLine(addCommand(choice, dir, `${TOOL}@${own}`))} moves the project to it.`,
         );
-      return { notes, failed: null };
+      return { notes, added: null, failed: null };
     }
   } else {
     fs.writeFileSync(path.join(dir, 'package.json'), '{\n  "private": true\n}\n');
     notes.push(`Created ${manifest}, private, to hold ${TOOL} as a dev dependency.`);
     if (!ignoredByGit(dir, 'node_modules')) notes.push('node_modules/ is not in .gitignore: add it before you commit.');
   }
-  const result = install(command, dir);
-  if (!result.ok) return { notes, failed: { command: shellLine(command), dir, problem: result.problem } };
-  notes.push(
-    `Added ${spec} to ${manifest} as a dev dependency with ${choice.manager}, because ${choice.source}: ${shellLine(command)}`,
-  );
-  return { notes, failed: null };
+  const result = await present({
+    title: `Adding ${spec} with ${choice.manager}`,
+    done: `Added ${spec} to ${manifest} with ${choice.manager}`,
+    run: onOutput => installer(command, dir, onOutput),
+  });
+  if (!result.ok) return { notes, added: null, failed: { command: shellLine(command), dir, problem: result.problem } };
+  const added = `Added ${spec} to ${manifest} as a dev dependency with ${choice.manager}, because ${choice.source}: ${shellLine(command)}`;
+  return { notes, added, failed: null };
 }
 
 function projectRoot(cwd: string, dir: string | undefined): string {
@@ -222,26 +236,54 @@ async function init(args: string[], deps: AgentCliDeps): Promise<number> {
     },
   });
   const root = projectRoot(deps.cwd, values.dir);
-  const agents = await agentsToWire(values, root, deps);
+  const screen = deps.terminal ? terminalScreen(deps.terminal) : null;
+  const agents = await agentsToWire(values, root, deps, screen);
+  if (agents === null) {
+    screen?.stop('No agents chosen, so init wrote nothing.');
+    return 2;
+  }
   const plan = planInit(root, agents, listSkills(deps.skillsDir ?? SKILLS_DIR), deps.env);
-  deps.stdout(report(plan, values.check));
+  if (screen) screen.files(plan, values.check);
+  else deps.stdout(report(plan, values.check));
   const refusals = plan.files.filter(f => f.status === 'refused');
   if (refusals.length > 0) {
-    for (const file of refusals) deps.stderr(`${TOOL} init: ${file.reason ?? file.file}\n`);
-    deps.stderr(
-      `${TOOL} init: wrote nothing; fix ${refusals.length === 1 ? 'that file' : 'those files'} and run ${CLI} init again\n`,
-    );
+    if (screen) screen.refused(refusals);
+    else {
+      for (const file of refusals) deps.stderr(`${TOOL} init: ${file.reason ?? file.file}\n`);
+      deps.stderr(
+        `${TOOL} init: wrote nothing; fix ${refusals.length === 1 ? 'that file' : 'those files'} and run ${CLI} init again\n`,
+      );
+    }
     return 1;
   }
   const changes = plan.files.filter(f => f.status === 'create' || f.status === 'update' || f.status === 'remove');
   if (values.check) {
-    if (changes.length > 0) deps.stderr(`${TOOL} init --check: ${String(changes.length)} file(s) would change\n`);
+    if (screen) screen.checked(changes.length);
+    else if (changes.length > 0) deps.stderr(`${TOOL} init --check: ${String(changes.length)} file(s) would change\n`);
     return changes.length > 0 ? 1 : 0;
   }
   const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[:.]/g, '-');
   const { backups } = applyInit(plan, path.join(stateDir(deps.env), 'init-backups', `${stamp}-${path.basename(root)}`));
-  const toolkit = provideToolkit(root, deps.env, deps.install);
+  const toolkit = await provideToolkit(
+    root,
+    deps.env,
+    deps.install,
+    screen ? step => screen.install(step) : step => step.run(deps.stderr),
+  );
+  const askForSetup = findConfigFile(root) === null;
+  if (screen) {
+    screen.end({
+      notes: toolkit.notes,
+      backups: backups ?? null,
+      changed: changes.length > 0,
+      next: agents.map(agent => ({ agent, text: NEXT[agent](plan.claudePlugin) })),
+      askForSetup,
+      failed: toolkit.failed,
+    });
+    return toolkit.failed === null ? 0 : 1;
+  }
   const out: string[] = [...toolkit.notes];
+  if (toolkit.added) out.push(toolkit.added);
   if (backups) out.push(`Backed up the files it changed in ${backups}.`);
   if (changes.length > 0)
     out.push(
@@ -250,8 +292,7 @@ async function init(args: string[], deps: AgentCliDeps): Promise<number> {
   else out.push('Nothing to change.');
   out.push('Next:');
   for (const agent of agents) out.push(`  ${agent}: ${NEXT[agent](plan.claudePlugin)}.`);
-  if (findConfigFile(root) === null)
-    out.push(`Then ask your agent: "Set this project up with ${TOOL}." Its setup skill writes ${CONFIG_FILE}.`);
+  if (askForSetup) out.push(`Then ask your agent: "Set this project up with ${TOOL}." Its setup skill writes ${CONFIG_FILE}.`);
   deps.stdout(`${out.join('\n')}\n`);
   if (toolkit.failed === null) return 0;
   const { command, dir, problem } = toolkit.failed;

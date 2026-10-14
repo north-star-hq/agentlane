@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { envName, TOOL } from '../name.ts';
@@ -14,7 +14,9 @@ export interface InstallCommand {
   args: string[];
 }
 
-export type Installer = (command: InstallCommand, cwd: string) => { ok: true } | { ok: false; problem: string };
+export type InstallResult = { ok: true } | { ok: false; problem: string };
+
+export type Installer = (command: InstallCommand, cwd: string, onOutput: (text: string) => void) => Promise<InstallResult>;
 
 const LOCKFILES: [string, PackageManager][] = [
   ['pnpm-lock.yaml', 'pnpm'],
@@ -136,10 +138,20 @@ export function installedVersion(packageDir: string): string | null {
   return typeof version === 'string' ? version : null;
 }
 
-export const realInstaller: Installer = (command, cwd) => {
-  const result = spawnSync(command.program, command.args, { cwd, stdio: ['ignore', process.stderr, process.stderr] });
-  if (result.error) return { ok: false, problem: result.error.message };
-  if (result.status !== 0)
-    return { ok: false, problem: result.signal ? `killed by ${result.signal}` : `exit ${String(result.status)}` };
-  return { ok: true };
-};
+export const realInstaller: Installer = (command, cwd, onOutput) =>
+  new Promise(resolve => {
+    const child = spawn(command.program, command.args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', (chunk: Buffer) => {
+      onOutput(chunk.toString());
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      onOutput(chunk.toString());
+    });
+    child.on('error', error => {
+      resolve({ ok: false, problem: error.message });
+    });
+    child.on('close', (code, signal) => {
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, problem: signal ? `killed by ${signal}` : `exit ${String(code)}` });
+    });
+  });
