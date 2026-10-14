@@ -91,6 +91,14 @@ test('parseStatusBar reads the fields simctl status_bar list prints', () => {
   assert.equal(statusBarPinned({ ...fields, Time: '10:12' }), false);
 });
 
+test('the pinned time counts with or without its leading zero, as different Macs read it back', () => {
+  const fields = parseStatusBar(STATUS_BAR_PINNED.replace('Time: 09:41', 'Time: 9:41'));
+  assert.equal(fields.Time, '9:41');
+  assert.equal(statusBarPinned(fields), true);
+  assert.equal(statusBarPinned({ ...fields, Time: '19:41' }), false);
+  assert.equal(statusBarPinned({ ...fields, Time: '9:42' }), false);
+});
+
 test('parseLogTimestamp reads log show timestamps with microseconds and an offset', () => {
   assert.equal(parseLogTimestamp('2026-10-11 21:37:48.741979-0400')?.toISOString(), '2026-10-12T01:37:48.741Z');
   assert.equal(parseLogTimestamp('2026-10-11 21:37:48+0000')?.toISOString(), '2026-10-11T21:37:48.000Z');

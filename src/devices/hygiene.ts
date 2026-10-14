@@ -118,8 +118,16 @@ export function sameCoordinate(a: Coordinate | undefined, b: Coordinate): boolea
   );
 }
 
+/** simctl reads the pinned time back as `09:41` on some Macs and `9:41` on others. */
+function sameField(key: string, got: string | undefined, wanted: string): boolean {
+  if (key !== 'Time') return got === wanted;
+  return got?.replace(/^0(?=\d:)/, '') === wanted.replace(/^0(?=\d:)/, '');
+}
+
 export function statusBarPinned(fields: StatusBarFields | undefined): boolean {
-  return fields !== undefined && Object.entries(STATUS_BAR_PIN_FIELDS).every(([key, value]) => fields[key] === value);
+  return (
+    fields !== undefined && Object.entries(STATUS_BAR_PIN_FIELDS).every(([key, value]) => sameField(key, fields[key], value))
+  );
 }
 
 function formatStatusBar(fields: StatusBarFields | undefined): string {

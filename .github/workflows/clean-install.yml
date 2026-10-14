@@ -56,5 +56,5 @@ jobs:
           name: clean-install-${{ matrix.platform }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/clean-install/
-            ~/.local/state/agentlane/claims/
+            ~/.local/state/agentlane/lanes/
           if-no-files-found: ignore

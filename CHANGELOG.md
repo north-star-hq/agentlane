@@ -11,6 +11,7 @@ Newest first.
 
 ### Fixed
 
+- `up` and `doctor` no longer fail capture hygiene on a Mac where the simulator reads its pinned status-bar time back as `9:41`. They accepted only `09:41`, which is how some Macs print it.
 - `init` no longer lists 0.2.x's `.github/hooks/agent-env.json` as `unchanged` in a project that doesn't have it. It lists that file only when it changes or removes it.
 - Under `exec` and in the signin hook, `maestro` is the lane's own Maestro, or it prints why the lane has none and exits 2. A lane whose `agentlane.json` was invalid or had no `driver` block, or that held no running simulator or emulator, ran whatever `maestro` came first on PATH, unbound to the lane's device, after one warning that named only the file. The message now gives the config's problems, or what is missing and how to add it. A project that ran its own Maestro under `exec` without a `driver` block adds `"driver": {}` to `agentlane.json`.
 - The lane's `maestro` refuses `maestro mcp`, which takes its device from each tool call, so the lane can't bind it to its device. The lane's MCP server is `node_modules/.bin/agentlane mcp`.
