@@ -2,13 +2,14 @@
 
 The mark is three lanes leaning forward on a dark tile. The middle one, lit in road-marking yellow, is the lane your agent holds.
 
-| File               | Use                                                                         |
-| ------------------ | --------------------------------------------------------------------------- |
-| `mark.svg`         | The mark alone: favicon, avatar, plugin icon. Holds at 16 px.               |
-| `mark-mono.svg`    | One-colour mark, for places that take a single colour.                      |
-| `lockup-light.svg` | Mark and wordmark on a light background.                                    |
-| `lockup-dark.svg`  | Mark and wordmark on a dark background. Its background is transparent.      |
-| `tokens.css`       | Colour and type tokens for light and dark themes, as CSS custom properties. |
+| File                 | Use                                                                         |
+| -------------------- | --------------------------------------------------------------------------- |
+| `mark.svg`           | The mark alone: favicon, avatar, plugin icon. Holds at 16 px.               |
+| `mark-mono.svg`      | One-colour mark, for places that take a single colour.                      |
+| `lockup-light.svg`   | Mark and wordmark on a light background.                                    |
+| `lockup-dark.svg`    | Mark and wordmark on a dark background. Its background is transparent.      |
+| `social-preview.png` | The 1280×640 card GitHub shows when the repository's link is shared.        |
+| `tokens.css`         | Colour and type tokens for light and dark themes, as CSS custom properties. |
 
 The wordmark is set in Overpass ExtraBold and converted to outlines, so the SVGs need no font installed. The name is always written lowercase: agentlane.
 
