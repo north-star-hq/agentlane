@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:32:34 -0400
+Subject: [PATCH] Remove the update check
+
+At startup the CLI asked api.copilot.mobile.dev for the latest version,
+whatever MAESTRO_DISABLE_UPDATE_CHECK said: the variable only hid the
+notice. The changelog fetch from raw.githubusercontent.com went with it.
+Both are gone, along with ApiClient.getLatestCliVersion and
+ChangeLogUtils.fetchContent.
+---
+ maestro-cli/src/main/java/maestro/cli/App.kt  | 22 -----
+ .../main/java/maestro/cli/api/ApiClient.kt    | 24 -----
+ .../main/java/maestro/cli/update/Updates.kt   | 96 -------------------
+ .../java/maestro/cli/util/ChangeLogUtils.kt   |  9 --
+ .../main/java/maestro/cli/util/EnvUtils.kt    |  3 +-
+ 5 files changed, 1 insertion(+), 153 deletions(-)
+ delete mode 100644 maestro-cli/src/main/java/maestro/cli/update/Updates.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/App.kt b/maestro-cli/src/main/java/maestro/cli/App.kt
+index 2d621e4..49e621e 100644
+--- a/maestro-cli/src/main/java/maestro/cli/App.kt
++++ b/maestro-cli/src/main/java/maestro/cli/App.kt
+@@ -42,10 +42,7 @@ import maestro.cli.command.StudioCommand
+ import maestro.cli.command.TestCommand
+ import maestro.cli.insights.TestAnalysisManager
+ import maestro.cli.mcp.claimMcpStdout
+-import maestro.cli.update.Updates
+-import maestro.cli.util.ChangeLogUtils
+ import maestro.cli.util.ErrorReporter
+-import maestro.cli.view.box
+ import maestro.debuglog.DebugLogStore
+ import maestro.debuglog.LogConfig
+ import picocli.AutoComplete.GenerateCompletion
+@@ -142,7 +139,6 @@ fun main(args: Array<String>) {
+         Analytics.warnAndEnableAnalyticsIfNotDisable()
+ 
+         Dependencies.install()
+-        Updates.fetchUpdatesAsync()
+ 
+         val commandLine = CommandLine(App())
+             .setUsageHelpWidth(160)
+@@ -186,24 +182,6 @@ fun main(args: Array<String>) {
+         DebugLogStore.finalizeRun()
+         TestAnalysisManager.maybeNotify()
+ 
+-        val newVersion = Updates.checkForUpdates()
+-        if (newVersion != null) {
+-            Updates.fetchChangelogAsync()
+-            System.err.println()
+-            val changelog = Updates.getChangelog()
+-            val anchor = newVersion.toString().replace(".", "")
+-            System.err.println(
+-                listOf(
+-                    "A new version of the Maestro CLI is available ($newVersion).\n",
+-                    "See what's new:",
+-                    "https://github.com/mobile-dev-inc/maestro/blob/main/CHANGELOG.md#$anchor",
+-                    ChangeLogUtils.print(changelog),
+-                    "Upgrade command:",
+-                    "curl -Ls \"https://get.maestro.mobile.dev\" | bash",
+-                ).joinToString("\n").box()
+-            )
+-        }
+-
+         if (commandLine.isVersionHelpRequested) {
+             printVersion()
+             Analytics.close()
+diff --git a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+index 431b024..1f1573c 100644
+--- a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
++++ b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+@@ -103,30 +103,6 @@ class ApiClient(
+         )
+     }
+ 
+-    fun getLatestCliVersion(): CliVersion {
+-        val request = Request.Builder()
+-            .header("X-FRESH-INSTALL", if (!Analytics.hasRunBefore) "true" else "false")
+-            .url("$baseUrl/v2/maestro/version")
+-            .get()
+-            .build()
+-
+-        val response = try {
+-            client.newCall(request).execute()
+-        } catch (e: IOException) {
+-            throw ApiException(statusCode = null)
+-        }
+-
+-        response.use {
+-            if (!response.isSuccessful) {
+-                throw ApiException(
+-                    statusCode = response.code
+-                )
+-            }
+-
+-            return JSON.readValue(response.body?.bytes(), CliVersion::class.java)
+-        }
+-    }
+-
+     fun getAuthUrl(port: String): String {
+         return "$baseUrl/v2/maestroLogin/authUrl?port=$port"
+     }
+diff --git a/maestro-cli/src/main/java/maestro/cli/update/Updates.kt b/maestro-cli/src/main/java/maestro/cli/update/Updates.kt
+deleted file mode 100644
+index c9f5df2..0000000
+--- a/maestro-cli/src/main/java/maestro/cli/update/Updates.kt
++++ /dev/null
+@@ -1,96 +0,0 @@
+-package maestro.cli.update
+-
+-import maestro.cli.api.ApiClient
+-import maestro.cli.api.CliVersion
+-import maestro.cli.util.EnvUtils
+-import maestro.cli.util.EnvUtils.CLI_VERSION
+-import java.util.concurrent.CompletableFuture
+-import java.util.concurrent.Executors
+-import java.util.concurrent.TimeUnit
+-import maestro.cli.util.ChangeLogUtils
+-import maestro.cli.util.ChangeLog
+-
+-object Updates {
+-    private val DEFAULT_THREAD_FACTORY = Executors.defaultThreadFactory()
+-    private val EXECUTOR = Executors.newCachedThreadPool {
+-        DEFAULT_THREAD_FACTORY.newThread(it).apply { isDaemon = true }
+-    }
+-
+-    private var future: CompletableFuture<CliVersion?>? = null
+-    private var changelogFuture: CompletableFuture<List<String>>? = null
+-
+-    fun fetchUpdatesAsync() {
+-        getFuture()
+-    }
+-
+-    fun fetchChangelogAsync() {
+-        getChangelogFuture()
+-    }
+-
+-    fun checkForUpdates(): CliVersion? {
+-        // Disable update check, when MAESTRO_DISABLE_UPDATE_CHECK is set to "true" e.g. when installed by a package manager. e.g. nix
+-        if (System.getenv("MAESTRO_DISABLE_UPDATE_CHECK")?.toBoolean() == true) {
+-            return null
+-        }
+-        return try {
+-            getFuture().get(3, TimeUnit.SECONDS)
+-        } catch (e: Exception) {
+-            return null
+-        }
+-    }
+-
+-    fun getChangelog(): List<String>? {
+-        // Disable update check, when MAESTRO_DISABLE_UPDATE_CHECK is set to "true" e.g. when installed by a package manager. e.g. nix
+-        if (System.getenv("MAESTRO_DISABLE_UPDATE_CHECK")?.toBoolean() == true) {
+-            return null
+-        }
+-        return try {
+-            getChangelogFuture().get(3, TimeUnit.SECONDS)
+-        } catch (e: Exception) {
+-            return null
+-        }
+-    }
+-
+-    private fun fetchUpdates(): CliVersion? {
+-        if (CLI_VERSION == null) {
+-            return null
+-        }
+-
+-        val latestCliVersion = ApiClient(EnvUtils.BASE_API_URL).getLatestCliVersion()
+-
+-        return if (latestCliVersion > CLI_VERSION) {
+-            latestCliVersion
+-        } else {
+-            null
+-        }
+-    }
+-
+-    private fun fetchChangelog(): ChangeLog {
+-        if (CLI_VERSION == null) {
+-            return null
+-        }
+-        val version = fetchUpdates()?.toString() ?: return null
+-        val content = ChangeLogUtils.fetchContent()
+-        return ChangeLogUtils.formatBody(content, version)
+-    }
+-
+-    @Synchronized
+-    private fun getFuture(): CompletableFuture<CliVersion?> {
+-        var future = this.future
+-        if (future == null) {
+-            future = CompletableFuture.supplyAsync(this::fetchUpdates, EXECUTOR)!!
+-            this.future = future
+-        }
+-        return future
+-    }
+-
+-    @Synchronized
+-    private fun getChangelogFuture(): CompletableFuture<List<String>> {
+-        var changelogFuture = this.changelogFuture
+-        if (changelogFuture == null) {
+-            changelogFuture = CompletableFuture.supplyAsync(this::fetchChangelog, EXECUTOR)!!
+-            this.changelogFuture = changelogFuture
+-        }
+-        return changelogFuture
+-    }
+-}
+diff --git a/maestro-cli/src/main/java/maestro/cli/util/ChangeLogUtils.kt b/maestro-cli/src/main/java/maestro/cli/util/ChangeLogUtils.kt
+index c02b31e..5b2758a 100644
+--- a/maestro-cli/src/main/java/maestro/cli/util/ChangeLogUtils.kt
++++ b/maestro-cli/src/main/java/maestro/cli/util/ChangeLogUtils.kt
+@@ -1,8 +1,6 @@
+ package maestro.cli.util
+ 
+ import maestro.cli.util.EnvUtils.CLI_VERSION
+-import maestro.utils.HttpClient
+-import okhttp3.Request
+ import java.io.File
+ 
+ typealias ChangeLog = List<String>?
+@@ -17,13 +15,6 @@ object ChangeLogUtils {
+         ?.map { it.replace("\\[(.*?)]\\(.*?\\)".toRegex(), "$1") }
+         ?.filter { it.isNotEmpty() && it.startsWith("- ") }
+ 
+-    fun fetchContent(): String? {
+-        val request = Request.Builder()
+-            .url("https://raw.githubusercontent.com/mobile-dev-inc/maestro/main/CHANGELOG.md")
+-            .build()
+-        return HttpClient.build("ChangeLogUtils").newCall(request).execute().body?.string()
+-    }
+-
+     fun print(changelog: ChangeLog): String =
+         changelog?.let { "\n${it.joinToString("\n")}\n" }.orEmpty()
+ }
+diff --git a/maestro-cli/src/main/java/maestro/cli/util/EnvUtils.kt b/maestro-cli/src/main/java/maestro/cli/util/EnvUtils.kt
+index 08eb142..857f8f3 100644
+--- a/maestro-cli/src/main/java/maestro/cli/util/EnvUtils.kt
++++ b/maestro-cli/src/main/java/maestro/cli/util/EnvUtils.kt
+@@ -3,7 +3,6 @@ package maestro.cli.util
+ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+ import com.fasterxml.jackson.module.kotlin.readValue
+ import maestro.cli.api.CliVersion
+-import maestro.cli.update.Updates
+ import maestro.cli.view.red
+ import maestro.device.CPU_ARCHITECTURE
+ import java.io.IOException
+@@ -122,7 +121,7 @@ object EnvUtils {
+ 
+     fun getCLIVersion(): CliVersion? {
+         val props = try {
+-            Updates::class.java.classLoader.getResourceAsStream("version.properties").use {
++            EnvUtils::class.java.classLoader.getResourceAsStream("version.properties").use {
+                 Properties().apply { load(it) }
+             }
+         } catch (e: Exception) {

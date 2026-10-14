@@ -1,0 +1,8 @@
+- title: Start
+  pages: [getting-started, install, requirements]
+- title: How it works
+  pages: [lanes, setup, parts, skills, speed]
+- title: Features
+  pages: [up, services, devices, browsers, resources, drive, evidence, doctor, build-cache, guard]
+- title: Reference
+  pages: [cli, mcp, config, environment, troubleshooting, faq, acknowledgements]

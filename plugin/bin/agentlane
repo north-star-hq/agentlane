@@ -1,0 +1,18 @@
+#!/bin/sh
+# Claude Code puts this folder on the Bash tool's PATH but exports no plugin variables to Bash,
+# so the script finds its plugin folder from its own path.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+here=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd -P)
+if toolkit=$("$here/../scripts/toolkit.sh" "$PWD"); then
+  exec "$toolkit" "$@"
+fi
+echo "agentlane: this project doesn't have the toolkit installed: no node_modules/.bin/agentlane in $PWD or the folders above it" >&2
+echo "to fix: add it as a dev dependency at the project's root (for example: pnpm add -D agentlane), then run this again" >&2
+exit 127

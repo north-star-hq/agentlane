@@ -1,0 +1,16 @@
+{
+  "extraKnownMarketplaces": {
+    "agent-env": {
+      "source": {
+        "source": "github",
+        "repo": "north-star-hq/agent-env"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "agent-env@agent-env": true
+  },
+  "disabledMcpjsonServers": [
+    "agent-env"
+  ]
+}

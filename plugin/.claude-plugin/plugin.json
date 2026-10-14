@@ -1,0 +1,13 @@
+{
+  "name": "agentlane",
+  "description": "Each agent session gets its own running copy of the project, mobile app or web app: look and screenshot on the simulator, emulator or browser it claimed, run on its device, hooks that keep simctl, adb, playwright-cli and agent-browser off the devices and browsers other sessions hold and release a session's lanes when it ends, and skills for setting a project up, driving the app and keeping a project's run skill true.",
+  "author": {
+    "name": "North Star"
+  },
+  "mcpServers": {
+    "device": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/mcp.sh"
+    }
+  },
+  "hooks": "./hooks/claude.json"
+}

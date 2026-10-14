@@ -1,0 +1,62 @@
+appId: com.example.expoapp
+name: Home controls, ticker and off-screen rows
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+      apiBaseUrl: http://localhost:${API_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-ticker
+    timeout: 60000
+- assertVisible:
+    text: 'Open for \d+ s'
+- tapOn:
+    id: home-increment
+- tapOn:
+    id: home-increment
+- assertVisible:
+    id: home-tap-count
+    text: 'Taps: 2'
+- tapOn:
+    id: home-name-input
+- inputText: Ada
+- pressKey: Enter
+- assertVisible:
+    id: home-greeting
+    text: 'Hello, Ada'
+- assertVisible: Notifications off
+- tapOn:
+    id: home-notify-switch
+- assertVisible:
+    id: home-notify-state
+    text: Notifications on
+- tapOn:
+    id: home-notify-switch
+- assertVisible:
+    id: home-notify-state
+    text: Notifications off
+- assertNotVisible:
+    id: row-40
+- scrollUntilVisible:
+    element:
+      id: row-40
+    direction: DOWN
+    speed: 90
+- tapOn:
+    id: row-40
+- assertVisible: Row 40 (selected)
+- scrollUntilVisible:
+    element:
+      id: home-ticker
+    direction: UP
+    speed: 90

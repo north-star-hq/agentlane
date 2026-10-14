@@ -1,0 +1,8 @@
+pnpm-lock.yaml
+ios/
+android/
+build/
+.expo/
+web/test-results/
+web/playwright-report/
+web/.auth/

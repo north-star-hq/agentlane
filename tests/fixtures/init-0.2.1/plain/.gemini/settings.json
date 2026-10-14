@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "agent-env": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" mcp; fi; echo \"agent-env: no node_modules/.bin/agent-env in $PWD or the folders above it; add the toolkit to this project\" >&2; exit 1"
+      ]
+    }
+  },
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" hook pre-tool-use --agent gemini; fi; exit 0",
+            "name": "agent-env-guard",
+            "timeout": 30000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" hook session-end --agent gemini; fi; exit 0",
+            "name": "agent-env-release",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

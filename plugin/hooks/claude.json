@@ -1,0 +1,17 @@
+{
+  "description": "Keep simctl, adb, emulator and avdmanager off devices other sessions hold, and playwright-cli and agent-browser off their browsers, and release this session's lanes when it ends.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Monitor",
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" pre-tool-use", "timeout": 30 }]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "prompt_input_exit|logout|other",
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" session-end", "timeout": 10 }]
+      }
+    ]
+  }
+}

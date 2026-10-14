@@ -1,0 +1,1255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:33:36 -0400
+Subject: [PATCH] feat(ios): bind the XCTest runner to a token
+
+The runner's HTTP server answered anyone who could reach its loopback
+port, so a Maestro process pointed at the wrong port could drive a
+simulator it didn't start, and when its liveness probe found that port
+busy it treated the runner as its own and could stop or replace it.
+
+The runner now answers only requests that carry the token it was
+started with, in the X-Maestro-Runner-Token header. Maestro passes the
+token next to PORT: TEST_RUNNER_MAESTRO_RUNNER_TOKEN for xcodebuild and
+SIMCTL_CHILD_MAESTRO_RUNNER_TOKEN for simctl and devicectl launches.
+Every other request gets HTTP 401 with a JSON body naming the reason
+(missing header, wrong token, or a runner started without a token),
+and does nothing. That includes /status and unknown paths. The
+comparison runs in constant time, in MaestroDriverLib's RunnerToken.
+
+If MAESTRO_RUNNER_TOKEN is set, every runner the process starts uses
+it. Otherwise each launch gets a random 256-bit token from
+SecureRandom. XCTestDriverClient adds the header to every request
+through an OkHttp interceptor, and the installer's status probe sends
+it too.
+
+The installer now tells three states apart: its own runner (2xx), a
+runner that holds the port but refuses the token (401), and no runner.
+On a 401 it doesn't launch, kill or uninstall anything. start() fails
+with IOSDriverPortTakenException, and uninstall() leaves that runner
+alone. The command log masks the token, and withInjectedShellEnvVars
+leaves MAESTRO_RUNNER_TOKEN out, so flows and maestro cloud uploads never
+see it.
+---
+ .../cli/mcp/McpSessionRunnerTakenTest.kt      | 131 ++++++++++++++++++
+ .../xctestdriver/XCTestDriverClientTest.kt    |  62 +++++++++
+ .../src/main/kotlin/util/CommandLineUtils.kt  |   3 +-
+ .../kotlin/util/LocalIOSDeviceController.kt   |   8 +-
+ .../main/kotlin/util/LocalSimulatorUtils.kt   |   7 +-
+ .../src/main/kotlin/util/XCRunnerCLIUtils.kt  |  22 ++-
+ .../src/main/kotlin/xcuitest/RunnerToken.kt   |  47 +++++++
+ .../src/main/kotlin/xcuitest/XCTestClient.kt  |   1 +
+ .../kotlin/xcuitest/XCTestDriverClient.kt     |  14 +-
+ .../installer/LocalXCTestInstaller.kt         |  69 ++++++---
+ .../test/kotlin/util/XCRunnerCLIUtilsTest.kt  |  10 ++
+ .../test/kotlin/xcuitest/RunnerTokenTest.kt   |  64 +++++++++
+ .../installer/LocalXCTestInstallerTest.kt     | 131 ++++++++++++++----
+ .../Helpers/RunnerToken.swift                 |  37 +++++
+ .../RunnerTokenTests.swift                    |  44 ++++++
+ .../project.pbxproj                           |   8 ++
+ .../Routes/Helpers/AppError.swift             |   2 +
+ .../Routes/XCTestHTTPServer.swift             |  29 +++-
+ maestro-orchestra-models/build.gradle.kts     |   1 +
+ .../main/java/maestro/orchestra/util/Env.kt   |   4 +-
+ .../kotlin/maestro/orchestra/util/EnvTest.kt  |   9 ++
+ 21 files changed, 642 insertions(+), 61 deletions(-)
+ create mode 100644 maestro-cli/src/test/kotlin/maestro/cli/mcp/McpSessionRunnerTakenTest.kt
+ create mode 100644 maestro-ios-driver/src/main/kotlin/xcuitest/RunnerToken.kt
+ create mode 100644 maestro-ios-driver/src/test/kotlin/xcuitest/RunnerTokenTest.kt
+ create mode 100644 maestro-ios-xctest-runner/MaestroDriverLib/Sources/MaestroDriverLib/Helpers/RunnerToken.swift
+ create mode 100644 maestro-ios-xctest-runner/MaestroDriverLib/Tests/MaestroDriverLibTests/RunnerTokenTests.swift
+
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpSessionRunnerTakenTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpSessionRunnerTakenTest.kt
+new file mode 100644
+index 0000000..c440eb3
+--- /dev/null
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpSessionRunnerTakenTest.kt
+@@ -0,0 +1,131 @@
++package maestro.cli.mcp
++
++import com.google.common.truth.Truth.assertThat
++import com.sun.net.httpserver.HttpServer
++import io.mockk.every
++import io.mockk.mockk
++import ios.LocalIOSDevice
++import ios.xctest.XCTestIOSDevice
++import maestro.Driver
++import maestro.drivers.IOSDriver
++import org.junit.jupiter.api.AfterEach
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import util.IOSDeviceType
++import util.XCRunnerCLIUtils
++import xcuitest.XCTestClient
++import xcuitest.XCTestDriverClient
++import xcuitest.installer.Context
++import xcuitest.installer.LocalXCTestInstaller
++import java.io.IOException
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.ServerSocket
++import java.nio.file.Path
++import java.util.Collections
++
++/**
++ * An MCP iOS session over the real driver stack (IOSDriver, LocalIOSDevice, XCTestIOSDevice,
++ * XCTestDriverClient, LocalXCTestInstaller). Only the device is missing: each launch of
++ * `xcodebuild test-without-building` starts a child process and an HTTP server on the session's
++ * port that serves every request, standing in for the runner.
++ */
++class McpSessionRunnerTakenTest {
++
++    @TempDir
++    lateinit var logsDir: Path
++
++    private val runners = Collections.synchronizedMap(mutableMapOf<Int, HttpServer>())
++    private val foreignRequests = Collections.synchronizedList(mutableListOf<String>())
++    private val xcodebuilds = Collections.synchronizedMap(mutableMapOf<Int, Process>())
++
++    @AfterEach
++    fun tearDown() {
++        runners.values.forEach { it.stop(0) }
++        xcodebuilds.values.forEach { it.destroyForcibly() }
++    }
++
++    private fun freePort(): Int = ServerSocket(0, 0, InetAddress.getLoopbackAddress()).use { it.localPort }
++
++    private fun serve(port: Int, status: Int, body: String, onRequest: (String) -> Unit = {}): HttpServer {
++        val http = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0)
++        http.createContext("/") { exchange ->
++            onRequest(exchange.requestURI.path)
++            val bytes = body.toByteArray()
++            exchange.sendResponseHeaders(status, bytes.size.toLong())
++            exchange.responseBody.use { it.write(bytes) }
++        }
++        http.start()
++        return http
++    }
++
++    private fun iosDriver(deviceId: String, port: Int): Driver {
++        val xcodebuild = mockk<XCRunnerCLIUtils> {
++            every { runXcTestWithoutBuild(any(), any(), any(), any(), any(), any()) } answers {
++                runners[port] = serve(port, 200, """{"status":"ok"}""")
++                ProcessBuilder("sleep", "600").start().also { xcodebuilds[port] = it }
++            }
++        }
++        val installer = LocalXCTestInstaller(
++            deviceId = deviceId,
++            deviceType = IOSDeviceType.SIMULATOR,
++            defaultPort = port,
++            iOSDriverConfig = LocalXCTestInstaller.IOSDriverConfig(
++                prebuiltRunner = false,
++                sourceDirectory = "driver-iPhoneSimulator",
++                context = Context.CLI,
++                snapshotKeyHonorModalViews = null,
++            ),
++            deviceController = mockk(relaxed = true),
++            logsDir = logsDir.toFile(),
++            xcRunnerCLIUtils = xcodebuild,
++            fixedRunnerToken = null,
++        )
++        val client = XCTestDriverClient(installer, XCTestClient("127.0.0.1", port, token = null))
++        return IOSDriver(
++            LocalIOSDevice(
++                deviceId = deviceId,
++                xcTestDevice = XCTestIOSDevice(deviceId, client, getInstalledApps = { emptySet() }),
++                deviceController = mockk(relaxed = true),
++            )
++        )
++    }
++
++    @Test
++    fun `a session whose port another Maestro's runner took is rebuilt on a new port, and that runner is left alone`() {
++        val ports = ArrayDeque(listOf(freePort(), freePort()))
++        lateinit var manager: McpMaestroSessionManager
++        manager = McpMaestroSessionManager(
++            findFreePort = { ports.removeFirst() },
++            sessionFactory = { deviceId -> manager.startIosSession(deviceId, streamDeviceType = null) { port -> iosDriver(deviceId, port) } },
++        )
++        try {
++            val first = manager.withSession("SIM") { it }
++            val firstPort = first.xcTestPort!!
++            runners.remove(firstPort)!!.stop(0)
++            val foreign = serve(firstPort, 401, """{"code":"unauthorized","errorMessage":"wrong runner token"}""") {
++                foreignRequests += it
++            }
++
++            val rebuiltPort = try {
++                manager.withSession("SIM") { session ->
++                    if (session === first) throw IOException("the runner refused the request")
++                    session.xcTestPort
++                }
++            } finally {
++                foreign.stop(0)
++            }
++
++            assertThat(rebuiltPort).isNotEqualTo(firstPort)
++            assertThat(manager.isXCTestPortReserved(firstPort)).isFalse()
++            assertThat(xcodebuilds.getValue(firstPort).isAlive).isFalse()
++            assertThat(xcodebuilds.getValue(rebuiltPort!!).isAlive).isTrue()
++            assertThat(foreignRequests.toSet()).containsExactly("/status")
++
++            manager.close()
++            assertThat(xcodebuilds.getValue(rebuiltPort).isAlive).isFalse()
++        } finally {
++            manager.close()
++        }
++    }
++}
+diff --git a/maestro-client/src/test/java/maestro/xctestdriver/XCTestDriverClientTest.kt b/maestro-client/src/test/java/maestro/xctestdriver/XCTestDriverClientTest.kt
+index 6c377c6..eddfab2 100644
+--- a/maestro-client/src/test/java/maestro/xctestdriver/XCTestDriverClientTest.kt
++++ b/maestro-client/src/test/java/maestro/xctestdriver/XCTestDriverClientTest.kt
+@@ -16,6 +16,7 @@ import xcuitest.XCTestClient
+ import xcuitest.XCTestDriverClient
+ import xcuitest.api.DeviceInfo
+ import xcuitest.api.Error
++import xcuitest.installer.XCTestInstaller
+ import java.io.InterruptedIOException
+ import java.net.InetAddress
+ import java.util.concurrent.TimeUnit
+@@ -281,6 +282,67 @@ class XCTestDriverClientTest {
+         mockWebServer.shutdown()
+     }
+ 
++    @Test
++    fun `every request to the runner carries the runner token`() {
++        val mockWebServer = MockWebServer()
++        val mapper = jacksonObjectMapper()
++        repeat(3) {
++            mockWebServer.enqueue(MockResponse().apply {
++                setResponseCode(200)
++                setBody(mapper.writeValueAsString(DeviceInfo(1, 2, 3, 4)))
++            })
++        }
++        mockWebServer.start(InetAddress.getByName("localhost"), 0)
++        val port = mockWebServer.port
++
++        val xcTestDriverClient = XCTestDriverClient(
++            installer = MockXCTestInstaller(MockXCTestInstaller.Simulator(), port = port),
++            client = XCTestClient("localhost", port, token = "claim-token"),
++        )
++        xcTestDriverClient.deviceInfo()
++        xcTestDriverClient.pressKey("home")
++        xcTestDriverClient.screenshot(compressed = true)
++
++        repeat(3) {
++            assertThat(mockWebServer.takeRequest().getHeader("X-Maestro-Runner-Token")).isEqualTo("claim-token")
++        }
++
++        mockWebServer.shutdown()
++    }
++
++    @Test
++    fun `after a restart the requests carry the restarted runner's token`() {
++        val mockWebServer = MockWebServer()
++        val mapper = jacksonObjectMapper()
++        repeat(2) {
++            mockWebServer.enqueue(MockResponse().apply {
++                setResponseCode(200)
++                setBody(mapper.writeValueAsString(DeviceInfo(1, 2, 3, 4)))
++            })
++        }
++        mockWebServer.start(InetAddress.getByName("localhost"), 0)
++        val port = mockWebServer.port
++        val restarted = object : XCTestInstaller {
++            override fun start() = XCTestClient("localhost", port, token = "second-launch")
++            override fun uninstall() = true
++            override fun isChannelAlive() = true
++            override fun close() = Unit
++        }
++
++        val xcTestDriverClient = XCTestDriverClient(
++            installer = restarted,
++            client = XCTestClient("localhost", port, token = "first-launch"),
++        )
++        xcTestDriverClient.deviceInfo()
++        xcTestDriverClient.restartXCTestRunner()
++        xcTestDriverClient.deviceInfo()
++
++        assertThat(mockWebServer.takeRequest().getHeader("X-Maestro-Runner-Token")).isEqualTo("first-launch")
++        assertThat(mockWebServer.takeRequest().getHeader("X-Maestro-Runner-Token")).isEqualTo("second-launch")
++
++        mockWebServer.shutdown()
++    }
++
+     // Mirrors production: the 200s readTimeout is the bound that fires first in the observed
+     // incident, surfacing as a SocketTimeoutException. We don't set callTimeout because OkHttp
+     // wraps the cause in a plain InterruptedIOException, which is a different kind of signal.
+diff --git a/maestro-ios-driver/src/main/kotlin/util/CommandLineUtils.kt b/maestro-ios-driver/src/main/kotlin/util/CommandLineUtils.kt
+index 2014d0d..9476515 100644
+--- a/maestro-ios-driver/src/main/kotlin/util/CommandLineUtils.kt
++++ b/maestro-ios-driver/src/main/kotlin/util/CommandLineUtils.kt
+@@ -6,6 +6,7 @@ import java.util.concurrent.TimeoutException
+ import okio.buffer
+ import okio.source
+ import org.slf4j.LoggerFactory
++import xcuitest.RunnerToken
+ 
+ object CommandLineUtils {
+ 
+@@ -20,7 +21,7 @@ object CommandLineUtils {
+             outputFile: File? = null,
+             params: Map<String, String> = emptyMap()
+     ): Process {
+-        logger.info("Running command line operation: $parts with $params")
++        logger.info("Running command line operation: $parts with ${RunnerToken.redact(params)}")
+ 
+         val processBuilder =
+                 if (outputFile != null) {
+diff --git a/maestro-ios-driver/src/main/kotlin/util/LocalIOSDeviceController.kt b/maestro-ios-driver/src/main/kotlin/util/LocalIOSDeviceController.kt
+index fd3bc38..7648b3b 100644
+--- a/maestro-ios-driver/src/main/kotlin/util/LocalIOSDeviceController.kt
++++ b/maestro-ios-driver/src/main/kotlin/util/LocalIOSDeviceController.kt
+@@ -1,6 +1,7 @@
+ package util
+ 
+ import util.CommandLineUtils.runCommand
++import xcuitest.RunnerToken
+ import java.io.File
+ import java.nio.file.Path
+ import java.time.LocalDateTime
+@@ -26,9 +27,12 @@ object LocalIOSDeviceController {
+         )
+     }
+ 
+-    fun launchRunner(deviceId: String, port: Int, snapshotKeyHonorModalViews: Boolean?, logsDir: File) {
++    fun launchRunner(deviceId: String, port: Int, token: String, snapshotKeyHonorModalViews: Boolean?, logsDir: File) {
+         val outputFile = xctestLogFile(logsDir, date)
+-        val params = mutableMapOf("SIMCTL_CHILD_PORT" to port.toString())
++        val params = mutableMapOf(
++            "SIMCTL_CHILD_PORT" to port.toString(),
++            RunnerToken.SIMCTL_VARIABLE to token,
++        )
+         if (snapshotKeyHonorModalViews != null) {
+             params["SIMCTL_CHILD_snapshotKeyHonorModalViews"] = snapshotKeyHonorModalViews.toString()
+         }
+diff --git a/maestro-ios-driver/src/main/kotlin/util/LocalSimulatorUtils.kt b/maestro-ios-driver/src/main/kotlin/util/LocalSimulatorUtils.kt
+index 2f8c6b2..dace023 100644
+--- a/maestro-ios-driver/src/main/kotlin/util/LocalSimulatorUtils.kt
++++ b/maestro-ios-driver/src/main/kotlin/util/LocalSimulatorUtils.kt
+@@ -8,6 +8,7 @@ import org.rauschig.jarchivelib.ArchiveFormat
+ import org.rauschig.jarchivelib.ArchiverFactory
+ import org.slf4j.LoggerFactory
+ import util.CommandLineUtils.runCommand
++import xcuitest.RunnerToken
+ import java.io.File
+ import java.io.InputStream
+ import java.lang.ProcessBuilder.Redirect.PIPE
+@@ -339,11 +340,15 @@ class LocalSimulatorUtils(private val tempFileHandler: TempFileHandler) {
+     fun launchUITestRunner(
+         deviceId: String,
+         port: Int,
++        token: String,
+         snapshotKeyHonorModalViews: Boolean?,
+         logsDir: File,
+     ) {
+         val outputFile = xctestLogFile(logsDir, date)
+-        val params = mutableMapOf("SIMCTL_CHILD_PORT" to port.toString())
++        val params = mutableMapOf(
++            "SIMCTL_CHILD_PORT" to port.toString(),
++            RunnerToken.SIMCTL_VARIABLE to token,
++        )
+         if (snapshotKeyHonorModalViews != null) {
+             params["SIMCTL_CHILD_snapshotKeyHonorModalViews"] = snapshotKeyHonorModalViews.toString()
+         }
+diff --git a/maestro-ios-driver/src/main/kotlin/util/XCRunnerCLIUtils.kt b/maestro-ios-driver/src/main/kotlin/util/XCRunnerCLIUtils.kt
+index 7b7c053..edd8489 100644
+--- a/maestro-ios-driver/src/main/kotlin/util/XCRunnerCLIUtils.kt
++++ b/maestro-ios-driver/src/main/kotlin/util/XCRunnerCLIUtils.kt
+@@ -2,6 +2,7 @@ package util
+ 
+ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+ import maestro.utils.TempFileHandler
++import xcuitest.RunnerToken
+ import java.io.File
+ import java.time.LocalDateTime
+ import java.time.format.DateTimeFormatter
+@@ -10,6 +11,21 @@ import kotlin.io.path.absolutePathString
+ 
+ const val XCTEST_LOG_DATE_FORMAT = "yyyy-MM-dd_HHmmss"
+ 
++internal fun xcodebuildTestRunnerEnvironment(
++    port: Int,
++    token: String,
++    snapshotKeyHonorModalViews: Boolean?,
++): Map<String, String> {
++    val params = mutableMapOf(
++        "TEST_RUNNER_PORT" to port.toString(),
++        RunnerToken.XCODEBUILD_VARIABLE to token,
++    )
++    if (snapshotKeyHonorModalViews != null) {
++        params["TEST_RUNNER_snapshotKeyHonorModalViews"] = snapshotKeyHonorModalViews.toString()
++    }
++    return params
++}
++
+ internal fun xctestLogFile(logsDir: File, date: String): File {
+     if (!logsDir.exists()) logsDir.mkdirs()
+     return File(logsDir, "xctest_runner_$date.log")
+@@ -105,16 +121,14 @@ class XCRunnerCLIUtils(private val tempFileHandler: TempFileHandler = TempFileHa
+         deviceId: String,
+         xcTestRunFilePath: String,
+         port: Int,
++        token: String,
+         snapshotKeyHonorModalViews: Boolean?,
+         logsDir: File,
+     ): Process {
+         val date = dateFormatter.format(LocalDateTime.now())
+         val outputFile = xctestLogFile(logsDir, date)
+         val logOutputDir = tempFileHandler.createTempDirectory("maestro_xctestrunner_xcodebuild_output").toPath()
+-        val params = mutableMapOf("TEST_RUNNER_PORT" to port.toString())
+-        if (snapshotKeyHonorModalViews != null) {
+-            params["TEST_RUNNER_snapshotKeyHonorModalViews"] = snapshotKeyHonorModalViews.toString()
+-        }
++        val params = xcodebuildTestRunnerEnvironment(port, token, snapshotKeyHonorModalViews)
+         return CommandLineUtils.runCommand(
+             listOf(
+                 "xcodebuild",
+diff --git a/maestro-ios-driver/src/main/kotlin/xcuitest/RunnerToken.kt b/maestro-ios-driver/src/main/kotlin/xcuitest/RunnerToken.kt
+new file mode 100644
+index 0000000..050e2e1
+--- /dev/null
++++ b/maestro-ios-driver/src/main/kotlin/xcuitest/RunnerToken.kt
+@@ -0,0 +1,47 @@
++package xcuitest
++
++import okhttp3.Interceptor
++import okhttp3.Request
++import java.security.SecureRandom
++
++/**
++ * The XCTest runner answers only requests that carry the token it was started with.
++ *
++ * If MAESTRO_RUNNER_TOKEN is set, every runner this process starts uses it; otherwise each runner
++ * launch gets a fresh random token, so a runner is bound to the process that started it.
++ */
++object RunnerToken {
++    const val HEADER = "X-Maestro-Runner-Token"
++    const val ENVIRONMENT_VARIABLE = "MAESTRO_RUNNER_TOKEN"
++
++    // xcodebuild passes TEST_RUNNER_<name> to the test runner as <name>, and simctl launch passes
++    // SIMCTL_CHILD_<name> to the launched app as <name>.
++    const val XCODEBUILD_VARIABLE = "TEST_RUNNER_$ENVIRONMENT_VARIABLE"
++    const val SIMCTL_VARIABLE = "SIMCTL_CHILD_$ENVIRONMENT_VARIABLE"
++
++    private const val RANDOM_BYTES = 32
++    private val VALID = Regex("[\\x21-\\x7E]+")
++    private val secureRandom = SecureRandom()
++
++    fun fromEnvironment(environment: Map<String, String> = System.getenv()): String? {
++        val token = environment[ENVIRONMENT_VARIABLE]?.takeIf { it.isNotEmpty() } ?: return null
++        require(VALID.matches(token)) {
++            "$ENVIRONMENT_VARIABLE must be printable ASCII without spaces, because it is sent in the $HEADER header"
++        }
++        return token
++    }
++
++    fun random(): String {
++        val bytes = ByteArray(RANDOM_BYTES).also(secureRandom::nextBytes)
++        return bytes.joinToString("") { "%02x".format(it) }
++    }
++
++    fun authorize(request: Request, token: String?): Request =
++        if (token == null) request else request.newBuilder().header(HEADER, token).build()
++
++    fun interceptor(token: () -> String?): Interceptor =
++        Interceptor { chain -> chain.proceed(authorize(chain.request(), token())) }
++
++    fun redact(environment: Map<String, String>): Map<String, String> =
++        environment.mapValues { (name, value) -> if (name.endsWith(ENVIRONMENT_VARIABLE)) "<redacted>" else value }
++}
+diff --git a/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestClient.kt b/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestClient.kt
+index a78186e..784595d 100644
+--- a/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestClient.kt
++++ b/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestClient.kt
+@@ -5,6 +5,7 @@ import okhttp3.HttpUrl
+ class XCTestClient(
+     val host: String,
+     val port: Int,
++    val token: String? = RunnerToken.fromEnvironment(),
+ ) {
+ 
+     fun xctestAPIBuilder(pathSegment: String): HttpUrl.Builder {
+diff --git a/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestDriverClient.kt b/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestDriverClient.kt
+index a6289a3..02a65a8 100644
+--- a/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestDriverClient.kt
++++ b/maestro-ios-driver/src/main/kotlin/xcuitest/XCTestDriverClient.kt
+@@ -29,6 +29,12 @@ class XCTestDriverClient(
+ 
+     private lateinit var client: XCTestClient
+ 
++    private val runnerHttpClient: OkHttpClient by lazy {
++        okHttpClient.newBuilder()
++            .addInterceptor(RunnerToken.interceptor { if (::client.isInitialized) client.token else null })
++            .build()
++    }
++
+     // Latched on the first transport-level failure (socket timeout against the runner's
+     // OkHttp socket). Subsequent HTTP calls fail-fast against this instead of issuing fresh
+     // requests to a runner we already know isn't answering. Volatile because OkHttp callers
+@@ -238,7 +244,7 @@ class XCTestDriverClient(
+                 .url(httpUrl)
+                 .post(bodyData)
+ 
+-            okHttpClient
++            runnerHttpClient
+                 .newCall(requestBuilder.build())
+                 .execute().use { processResponse(it, httpUrl.toString()) }
+         }
+@@ -250,7 +256,7 @@ class XCTestDriverClient(
+                 .url(httpUrl)
+                 .build()
+ 
+-            okHttpClient
++            runnerHttpClient
+                 .newCall(request)
+                 .execute().use {
+                     val bytes = it.body?.bytes() ?: ByteArray(0)
+@@ -274,7 +280,7 @@ class XCTestDriverClient(
+                 .url(client.xctestAPIBuilder(pathSegment).build())
+                 .post(bodyData)
+ 
+-            okHttpClient
++            runnerHttpClient
+                 .newCall(requestBuilder.build())
+                 .execute().use { processResponse(it, pathSegment) }
+         }
+@@ -285,7 +291,7 @@ class XCTestDriverClient(
+                 .url(client.xctestAPIBuilder(pathSegment).build())
+                 .get()
+ 
+-            okHttpClient
++            runnerHttpClient
+                 .newCall(requestBuilder.build())
+                 .execute().use { processResponse(it, pathSegment) }
+         }
+diff --git a/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt b/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
+index 0aa9a8d..da97e11 100644
+--- a/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
++++ b/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
+@@ -14,6 +14,7 @@ import util.IOSDeviceType
+ import util.LocalIOSDeviceController
+ import util.LocalSimulatorUtils
+ import util.XCRunnerCLIUtils
++import xcuitest.RunnerToken
+ import xcuitest.XCTestClient
+ import java.io.File
+ import java.io.IOException
+@@ -41,6 +42,7 @@ class LocalXCTestInstaller(
+     private val logsDir: File,
+     private val xcRunnerCLIUtils: XCRunnerCLIUtils = XCRunnerCLIUtils(tempFileHandler),
+     private val startupTimeoutMs: Long = startupTimeoutFromEnvironment(),
++    private val fixedRunnerToken: String? = RunnerToken.fromEnvironment(),
+ ) : XCTestInstaller {
+ 
+     private val logger = LoggerFactory.getLogger(LocalXCTestInstaller::class.java)
+@@ -63,6 +65,9 @@ class LocalXCTestInstaller(
+ 
+     private var xcTestProcess: Process? = null
+ 
++    @Volatile
++    private var runnerToken: String? = fixedRunnerToken
++
+     override fun uninstall(): Boolean {
+         return metrics.measured("operation", mapOf("command" to "uninstall")) {
+             // FIXME(bartekpacia): This method probably doesn't have to care about killing the XCTest Runner process.
+@@ -120,7 +125,7 @@ class LocalXCTestInstaller(
+ 
+                 repeat(20) {
+                     if (ensureOpen()) {
+-                        return@measured XCTestClient(host, defaultPort)
++                        return@measured XCTestClient(host, defaultPort, runnerToken)
+                     }
+                     logger.info("==> Start XCTest runner to continue flow")
+                     Thread.sleep(500)
+@@ -136,10 +141,14 @@ class LocalXCTestInstaller(
+             val startTime = System.currentTimeMillis()
+ 
+             while (System.currentTimeMillis() - startTime < startupTimeoutMs) {
+-                runCatching {
+-                    if (isChannelAlive()) return@measured XCTestClient(host, defaultPort)
++                when (val status = runCatching { runnerStatus() }.getOrDefault(RunnerStatus.Absent)) {
++                    RunnerStatus.Ours -> return@measured XCTestClient(host, defaultPort, runnerToken)
++                    is RunnerStatus.Taken -> {
++                        stopXCTestProcess()
++                        throw IOSDriverPortTakenException(portTakenMessage(status))
++                    }
++                    RunnerStatus.Absent -> Thread.sleep(500)
+                 }
+-                Thread.sleep(500)
+             }
+ 
+             stopXCTestProcess()
+@@ -149,9 +158,11 @@ class LocalXCTestInstaller(
+ 
+     class IOSDriverTimeoutException(message: String): RuntimeException(message)
+ 
++    class IOSDriverPortTakenException(message: String): RuntimeException(message)
++
+     override fun isChannelAlive(): Boolean {
+         return metrics.measured("operation", mapOf("command" to "isChannelAlive")) {
+-        return@measured xcTestDriverStatusCheck()
++        return@measured runnerStatus() == RunnerStatus.Ours
+         }
+     }
+ 
+@@ -165,7 +176,18 @@ class LocalXCTestInstaller(
+         return result
+     }
+ 
+-    private fun xcTestDriverStatusCheck(): Boolean {
++    private sealed interface RunnerStatus {
++        data object Ours : RunnerStatus
++        data class Taken(val reason: String) : RunnerStatus
++        data object Absent : RunnerStatus
++    }
++
++    private fun portTakenMessage(status: RunnerStatus.Taken) =
++        "The XCTest runner port $host:$defaultPort is held by a Maestro runner that refuses this process's token " +
++            "(${status.reason}). It belongs to another Maestro process, so Maestro will not stop or replace it. " +
++            "Use a different port, or set ${RunnerToken.ENVIRONMENT_VARIABLE} to the token that runner was started with."
++
++    private fun runnerStatus(): RunnerStatus {
+         logger.info("[Start] Perform XCUITest driver status check on $deviceId")
+         fun xctestAPIBuilder(pathSegment: String): HttpUrl.Builder {
+             return HttpUrl.Builder()
+@@ -186,30 +208,39 @@ class LocalXCTestInstaller(
+             .build()
+         }
+ 
+-        val checkSuccessful = try {
+-            httpClient.newCall(request).execute().use {
++        return try {
++            httpClient.newCall(RunnerToken.authorize(request, runnerToken)).execute().use {
+                 logger.info("[Done] Perform XCUITest driver status check on $deviceId")
+-                it.isSuccessful
++                when {
++                    it.isSuccessful -> RunnerStatus.Ours
++                    it.code == HTTP_UNAUTHORIZED -> RunnerStatus.Taken(it.body?.string().orEmpty().take(200))
++                    else -> RunnerStatus.Absent
++                }
+             }
+         } catch (ignore: IOException) {
+             logger.info("[Failed] Perform XCUITest driver status check on $deviceId, exception: $ignore")
+-            false
++            RunnerStatus.Absent
+         }
+-
+-        return checkSuccessful
+     }
+ 
+     private fun startXCTestRunner(deviceId: String, preBuiltRunner: Boolean) {
+-        if (isChannelAlive()) {
+-            logger.info("UI Test runner already running, returning")
+-            return
++        when (val status = runnerStatus()) {
++            RunnerStatus.Ours -> {
++                logger.info("UI Test runner already running, returning")
++                return
++            }
++            is RunnerStatus.Taken -> throw IOSDriverPortTakenException(portTakenMessage(status))
++            RunnerStatus.Absent -> Unit
+         }
+ 
++        val token = fixedRunnerToken ?: RunnerToken.random()
++        runnerToken = token
++
+         val buildProducts = iosBuildProductsExtractor.extract(iOSDriverConfig.sourceDirectory)
+ 
+         if (preBuiltRunner) {
+             logger.info("Installing pre built driver without xcodebuild")
+-            installPrebuiltRunner(deviceId, buildProducts.uiRunnerPath)
++            installPrebuiltRunner(deviceId, buildProducts.uiRunnerPath, token)
+         } else {
+             logger.info("Installing driver with xcodebuild")
+             logger.info("[Start] Running XcUITest with `xcodebuild test-without-building` with $defaultPort and config: $iOSDriverConfig")
+@@ -217,6 +248,7 @@ class LocalXCTestInstaller(
+                 deviceId = this.deviceId,
+                 xcTestRunFilePath = buildProducts.xctestRunPath.absolutePath,
+                 port = defaultPort,
++                token = token,
+                 snapshotKeyHonorModalViews = iOSDriverConfig.snapshotKeyHonorModalViews,
+                 logsDir = logsDir,
+             )
+@@ -224,7 +256,7 @@ class LocalXCTestInstaller(
+         }
+     }
+ 
+-    private fun installPrebuiltRunner(deviceId: String, bundlePath: File) {
++    private fun installPrebuiltRunner(deviceId: String, bundlePath: File, token: String) {
+         logger.info("Installing prebuilt driver for $deviceId and type $deviceType")
+         when (deviceType) {
+             IOSDeviceType.REAL -> {
+@@ -232,6 +264,7 @@ class LocalXCTestInstaller(
+                 LocalIOSDeviceController.launchRunner(
+                     deviceId = deviceId,
+                     port = defaultPort,
++                    token = token,
+                     snapshotKeyHonorModalViews = iOSDriverConfig.snapshotKeyHonorModalViews,
+                     logsDir = logsDir,
+                 )
+@@ -241,6 +274,7 @@ class LocalXCTestInstaller(
+                 localSimulatorUtils.launchUITestRunner(
+                     deviceId = deviceId,
+                     port = defaultPort,
++                    token = token,
+                     snapshotKeyHonorModalViews = iOSDriverConfig.snapshotKeyHonorModalViews,
+                     logsDir = logsDir,
+                 )
+@@ -274,6 +308,7 @@ class LocalXCTestInstaller(
+         const val UI_TEST_RUNNER_APP_BUNDLE_ID = "dev.mobile.maestro-driver-iosUITests.xctrunner"
+ 
+         private const val SERVER_LAUNCH_TIMEOUT_MS = 120000L
++        private const val HTTP_UNAUTHORIZED = 401
+         private const val XCODEBUILD_STOP_TIMEOUT_SECONDS = 10L
+         private const val MAESTRO_DRIVER_STARTUP_TIMEOUT = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
+ 
+diff --git a/maestro-ios-driver/src/test/kotlin/util/XCRunnerCLIUtilsTest.kt b/maestro-ios-driver/src/test/kotlin/util/XCRunnerCLIUtilsTest.kt
+index ed3f431..92910f7 100644
+--- a/maestro-ios-driver/src/test/kotlin/util/XCRunnerCLIUtilsTest.kt
++++ b/maestro-ios-driver/src/test/kotlin/util/XCRunnerCLIUtilsTest.kt
+@@ -31,4 +31,14 @@ class XCRunnerCLIUtilsTest {
+         assertThat(notYet.isDirectory).isTrue()
+         assertThat(result.parentFile).isEqualTo(notYet)
+     }
++
++    @Test
++    fun `xcodebuild hands the runner its port and token through the test environment`() {
++        val environment = xcodebuildTestRunnerEnvironment(port = 61422, token = "claim-token", snapshotKeyHonorModalViews = null)
++
++        assertThat(environment).containsExactly(
++            "TEST_RUNNER_PORT", "61422",
++            "TEST_RUNNER_MAESTRO_RUNNER_TOKEN", "claim-token",
++        )
++    }
+ }
+diff --git a/maestro-ios-driver/src/test/kotlin/xcuitest/RunnerTokenTest.kt b/maestro-ios-driver/src/test/kotlin/xcuitest/RunnerTokenTest.kt
+new file mode 100644
+index 0000000..a971aa1
+--- /dev/null
++++ b/maestro-ios-driver/src/test/kotlin/xcuitest/RunnerTokenTest.kt
+@@ -0,0 +1,64 @@
++package xcuitest
++
++import com.google.common.truth.Truth.assertThat
++import okhttp3.Request
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertThrows
++
++class RunnerTokenTest {
++
++    @Test
++    fun `the token from MAESTRO_RUNNER_TOKEN is used when it is set`() {
++        val environment = mapOf("MAESTRO_RUNNER_TOKEN" to "claim-7f3a9c1e5b2d4f60")
++
++        assertThat(RunnerToken.fromEnvironment(environment)).isEqualTo("claim-7f3a9c1e5b2d4f60")
++    }
++
++    @Test
++    fun `no token comes from the environment when MAESTRO_RUNNER_TOKEN is unset or empty`() {
++        assertThat(RunnerToken.fromEnvironment(emptyMap())).isNull()
++        assertThat(RunnerToken.fromEnvironment(mapOf("MAESTRO_RUNNER_TOKEN" to ""))).isNull()
++    }
++
++    @Test
++    fun `a token that can't travel in an HTTP header is rejected`() {
++        for (bad in listOf("has space", "line\nbreak", "tab\there", "naïve")) {
++            assertThrows<IllegalArgumentException> {
++                RunnerToken.fromEnvironment(mapOf("MAESTRO_RUNNER_TOKEN" to bad))
++            }
++        }
++    }
++
++    @Test
++    fun `a random token carries 256 bits and differs on every launch`() {
++        val tokens = List(100) { RunnerToken.random() }
++
++        tokens.forEach { assertThat(it).matches("[0-9a-f]{64}") }
++        assertThat(tokens.toSet()).hasSize(100)
++    }
++
++    @Test
++    fun `authorize adds the token header, and leaves the request alone without a token`() {
++        val request = Request.Builder().url("http://127.0.0.1:1/status").build()
++
++        assertThat(RunnerToken.authorize(request, "abc123").header("X-Maestro-Runner-Token")).isEqualTo("abc123")
++        assertThat(RunnerToken.authorize(request, null).header("X-Maestro-Runner-Token")).isNull()
++    }
++
++    @Test
++    fun `redact hides the token in every launch environment and keeps the rest`() {
++        val redacted = RunnerToken.redact(
++            mapOf(
++                "TEST_RUNNER_PORT" to "61422",
++                "TEST_RUNNER_MAESTRO_RUNNER_TOKEN" to "secret",
++                "SIMCTL_CHILD_MAESTRO_RUNNER_TOKEN" to "secret",
++            )
++        )
++
++        assertThat(redacted).containsExactly(
++            "TEST_RUNNER_PORT", "61422",
++            "TEST_RUNNER_MAESTRO_RUNNER_TOKEN", "<redacted>",
++            "SIMCTL_CHILD_MAESTRO_RUNNER_TOKEN", "<redacted>",
++        )
++    }
++}
+diff --git a/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt b/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+index 7b80d17..2703b84 100644
+--- a/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
++++ b/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+@@ -24,28 +24,30 @@ class LocalXCTestInstallerTest {
+     lateinit var logsDir: Path
+ 
+     private val tempFileHandler = TempFileHandler()
+-    private val deviceController = mockk<IOSDevice>(relaxed = true)
++    private val requests = Collections.synchronizedList(mutableListOf<Pair<String, String?>>())
++    private val servers = Collections.synchronizedList(mutableListOf<HttpServer>())
+     private val xcodebuilds = Collections.synchronizedList(mutableListOf<Process>())
+-    private var server: HttpServer? = null
+ 
+     @AfterEach
+     fun tearDown() {
+-        server?.stop(0)
++        servers.forEach { it.stop(0) }
+         xcodebuilds.forEach { it.destroyForcibly() }
+         tempFileHandler.close()
+     }
+ 
+     private fun freePort(): Int = ServerSocket(0, 0, InetAddress.getLoopbackAddress()).use { it.localPort }
+ 
+-    private fun runner(port: Int, status: Int, body: String) {
++    private fun runner(status: Int, body: String, port: Int = 0): HttpServer {
+         val http = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0)
+         http.createContext("/") { exchange ->
++            requests += exchange.requestURI.path to exchange.requestHeaders.getFirst("X-Maestro-Runner-Token")
+             val bytes = body.toByteArray()
+             exchange.sendResponseHeaders(status, bytes.size.toLong())
+             exchange.responseBody.use { it.write(bytes) }
+         }
+         http.start()
+-        server = http
++        servers += http
++        return http
+     }
+ 
+     /**
+@@ -54,38 +56,44 @@ class LocalXCTestInstallerTest {
+      * the runner's pid or kill anything else without the test failing.
+      */
+     private fun xcodebuild(onLaunch: () -> Unit = {}): XCRunnerCLIUtils = mockk {
+-        every { runXcTestWithoutBuild(any(), any(), any(), any(), any()) } answers {
++        every { runXcTestWithoutBuild(any(), any(), any(), any(), any(), any()) } answers {
+             onLaunch()
+             ProcessBuilder("sleep", "600").start().also { xcodebuilds += it }
+         }
+     }
+ 
+-    private fun installer(port: Int, xcRunnerCLIUtils: XCRunnerCLIUtils, startupTimeoutMs: Long = 120_000) =
+-        LocalXCTestInstaller(
+-            deviceId = "00000000-0000-0000-0000-000000000000",
+-            deviceType = IOSDeviceType.SIMULATOR,
+-            defaultPort = port,
+-            iOSDriverConfig = LocalXCTestInstaller.IOSDriverConfig(
+-                prebuiltRunner = false,
+-                sourceDirectory = "driver-iPhoneSimulator",
+-                context = Context.CLI,
+-                snapshotKeyHonorModalViews = null,
+-            ),
+-            deviceController = deviceController,
+-            tempFileHandler = tempFileHandler,
+-            logsDir = logsDir.toFile(),
+-            xcRunnerCLIUtils = xcRunnerCLIUtils,
+-            startupTimeoutMs = startupTimeoutMs,
+-        )
++    private fun installer(
++        port: Int,
++        fixedRunnerToken: String?,
++        xcRunnerCLIUtils: XCRunnerCLIUtils = xcodebuild(),
++        startupTimeoutMs: Long = 120_000,
++    ) = LocalXCTestInstaller(
++        deviceId = "00000000-0000-0000-0000-000000000000",
++        deviceType = IOSDeviceType.SIMULATOR,
++        defaultPort = port,
++        iOSDriverConfig = LocalXCTestInstaller.IOSDriverConfig(
++            prebuiltRunner = false,
++            sourceDirectory = "driver-iPhoneSimulator",
++            context = Context.CLI,
++            snapshotKeyHonorModalViews = null,
++        ),
++        deviceController = mockk<IOSDevice>(relaxed = true),
++        tempFileHandler = tempFileHandler,
++        logsDir = logsDir.toFile(),
++        xcRunnerCLIUtils = xcRunnerCLIUtils,
++        startupTimeoutMs = startupTimeoutMs,
++        fixedRunnerToken = fixedRunnerToken,
++    )
+ 
+     @Test
+     fun `uninstall stops the xcodebuild it started even when the runner no longer answers`() {
+         val port = freePort()
+-        val installer = installer(port, xcodebuild { runner(port, 200, """{"status":"ok"}""") })
++        var ours: HttpServer? = null
++        val installer = installer(port, fixedRunnerToken = null, xcodebuild { ours = runner(200, """{"status":"ok"}""", port) })
+         installer.start()
+         val xcodebuild = xcodebuilds.single()
+ 
+-        server?.stop(0)
++        ours!!.stop(0)
+         val uninstalled = installer.uninstall()
+ 
+         assertThat(uninstalled).isFalse()
+@@ -94,11 +102,82 @@ class LocalXCTestInstallerTest {
+ 
+     @Test
+     fun `a runner that never comes up fails the start, and the xcodebuild launched for it is stopped`() {
+-        val installer = installer(freePort(), xcodebuild(), startupTimeoutMs = 1_500)
++        val installer = installer(freePort(), fixedRunnerToken = null, startupTimeoutMs = 1_500)
+ 
+         assertThrows<LocalXCTestInstaller.IOSDriverTimeoutException> { installer.start() }
+ 
+         assertThat(xcodebuilds).hasSize(1)
+         assertThat(xcodebuilds.single().isAlive).isFalse()
+     }
++
++    @Test
++    fun `the status check carries the token from MAESTRO_RUNNER_TOKEN, and a runner that accepts it is ours`() {
++        val port = runner(200, """{"status":"ok"}""").address.port
++
++        assertThat(installer(port, fixedRunnerToken = "claim-token").isChannelAlive()).isTrue()
++        assertThat(requests).containsExactly("/status" to "claim-token")
++    }
++
++    @Test
++    fun `a runner that refuses the token holds the port, so start fails without launching a runner`() {
++        val port = runner(401, """{"code":"unauthorized","errorMessage":"wrong runner token"}""").address.port
++        val installer = installer(port, fixedRunnerToken = "claim-token")
++
++        val error = assertThrows<LocalXCTestInstaller.IOSDriverPortTakenException> { installer.start() }
++
++        assertThat(error.message).contains("127.0.0.1:$port")
++        assertThat(error.message).contains("wrong runner token")
++        assertThat(requests.map { it.first }.toSet()).containsExactly("/status")
++        assertThat(xcodebuilds).isEmpty()
++        assertThat(logsDir.toFile().listFiles()).isEmpty()
++    }
++
++    @Test
++    fun `a runner that takes the port with another token while ours starts fails the start and stops our xcodebuild`() {
++        val port = freePort()
++        val installer = installer(
++            port,
++            fixedRunnerToken = "claim-token",
++            xcodebuild { runner(401, """{"code":"unauthorized","errorMessage":"wrong runner token"}""", port) },
++            startupTimeoutMs = 5_000,
++        )
++
++        val error = assertThrows<LocalXCTestInstaller.IOSDriverPortTakenException> { installer.start() }
++
++        assertThat(error.message).contains("wrong runner token")
++        assertThat(xcodebuilds).hasSize(1)
++        assertThat(xcodebuilds.single().isAlive).isFalse()
++    }
++
++    @Test
++    fun `a runner that took our port after ours died is not ours, and uninstall stops only our xcodebuild`() {
++        val port = freePort()
++        var ours: HttpServer? = null
++        val installer = installer(port, fixedRunnerToken = null, xcodebuild { ours = runner(200, """{"status":"ok"}""", port) })
++        installer.start()
++        ours!!.stop(0)
++        runner(401, """{"code":"unauthorized","errorMessage":"wrong runner token"}""", port)
++
++        assertThat(installer.isChannelAlive()).isFalse()
++        assertThat(installer.uninstall()).isFalse()
++        assertThat(xcodebuilds.single().isAlive).isFalse()
++    }
++
++    @Test
++    fun `uninstall leaves a runner that refuses the token alone`() {
++        val port = runner(401, """{"code":"unauthorized","errorMessage":"wrong runner token"}""").address.port
++        val installer = installer(port, fixedRunnerToken = "claim-token")
++
++        assertThat(installer.isChannelAlive()).isFalse()
++        assertThat(installer.uninstall()).isFalse()
++        assertThat(requests.map { it.first }.toSet()).containsExactly("/status")
++    }
++
++    @Test
++    fun `without MAESTRO_RUNNER_TOKEN there is no token before the first launch, so any tokened runner is someone else's`() {
++        val port = runner(401, """{"code":"unauthorized","errorMessage":"missing X-Maestro-Runner-Token header"}""").address.port
++
++        assertThrows<LocalXCTestInstaller.IOSDriverPortTakenException> { installer(port, fixedRunnerToken = null).start() }
++        assertThat(requests).contains("/status" to null)
++    }
+ }
+diff --git a/maestro-ios-xctest-runner/MaestroDriverLib/Sources/MaestroDriverLib/Helpers/RunnerToken.swift b/maestro-ios-xctest-runner/MaestroDriverLib/Sources/MaestroDriverLib/Helpers/RunnerToken.swift
+new file mode 100644
+index 0000000..6aba8c2
+--- /dev/null
++++ b/maestro-ios-xctest-runner/MaestroDriverLib/Sources/MaestroDriverLib/Helpers/RunnerToken.swift
+@@ -0,0 +1,37 @@
++import Foundation
++
++/// The token a runner was started with. Maestro passes it in the test environment next to PORT and
++/// sends it in `header` on every request; the runner answers only requests that carry it.
++public struct RunnerToken: Sendable {
++    public static let header = "X-Maestro-Runner-Token"
++    public static let environmentVariable = "MAESTRO_RUNNER_TOKEN"
++
++    private let expected: [UInt8]?
++
++    public init(environment: [String: String]) {
++        expected = environment[Self.environmentVariable].flatMap { $0.isEmpty ? nil : Array($0.utf8) }
++    }
++
++    /// Why a request that presents `presented` is refused, or nil when the runner should serve it.
++    public func refusal(presented: String?) -> String? {
++        guard let expected else {
++            return "this runner was started without \(Self.environmentVariable), so it refuses every request"
++        }
++        guard let presented else {
++            return "missing \(Self.header) header"
++        }
++        guard Self.constantTimeEquals(Array(presented.utf8), expected) else {
++            return "wrong runner token"
++        }
++        return nil
++    }
++
++    static func constantTimeEquals(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
++        guard lhs.count == rhs.count else { return false }
++        var difference: UInt8 = 0
++        for index in lhs.indices {
++            difference |= lhs[index] ^ rhs[index]
++        }
++        return difference == 0
++    }
++}
+diff --git a/maestro-ios-xctest-runner/MaestroDriverLib/Tests/MaestroDriverLibTests/RunnerTokenTests.swift b/maestro-ios-xctest-runner/MaestroDriverLib/Tests/MaestroDriverLibTests/RunnerTokenTests.swift
+new file mode 100644
+index 0000000..9e6f716
+--- /dev/null
++++ b/maestro-ios-xctest-runner/MaestroDriverLib/Tests/MaestroDriverLibTests/RunnerTokenTests.swift
+@@ -0,0 +1,44 @@
++import XCTest
++@testable import MaestroDriverLib
++
++final class RunnerTokenTests: XCTestCase {
++
++    private let token = RunnerToken(environment: [RunnerToken.environmentVariable: "4f1c0d9e8b7a6f5e4d3c2b1a09f8e7d6"])
++
++    func testMatchingTokenIsServed() {
++        XCTAssertNil(token.refusal(presented: "4f1c0d9e8b7a6f5e4d3c2b1a09f8e7d6"))
++    }
++
++    func testMissingHeaderIsRefused() {
++        XCTAssertEqual(token.refusal(presented: nil), "missing X-Maestro-Runner-Token header")
++    }
++
++    func testWrongTokenIsRefused() {
++        XCTAssertEqual(token.refusal(presented: "4f1c0d9e8b7a6f5e4d3c2b1a09f8e7d7"), "wrong runner token")
++    }
++
++    func testPrefixOfTheTokenIsRefused() {
++        XCTAssertEqual(token.refusal(presented: "4f1c0d9e8b7a6f5e"), "wrong runner token")
++    }
++
++    func testEmptyPresentedTokenIsRefused() {
++        XCTAssertEqual(token.refusal(presented: ""), "wrong runner token")
++    }
++
++    func testRunnerWithoutTokenRefusesEveryRequest() {
++        let reason = "this runner was started without MAESTRO_RUNNER_TOKEN, so it refuses every request"
++        for environment in [[:], [RunnerToken.environmentVariable: ""]] {
++            let tokenless = RunnerToken(environment: environment)
++            XCTAssertEqual(tokenless.refusal(presented: nil), reason)
++            XCTAssertEqual(tokenless.refusal(presented: ""), reason)
++            XCTAssertEqual(tokenless.refusal(presented: "anything"), reason)
++        }
++    }
++
++    func testConstantTimeEquals() {
++        XCTAssertTrue(RunnerToken.constantTimeEquals(Array("abc".utf8), Array("abc".utf8)))
++        XCTAssertFalse(RunnerToken.constantTimeEquals(Array("abc".utf8), Array("abd".utf8)))
++        XCTAssertFalse(RunnerToken.constantTimeEquals(Array("abc".utf8), Array("abcd".utf8)))
++        XCTAssertFalse(RunnerToken.constantTimeEquals([], Array("a".utf8)))
++    }
++}
+diff --git a/maestro-ios-xctest-runner/maestro-driver-ios.xcodeproj/project.pbxproj b/maestro-ios-xctest-runner/maestro-driver-ios.xcodeproj/project.pbxproj
+index 7c18f27..f89c958 100644
+--- a/maestro-ios-xctest-runner/maestro-driver-ios.xcodeproj/project.pbxproj
++++ b/maestro-ios-xctest-runner/maestro-driver-ios.xcodeproj/project.pbxproj
+@@ -111,6 +111,8 @@
+ 		BBBB000A2DF24A000000000A /* PermissionButtonFinderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB00172DF24A0000000017 /* PermissionButtonFinderTests.swift */; };
+ 		BBBB000B2DF24A000000000B /* AXElementTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB00182DF24A0000000018 /* AXElementTests.swift */; };
+ 		BBBB000C2DF24A000000000C /* AXFrameTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB00192DF24A0000000019 /* AXFrameTests.swift */; };
++		BBBB000D2DF24A000000000D /* RunnerToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB001B2DF24A000000001B /* RunnerToken.swift */; };
++		BBBB000E2DF24A000000000E /* RunnerTokenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB001C2DF24A000000001C /* RunnerTokenTests.swift */; };
+ 		C2DB03C0028C821C6F580B2C /* XCAXClient_iOS+FBSnapshotReqParams.m in Sources */ = {isa = PBXBuildFile; fileRef = 526111792DE5E8E5007C356B /* XCAXClient_iOS+FBSnapshotReqParams.m */; };
+ 		D2244FD4EDCE31D1BAFD0549 /* SnapshotParametersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69198CA2D2E1AAFBD06FEB38 /* SnapshotParametersTests.swift */; };
+ 		F328D3E62A2A98E7000546D3 /* StringExtensions.swift in Sources */ = {isa = PBXBuildFile; fileRef = F328D3E52A2A98E7000546D3 /* StringExtensions.swift */; };
+@@ -361,6 +363,8 @@
+ 		BBBB00172DF24A0000000017 /* PermissionButtonFinderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionButtonFinderTests.swift; sourceTree = "<group>"; };
+ 		BBBB00182DF24A0000000018 /* AXElementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AXElementTests.swift; sourceTree = "<group>"; };
+ 		BBBB00192DF24A0000000019 /* AXFrameTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AXFrameTests.swift; sourceTree = "<group>"; };
++		BBBB001B2DF24A000000001B /* RunnerToken.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerToken.swift; sourceTree = "<group>"; };
++		BBBB001C2DF24A000000001C /* RunnerTokenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTokenTests.swift; sourceTree = "<group>"; };
+ 		BBBB001A2DF24A000000001A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+ 		BBBB00202DF24A0000000020 /* MaestroDriverLib.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = MaestroDriverLib.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+ 		BBBB00212DF24A0000000021 /* MaestroDriverLibTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MaestroDriverLibTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+@@ -777,6 +781,7 @@
+ 			isa = PBXGroup;
+ 			children = (
+ 				BBBB00152DF24A0000000015 /* PermissionButtonFinder.swift */,
++				BBBB001B2DF24A000000001B /* RunnerToken.swift */,
+ 			);
+ 			path = Helpers;
+ 			sourceTree = "<group>";
+@@ -787,6 +792,7 @@
+ 				BBBB00172DF24A0000000017 /* PermissionButtonFinderTests.swift */,
+ 				BBBB00182DF24A0000000018 /* AXElementTests.swift */,
+ 				BBBB00192DF24A0000000019 /* AXFrameTests.swift */,
++				BBBB001C2DF24A000000001C /* RunnerTokenTests.swift */,
+ 			);
+ 			path = MaestroDriverLib/Tests/MaestroDriverLibTests;
+ 			sourceTree = "<group>";
+@@ -1086,6 +1092,7 @@
+ 				BBBB00042DF24A0000000004 /* PermissionValue.swift in Sources */,
+ 				BBBB00052DF24A0000000005 /* PermissionButtonFinder.swift in Sources */,
+ 				BBBB00062DF24A0000000006 /* MaestroDriverLib.swift in Sources */,
++				BBBB000D2DF24A000000000D /* RunnerToken.swift in Sources */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+@@ -1096,6 +1103,7 @@
+ 				BBBB000A2DF24A000000000A /* PermissionButtonFinderTests.swift in Sources */,
+ 				BBBB000B2DF24A000000000B /* AXElementTests.swift in Sources */,
+ 				BBBB000C2DF24A000000000C /* AXFrameTests.swift in Sources */,
++				BBBB000E2DF24A000000000E /* RunnerTokenTests.swift in Sources */,
+ 			);
+ 			runOnlyForDeploymentPostprocessing = 0;
+ 		};
+diff --git a/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/Helpers/AppError.swift b/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/Helpers/AppError.swift
+index 6881c3c..754293e 100644
+--- a/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/Helpers/AppError.swift
++++ b/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/Helpers/AppError.swift
+@@ -6,6 +6,7 @@ enum AppErrorType: String, Codable {
+     case `internal`
+     case precondition
+     case timeout
++    case unauthorized
+ }
+ 
+ struct AppError: Error, Codable {
+@@ -17,6 +18,7 @@ struct AppError: Error, Codable {
+         case .internal: return .internalServerError
+         case .precondition: return .badRequest
+         case .timeout: return .requestTimeout
++        case .unauthorized: return .unauthorized
+         }
+     }
+ 
+diff --git a/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/XCTestHTTPServer.swift b/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/XCTestHTTPServer.swift
+index 30874d4..e3fda42 100644
+--- a/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/XCTestHTTPServer.swift
++++ b/maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/XCTestHTTPServer.swift
+@@ -1,5 +1,6 @@
+ import FlyingFox
+ import Foundation
++import MaestroDriverLib
+ 
+ enum Route: String, CaseIterable {
+     case runningApp
+@@ -30,14 +31,32 @@ enum Route: String, CaseIterable {
+ 
+ struct XCTestHTTPServer {
+     func start() async throws {
+-        let port = ProcessInfo.processInfo.environment["PORT"]?.toUInt16()
+-        let server = HTTPServer(address: try .inet(ip4: "127.0.0.1", port: port ?? 22087), timeout: 100)
+-        
++        let environment = ProcessInfo.processInfo.environment
++        let port = environment["PORT"]?.toUInt16()
++
++        var routes = RoutedHTTPHandler()
+         for route in Route.allCases {
+             let handler = await RouteHandlerFactory.createRouteHandler(route: route)
+-            await server.appendRoute(route.toHTTPRoute(), to: handler)
++            routes.appendRoute(route.toHTTPRoute(), to: handler)
+         }
+-        
++
++        let server = HTTPServer(
++            address: try .inet(ip4: "127.0.0.1", port: port ?? 22087),
++            timeout: 100,
++            handler: RunnerTokenHandler(token: RunnerToken(environment: environment), routes: routes)
++        )
+         try await server.run()
+     }
+ }
++
++struct RunnerTokenHandler: HTTPHandler {
++    let token: RunnerToken
++    let routes: RoutedHTTPHandler
++
++    func handleRequest(_ request: HTTPRequest) async throws -> HTTPResponse {
++        if let reason = token.refusal(presented: request.headers[HTTPHeader(RunnerToken.header)]) {
++            return AppError(type: .unauthorized, message: reason).httpResponse
++        }
++        return try await routes.handleRequest(request)
++    }
++}
+diff --git a/maestro-orchestra-models/build.gradle.kts b/maestro-orchestra-models/build.gradle.kts
+index 040e4b9..8e81a01 100644
+--- a/maestro-orchestra-models/build.gradle.kts
++++ b/maestro-orchestra-models/build.gradle.kts
+@@ -30,6 +30,7 @@ tasks.named("compileKotlin", KotlinCompilationTask::class.java) {
+ 
+ dependencies {
+     implementation(project(":maestro-client"))
++    implementation(project(":maestro-ios-driver"))
+     implementation(libs.datafaker)
+ 
+     api(libs.jackson.core.databind)
+diff --git a/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt b/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
+index 7ac56c7..aa41709 100644
+--- a/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
++++ b/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
+@@ -4,6 +4,7 @@ import java.io.File
+ import maestro.js.JsEngine
+ import maestro.orchestra.DefineVariablesCommand
+ import maestro.orchestra.MaestroCommand
++import xcuitest.RunnerToken
+ 
+ object Env {
+ 
+@@ -111,7 +112,8 @@ object Env {
+             .filterKeys {
+                 it.startsWith("MAESTRO_") &&
+                     this.containsKey(it).not() &&
+-                    it !in INTERNAL_ONLY_ENV_VARS
++                    it !in INTERNAL_ONLY_ENV_VARS &&
++                    it != RunnerToken.ENVIRONMENT_VARIABLE
+             }
+             .filterValues { it != null && it.isNotEmpty() }
+ 
+diff --git a/maestro-orchestra-models/src/test/kotlin/maestro/orchestra/util/EnvTest.kt b/maestro-orchestra-models/src/test/kotlin/maestro/orchestra/util/EnvTest.kt
+index 5b247e5..852a17d 100644
+--- a/maestro-orchestra-models/src/test/kotlin/maestro/orchestra/util/EnvTest.kt
++++ b/maestro-orchestra-models/src/test/kotlin/maestro/orchestra/util/EnvTest.kt
+@@ -112,6 +112,15 @@ class EnvTest {
+         assertThat(env.containsKey("MAESTRO_SHARD_INDEX")).isFalse()
+     }
+ 
++    @Test
++    fun `withInjectedShellEnvVars never hands the runner token to flows`() {
++        val shell = mapOf("MAESTRO_RUNNER_TOKEN" to "claim-token", "MAESTRO_APP_URL" to "https://example.test")
++
++        val env = emptyEnv.withInjectedShellEnvVars(shell)
++
++        assertThat(env).containsExactly("MAESTRO_APP_URL", "https://example.test")
++    }
++
+     @Test
+     fun `withInjectedShellEnvVars does not strip previous MAESTRO_ vars`() {
+         val rand = Random.nextInt()

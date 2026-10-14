@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Expo Example",
+    "slug": "expo-app",
+    "version": "1.0.0",
+    "scheme": "expoexample",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.example.expoapp",
+      "supportsTablet": false,
+      "infoPlist": {
+        "EXDevMenuIsOnboardingFinished": true,
+        "EXDevMenuShowsAtLaunch": false,
+        "EXDevMenuShowFloatingActionButton": false
+      }
+    },
+    "android": {
+      "package": "com.example.expoapp",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-dev-client",
+        {
+          "launchMode": "launcher"
+        }
+      ],
+      [
+        "./plugins/with-android-dev-menu",
+        {
+          "EXDevMenuIsOnboardingFinished": true,
+          "EXDevMenuShowsAtLaunch": false,
+          "EXDevMenuShowFloatingActionButton": false
+        }
+      ]
+    ]
+  }
+}

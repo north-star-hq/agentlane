@@ -1,0 +1,12 @@
+docs/
+pnpm-lock.yaml
+tests/fixtures/ios-26.5/
+tests/fixtures/android-36/
+tests/fixtures/pages/
+tests/fixtures/recorded-settings.yaml
+examples/
+maestro/work/
+maestro/out/
+schema/
+tests/fixtures/init-0.2.1/
+private/

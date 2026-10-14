@@ -1,0 +1,55 @@
+appId: com.example.expoapp
+name: Read the API result
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+      apiBaseUrl: http://localhost:${API_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-open-api
+    timeout: 60000
+- tapOn:
+    id: home-open-api
+- extendedWaitUntil:
+    visible:
+      id: api-result
+    timeout: 10000
+- assertVisible:
+    id: api-base-url
+    text: 'API: http://localhost:${API_PORT}'
+- assertVisible:
+    id: api-served-by
+    text: 'Served by port ${API_PORT}'
+- assertVisible:
+    id: api-item-harbor
+- assertVisible:
+    id: api-item-gallery
+- tapOn:
+    id: api-reload
+- extendedWaitUntil:
+    visible:
+      id: api-item-market
+    timeout: 10000
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: BackButton
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - back
+- assertVisible:
+    id: home-open-api

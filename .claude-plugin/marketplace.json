@@ -1,0 +1,12 @@
+{
+  "name": "agentlane",
+  "owner": { "name": "North Star" },
+  "description": "The toolkit's Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "agentlane",
+      "source": "./plugin",
+      "description": "The device and browser tools, the guard and session-end hooks, and the setup, driving and run-loop skills."
+    }
+  ]
+}

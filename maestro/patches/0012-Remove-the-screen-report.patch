@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:33:17 -0400
+Subject: [PATCH] Remove the screen report
+
+When a local session ended, a shutdown hook posted the deepest view
+hierarchy seen in the run to api.copilot.mobile.dev/maestro/screen.
+---
+ .../src/main/java/maestro/cli/api/ApiClient.kt    |  9 ---------
+ .../maestro/cli/session/MaestroSessionManager.kt  |  2 --
+ .../main/java/maestro/cli/util/ScreenReporter.kt  | 15 ---------------
+ 3 files changed, 26 deletions(-)
+ delete mode 100644 maestro-cli/src/main/java/maestro/cli/util/ScreenReporter.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+index 0f7d39c..8073c5c 100644
+--- a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
++++ b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+@@ -84,15 +84,6 @@ class ApiClient(
+             return domain ?: "mobile.dev"
+         }
+ 
+-    fun sendScreenReport(maxDepth: Int) {
+-        post<Unit>(
+-            path = "/maestro/screen",
+-            body = mapOf(
+-                "maxDepth" to maxDepth
+-            )
+-        )
+-    }
+-
+     fun getAuthUrl(port: String): String {
+         return "$baseUrl/v2/maestroLogin/authUrl?port=$port"
+     }
+diff --git a/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt b/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
+index cc05d69..37c5fdc 100644
+--- a/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
++++ b/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
+@@ -31,7 +31,6 @@ import maestro.cli.device.PickDeviceInteractor
+ import maestro.device.Platform
+ import maestro.utils.CliInsights
+ import maestro.cli.report.TestDebugReporter
+-import maestro.cli.util.ScreenReporter
+ import maestro.drivers.AndroidDriver
+ import maestro.drivers.IOSDriver
+ import maestro.orchestra.WorkspaceConfig.PlatformConfiguration
+@@ -124,7 +123,6 @@ object MaestroSessionManager {
+         Runtime.getRuntime().addShutdownHook(thread(start = false) {
+             heartbeatFuture.cancel(true)
+             SessionStore.default.delete(sessionId, selectedDevice.platform, effectiveDeviceId)
+-            runCatching { ScreenReporter.reportMaxDepth() }
+             if (SessionStore.default.shouldCloseSession(selectedDevice.platform, effectiveDeviceId)) {
+                 session.close()
+             }
+diff --git a/maestro-cli/src/main/java/maestro/cli/util/ScreenReporter.kt b/maestro-cli/src/main/java/maestro/cli/util/ScreenReporter.kt
+deleted file mode 100644
+index a38d621..0000000
+--- a/maestro-cli/src/main/java/maestro/cli/util/ScreenReporter.kt
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package maestro.cli.util
+-
+-import maestro.cli.api.ApiClient
+-import maestro.utils.DepthTracker
+-
+-object ScreenReporter {
+-
+-    fun reportMaxDepth() {
+-        val maxDepth = DepthTracker.getMaxDepth()
+-
+-        if (maxDepth == 0) return
+-
+-        ApiClient(EnvUtils.BASE_API_URL).sendScreenReport(maxDepth = maxDepth)
+-    }
+-}

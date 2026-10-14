@@ -1,0 +1,63 @@
+{
+  "name": "agentlane",
+  "version": "0.3.0",
+  "description": "Gives each coding agent its own lane: a running copy of your app with its own ports, dev servers, database, and a simulator, emulator or browser to drive it.",
+  "keywords": [
+    "ai-agents",
+    "coding-agents",
+    "mcp",
+    "claude-code",
+    "codex",
+    "cursor",
+    "ios-simulator",
+    "android-emulator",
+    "playwright",
+    "maestro",
+    "worktrees",
+    "dev-environment"
+  ],
+  "homepage": "https://north-star-hq.github.io/agentlane/",
+  "bugs": "https://github.com/north-star-hq/agentlane/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/north-star-hq/agentlane.git"
+  },
+  "license": "MIT",
+  "author": "North Star",
+  "type": "module",
+  "bin": {
+    "agentlane": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "schema",
+    "skills",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.11.2",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint . && prettier --check .",
+    "lint:sh": "git ls-files -z '*.sh' | xargs -0 -r shellcheck",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test 'tests/**/*.test.ts'",
+    "schema": "node src/cli.ts schema > schema/agentlane.schema.json",
+    "hero": "node scripts/hero/generate.ts",
+    "site": "node site/build/build.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.2",
+    "eslint": "^10.12.0",
+    "marked": "18.1.1",
+    "prettier": "^3.9.10",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.1"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}

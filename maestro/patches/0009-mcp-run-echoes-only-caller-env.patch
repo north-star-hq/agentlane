@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:58:07 -0400
+Subject: [PATCH] fix(mcp): echo only the caller's env in the run tool's result
+
+The run tool's result listed env_vars as the caller's env plus every
+non-empty MAESTRO_* variable from the server's own environment, which
+withInjectedShellEnvVars adds for the flows. Those variables belong to
+whoever started the server, and the result handed all of them to the agent
+that called the tool.
+
+The flows still get the shell's MAESTRO_* variables as before. The result
+now lists only the env the caller passed, and leaves env_vars out when the
+caller passed none.
+
+withInjectedShellEnvVars and RunTool.handle take the shell environment as
+a parameter, defaulting to System.getenv(), so the tests can set one.
+---
+ .../java/maestro/cli/mcp/tools/RunTool.kt     | 15 +--
+ .../maestro/cli/mcp/tools/RunToolTest.kt      | 94 +++++++++++++++++++
+ .../main/java/maestro/orchestra/util/Env.kt   |  6 +-
+ 3 files changed, 107 insertions(+), 8 deletions(-)
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/tools/RunTool.kt b/maestro-cli/src/main/java/maestro/cli/mcp/tools/RunTool.kt
+index f34ac24..708c94f 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/tools/RunTool.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/tools/RunTool.kt
+@@ -65,6 +65,7 @@ object RunTool {
+     internal fun handle(
+         request: CallToolRequest,
+         sessionManager: McpMaestroSessionManager,
++        shellEnv: Map<String, String> = System.getenv(),
+     ): CallToolResult {
+         val args = when (val parsed = RunToolArgs.parse(request.arguments)) {
+             is ParseResult.Failure -> return errorResult(parsed.message)
+@@ -85,8 +86,8 @@ object RunTool {
+             ) { session ->
+                 val orchestra = McpViewerOrchestra.create(session.maestro)
+                 when (executable) {
+-                    is Executable.Inline -> runInline(args.deviceId, orchestra, executable.yaml, args.env)
+-                    is Executable.Plan -> runPlan(args.deviceId, orchestra, executable.plan, args.env)
++                    is Executable.Inline -> runInline(args.deviceId, orchestra, executable.yaml, args.env, shellEnv)
++                    is Executable.Plan -> runPlan(args.deviceId, orchestra, executable.plan, args.env, shellEnv)
+                 }
+             }
+ 
+@@ -155,8 +156,9 @@ object RunTool {
+         orchestra: Orchestra,
+         yaml: String,
+         env: Map<String, String>,
++        shellEnv: Map<String, String>,
+     ): RunResult {
+-        val envWithShell = env.withInjectedShellEnvVars()
++        val envWithShell = env.withInjectedShellEnvVars(shellEnv)
+         val tempFile = Files.createTempFile("maestro-flow", ".yaml").toFile()
+         return try {
+             tempFile.writeText(yaml)
+@@ -169,7 +171,7 @@ object RunTool {
+                     put("device_id", deviceId)
+                     put("commands_executed", commands.size)
+                     put("message", "Flow executed successfully")
+-                    if (envWithShell.isNotEmpty()) putEnv("env_vars", envWithShell)
++                    if (env.isNotEmpty()) putEnv("env_vars", env)
+                 },
+                 success = true,
+             )
+@@ -183,8 +185,9 @@ object RunTool {
+         orchestra: Orchestra,
+         plan: ExecutionPlan,
+         env: Map<String, String>,
++        shellEnv: Map<String, String>,
+     ): RunResult {
+-        val envWithShell = env.withInjectedShellEnvVars()
++        val envWithShell = env.withInjectedShellEnvVars(shellEnv)
+         val results = mutableListOf<FlowResult>()
+ 
+         // Sequence flows run first, matching `maestro test` CLI semantics.
+@@ -226,7 +229,7 @@ object RunTool {
+                     }
+                 }
+             }
+-            if (envWithShell.isNotEmpty()) putEnv("env_vars", envWithShell)
++            if (env.isNotEmpty()) putEnv("env_vars", env)
+             put(
+                 "message",
+                 if (allOk) "All flows executed successfully" else "Some flows failed to execute",
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/RunToolTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/RunToolTest.kt
+index ca6dbd4..597efaa 100644
+--- a/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/RunToolTest.kt
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/RunToolTest.kt
+@@ -11,8 +11,16 @@ import kotlinx.serialization.json.buildJsonObject
+ import kotlinx.serialization.json.put
+ import kotlinx.serialization.json.putJsonArray
+ import kotlinx.serialization.json.putJsonObject
++import io.mockk.mockk
++import io.mockk.verify
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.jsonObject
++import maestro.Driver
++import maestro.Maestro
+ import maestro.cli.mcp.McpMaestroSessionManager
+ import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.io.TempDir
++import java.nio.file.Path
+ 
+ class RunToolTest {
+ 
+@@ -171,6 +179,87 @@ class RunToolTest {
+         assertThat(text).contains("device_id")
+     }
+ 
++    @Test
++    fun `inline run echoes only the env the caller passed, and the flow still gets the shell's MAESTRO_ variables`() {
++        val driver = recordingDriver()
++        val manager = sessionManager(driver)
++
++        val result = RunTool.handle(
++            runRequest {
++                put("yaml", TYPE_SHELL_VARIABLE_FLOW)
++                putJsonObject("env") { put("GREETING", "hi") }
++            },
++            manager,
++            shellEnv = SHELL_ENV,
++        )
++
++        val text = (result.content.single() as TextContent).text
++        assertThat(result.isError).isFalse()
++        assertThat(Json.parseToJsonElement(text).jsonObject["env_vars"]).isEqualTo(buildJsonObject { put("GREETING", "hi") })
++        assertThat(text).doesNotContain("MAESTRO_SHELL_ONLY")
++        assertThat(text).doesNotContain("from-the-shell")
++        verify { driver.inputText("from-the-shell") }
++        manager.close()
++    }
++
++    @Test
++    fun `a run of flow files echoes only the env the caller passed`(@TempDir dir: Path) {
++        val flow = dir.resolve("type.yaml").toFile().apply { writeText(TYPE_SHELL_VARIABLE_FLOW) }
++        val driver = recordingDriver()
++        val manager = sessionManager(driver)
++
++        val result = RunTool.handle(
++            runRequest {
++                putJsonArray("files") { add(flow.absolutePath) }
++                putJsonObject("env") { put("GREETING", "hi") }
++            },
++            manager,
++            shellEnv = SHELL_ENV,
++        )
++
++        val text = (result.content.single() as TextContent).text
++        assertThat(result.isError).isFalse()
++        assertThat(Json.parseToJsonElement(text).jsonObject["env_vars"]).isEqualTo(buildJsonObject { put("GREETING", "hi") })
++        assertThat(text).doesNotContain("from-the-shell")
++        verify { driver.inputText("from-the-shell") }
++        manager.close()
++    }
++
++    @Test
++    fun `a run without env echoes no env, whatever MAESTRO_ variables the shell holds`() {
++        val manager = sessionManager(recordingDriver())
++
++        val result = RunTool.handle(runRequest { put("yaml", TYPE_SHELL_VARIABLE_FLOW) }, manager, shellEnv = SHELL_ENV)
++
++        val text = (result.content.single() as TextContent).text
++        assertThat(result.isError).isFalse()
++        assertThat(Json.parseToJsonElement(text).jsonObject).doesNotContainKey("env_vars")
++        manager.close()
++    }
++
++    private fun recordingDriver(): Driver = mockk(relaxed = true)
++
++    private fun sessionManager(driver: Driver) = McpMaestroSessionManager(
++        sessionFactory = { deviceId ->
++            McpMaestroSessionManager.McpMaestroSession(
++                maestro = Maestro(driver),
++                platform = "android",
++                streamDeviceType = null,
++                deviceId = deviceId,
++            )
++        },
++    )
++
++    private fun runRequest(builder: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) = CallToolRequest(
++        CallToolRequestParams(
++            name = "run",
++            arguments = buildArgs {
++                put("device_id", "device-1")
++                builder()
++            },
++        )
++    )
++
+     private fun expectParseSuccess(arguments: JsonObject): RunToolArgs {
+         val result = RunToolArgs.parse(arguments)
+         assertThat(result).isInstanceOf(ParseResult.Success::class.java)
+@@ -185,4 +274,9 @@ class RunToolTest {
+ 
+     private fun buildArgs(builder: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit): JsonObject =
+         buildJsonObject(builder)
++
++    private companion object {
++        const val TYPE_SHELL_VARIABLE_FLOW = "appId: com.example.app\n---\n- inputText: \${MAESTRO_SHELL_ONLY}\n"
++        val SHELL_ENV = mapOf("MAESTRO_SHELL_ONLY" to "from-the-shell", "PATH" to "/usr/bin")
++    }
+ }
+diff --git a/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt b/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
+index cfc425e..7ac56c7 100644
+--- a/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
++++ b/maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
+@@ -104,8 +104,10 @@ object Env {
+         "MAESTRO_SHARD_INDEX",
+     )
+ 
+-    fun Map<String, String>.withInjectedShellEnvVars(): Map<String, String> = this +
+-        System.getenv()
++    fun Map<String, String>.withInjectedShellEnvVars(
++        shellEnv: Map<String, String> = System.getenv(),
++    ): Map<String, String> = this +
++        shellEnv
+             .filterKeys {
+                 it.startsWith("MAESTRO_") &&
+                     this.containsKey(it).not() &&

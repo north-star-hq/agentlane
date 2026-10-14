@@ -1,0 +1,37 @@
+appId: com.example.expoapp
+name: Launched without -apiBaseUrl, the API screen says no API is configured
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-open-api
+    timeout: 60000
+- tapOn:
+    id: home-open-api
+- assertVisible:
+    id: api-unconfigured
+- assertVisible: No API configured
+- assertNotVisible:
+    id: api-base-url
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: BackButton
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - back

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "d=\"${CURSOR_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" hook pre-tool-use --agent cursor; fi; echo '{\"permission\":\"allow\"}'",
+        "timeout": 30
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "d=\"${CURSOR_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" hook session-end --agent cursor; fi; exit 0",
+        "timeout": 10
+      }
+    ]
+  }
+}

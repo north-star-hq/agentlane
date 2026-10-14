@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:51:42 -0400
+Subject: [PATCH] feat(ios): put each element's XCUIElement type in the view
+ hierarchy
+
+IOSDriver.mapViewHierarchy dropped the runner's elementType, so an iOS
+hierarchy, and the MCP inspect_screen output built from it, said nothing
+about whether an element is a button, a cell or a switch. It now sets
+the class attribute to the XCUIElement.ElementType raw value (9 is a
+button, 75 a cell), which the compact output already emits as cls. The
+iOS ui_schema names the cls abbreviation, as the Android one does.
+---
+ .../cli/mcp/tools/ViewHierarchyFormatters.kt  |  1 +
+ .../mcp/tools/ViewHierarchyFormattersTest.kt  | 22 +++++++++++++++++
+ .../main/java/maestro/drivers/IOSDriver.kt    |  1 +
+ .../java/maestro/drivers/IOSDriverTest.kt     | 24 +++++++++++++++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/tools/ViewHierarchyFormatters.kt b/maestro-cli/src/main/java/maestro/cli/mcp/tools/ViewHierarchyFormatters.kt
+index 3567cbf..bca0f60 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/tools/ViewHierarchyFormatters.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/tools/ViewHierarchyFormatters.kt
+@@ -258,6 +258,7 @@ object ViewHierarchyFormatters {
+                 "a11y" to "accessibilityText",
+                 "hint" to "hintText",
+                 "val" to "value",
++                "cls" to "class",
+                 "c" to "children"
+             ),
+             "defaults" to mapOf(
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/ViewHierarchyFormattersTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/ViewHierarchyFormattersTest.kt
+index bf642ca..2724687 100644
+--- a/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/ViewHierarchyFormattersTest.kt
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/ViewHierarchyFormattersTest.kt
+@@ -74,6 +74,28 @@ class ViewHierarchyFormattersTest {
+         assertThat(elements[0]["val"]).isEqualTo("Hello")
+     }
+ 
++    @Test
++    fun `compact json for ios carries the element type as cls and names it in the schema`() {
++        val tree = TreeNode(
++            attributes = mutableMapOf(
++                "bounds" to "[0,0][50,50]",
++                "accessibilityText" to "General",
++                "class" to "9",
++            ),
++        )
++
++        val json = ViewHierarchyFormatters.extractCompactJsonOutput(tree, "ios")
++        val parsed: Map<String, Any?> = jacksonObjectMapper().readValue(json)
++
++        @Suppress("UNCHECKED_CAST")
++        val schema = parsed["ui_schema"] as Map<String, Any?>
++        @Suppress("UNCHECKED_CAST")
++        assertThat((schema["abbreviations"] as Map<String, Any?>)["cls"]).isEqualTo("class")
++        @Suppress("UNCHECKED_CAST")
++        val elements = parsed["elements"] as List<Map<String, Any?>>
++        assertThat(elements[0]["cls"]).isEqualTo("9")
++    }
++
+     @Test
+     fun `unknown platform falls back to ios schema`() {
+         val tree = TreeNode(attributes = mutableMapOf("bounds" to "[0,0][10,10]", "text" to "x"))
+diff --git a/maestro-client/src/main/java/maestro/drivers/IOSDriver.kt b/maestro-client/src/main/java/maestro/drivers/IOSDriver.kt
+index 8af50e6..8fa6c62 100644
+--- a/maestro-client/src/main/java/maestro/drivers/IOSDriver.kt
++++ b/maestro-client/src/main/java/maestro/drivers/IOSDriver.kt
+@@ -216,6 +216,7 @@ class IOSDriver(
+         attributes["text"] = element.title?.ifEmpty { element.value } ?: ""
+         attributes["hintText"] = element.placeholderValue ?: ""
+         attributes["resource-id"] = element.identifier
++        attributes["class"] = element.elementType.toString()
+         attributes["bounds"] = element.frame.boundsString
+         attributes["enabled"] = element.enabled.toString()
+         attributes["focused"] = element.hasFocus.toString()
+diff --git a/maestro-client/src/test/java/maestro/drivers/IOSDriverTest.kt b/maestro-client/src/test/java/maestro/drivers/IOSDriverTest.kt
+index a8e332f..be659ab 100644
+--- a/maestro-client/src/test/java/maestro/drivers/IOSDriverTest.kt
++++ b/maestro-client/src/test/java/maestro/drivers/IOSDriverTest.kt
+@@ -3,6 +3,9 @@ package maestro.drivers
+ import com.google.common.truth.Truth.assertThat
+ import device.IOSDevice
+ import device.IOSScreenRecording
++import hierarchy.AXElement
++import hierarchy.AXFrame
++import hierarchy.ViewHierarchy
+ import io.mockk.every
+ import io.mockk.mockk
+ import io.mockk.verify
+@@ -93,4 +96,25 @@ class IOSDriverTest {
+ 
+         verify(exactly = 3) { iosDevice.deviceInfo() }
+     }
++
++    @Test
++    fun `the view hierarchy carries each element's XCUIElement type as its class`() {
++        fun element(elementType: Int, label: String, children: List<AXElement> = emptyList()) = AXElement(
++            label = label, elementType = elementType, identifier = "", horizontalSizeClass = 0, windowContextID = 0,
++            verticalSizeClass = 0, selected = false, displayID = 0, hasFocus = false, placeholderValue = null,
++            value = null, frame = AXFrame(0f, 0f, 100f, 40f), enabled = true, title = null,
++            children = ArrayList(children),
++        )
++        val iosDevice = mockk<IOSDevice>(relaxed = true)
++        every { iosDevice.viewHierarchy(any()) } returns ViewHierarchy(
++            axElement = element(2, "Settings", listOf(element(9, "General"), element(75, "Wi-Fi"))),
++            depth = 2,
++        )
++
++        val root = IOSDriver(iosDevice).contentDescriptor(excludeKeyboardElements = false)
++
++        assertThat(root.attributes["class"]).isEqualTo("2")
++        assertThat(root.children.map { it.attributes["accessibilityText"] to it.attributes["class"] })
++            .containsExactly("General" to "9", "Wi-Fi" to "75")
++    }
+ }

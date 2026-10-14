@@ -1,0 +1,67 @@
+{
+  "$schema": "../../schema/agentlane.schema.json",
+  "app": {
+    "platform": "ios",
+    "bundleId": "com.example.expoapp",
+    "scheme": "expoexample",
+    "launch": "dev-client",
+    "android": { "output": "build/android/app-debug.apk" }
+  },
+  "web": { "service": "web", "path": "/", "browser": { "driver": "playwright" } },
+  "services": {
+    "metro": {
+      "type": "metro",
+      "platforms": ["ios", "android"],
+      "start": "EXPO_NO_TELEMETRY=1 exec node_modules/.bin/expo start --dev-client --port \"$AGENTLANE_METRO_PORT\" </dev/null",
+      "ready": { "kind": "http", "path": "/status", "body": "packager-status:running" },
+      "timeoutSeconds": 120
+    },
+    "api": {
+      "type": "api",
+      "start": "PORT=\"$AGENTLANE_API_PORT\" exec node api/server.mjs",
+      "ready": { "kind": "http", "path": "/health" },
+      "dial": { "argument": "-apiBaseUrl" }
+    },
+    "web": {
+      "type": "web",
+      "start": "API_URL=\"http://127.0.0.1:$AGENTLANE_API_PORT\" exec node_modules/.bin/vite web --port \"$AGENTLANE_WEB_PORT\" --strictPort --host 127.0.0.1 </dev/null",
+      "ready": { "kind": "http", "path": "/" }
+    }
+  },
+  "resources": {
+    "db": {
+      "create": "node api/database.mjs create",
+      "exports": ["DATABASE_PATH"],
+      "teardown": "rm -f -- \"${DATABASE_PATH:?}\" \"$DATABASE_PATH-journal\""
+    }
+  },
+  "hooks": {
+    "setup": "pnpm install --frozen-lockfile",
+    "signin": "node scripts/signin.mjs",
+    "build": "scripts/build-$AGENTLANE_PLATFORM.sh \"$AGENTLANE_DEVICE\""
+  },
+  "preconditions": [
+    {
+      "name": "CocoaPods is installed",
+      "run": "command -v pod",
+      "fix": "install CocoaPods, for example with brew install cocoapods",
+      "platforms": ["ios"]
+    },
+    {
+      "name": "node_modules is installed",
+      "run": "test -d node_modules",
+      "fix": "run pnpm install --frozen-lockfile in examples/expo-app",
+      "before": "build"
+    }
+  ],
+  "buildCache": {
+    "inputs": [
+      { "kind": "files", "paths": ["app.json", "package.json", "pnpm-lock.yaml", "assets", "plugins"] },
+      { "kind": "files", "paths": ["scripts/build-ios.sh", "scripts/ios-common.sh"], "platforms": ["ios"] },
+      { "kind": "files", "paths": ["scripts/build-android.sh", "modules"], "platforms": ["android"] },
+      { "kind": "command", "run": "pod --version", "platforms": ["ios"] }
+    ],
+    "cacheableVariants": ["Debug"]
+  },
+  "driver": { "flows": ".maestro" }
+}

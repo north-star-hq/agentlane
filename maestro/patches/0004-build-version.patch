@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:38:53 -0400
+Subject: [PATCH] build: name the distribution's build in maestro --version
+
+A build can pass -PmaestroBuildVersion=<version> to say which patched build it
+is. createProperties writes it to version.properties as buildVersion, and
+maestro --version prints it. Without the property, buildVersion is the CLI
+version, so stock builds print what they printed before.
+
+The version key keeps the plain CLI version, because CliVersion.parse accepts
+only major.minor.patch and the update check, the cloud API headers and the
+real-device driver build read that key.
+---
+ maestro-cli/build.gradle.kts                 | 1 +
+ maestro-cli/src/main/java/maestro/cli/App.kt | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/maestro-cli/build.gradle.kts b/maestro-cli/build.gradle.kts
+index 7d09274..1f6ad66 100644
+--- a/maestro-cli/build.gradle.kts
++++ b/maestro-cli/build.gradle.kts
+@@ -357,6 +357,7 @@ tasks.create("createProperties") {
+         File("$buildDir/resources/main/version.properties").writer().use { w ->
+             val p = Properties()
+             p["version"] = CLI_VERSION
++            p["buildVersion"] = project.findProperty("maestroBuildVersion")?.toString() ?: CLI_VERSION
+             p.store(w, null)
+         }
+     }
+diff --git a/maestro-cli/src/main/java/maestro/cli/App.kt b/maestro-cli/src/main/java/maestro/cli/App.kt
+index 8df1b2f..2d621e4 100644
+--- a/maestro-cli/src/main/java/maestro/cli/App.kt
++++ b/maestro-cli/src/main/java/maestro/cli/App.kt
+@@ -115,7 +115,7 @@ private fun printVersion() {
+         Properties().apply { load(it) }
+     }
+ 
+-    println(props["version"])
++    println(props["buildVersion"] ?: props["version"])
+ }
+ 
+ fun main(args: Array<String>) {

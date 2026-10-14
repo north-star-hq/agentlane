@@ -1,0 +1,40 @@
+/* agentlane brand tokens. Fonts: Overpass (SIL Open Font License 1.1), Overpass Mono (SIL Open Font License 1.1) */
+:root {
+  color-scheme: light dark;
+  --al-font-heading: 'Overpass', system-ui, sans-serif;
+  --al-font-body: 'Overpass', system-ui, sans-serif;
+  --al-font-code: 'Overpass Mono', ui-monospace, monospace;
+  --al-weight-heading: 800;
+  --al-bg: #f4f4f2;
+  --al-surface: #ffffff;
+  --al-text: #121316;
+  --al-muted: #585b62;
+  --al-border: #d9dad6;
+  --al-accent: #ffc629;
+  --al-accent-text: #855a00;
+  --al-on-accent: #121316;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --al-bg: #0e0f12;
+    --al-surface: #181a1f;
+    --al-text: #f3f3f1;
+    --al-muted: #9ea1a8;
+    --al-border: #2b2e35;
+    --al-accent: #ffc629;
+    --al-accent-text: #ffc629;
+    --al-on-accent: #121316;
+  }
+}
+
+:root[data-theme='dark'] {
+  --al-bg: #0e0f12;
+  --al-surface: #181a1f;
+  --al-text: #f3f3f1;
+  --al-muted: #9ea1a8;
+  --al-border: #2b2e35;
+  --al-accent: #ffc629;
+  --al-accent-text: #ffc629;
+  --al-on-accent: #121316;
+}

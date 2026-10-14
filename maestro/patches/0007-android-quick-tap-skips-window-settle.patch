@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 01:10:41 -0400
+Subject: [PATCH] fix(android): let waitToSettleTimeoutMs 0 skip the window
+ settle loop
+
+On Android, a tapOn in a flow with an appId waits in waitForWindowToSettle
+for a fixed WINDOW_UPDATE_TIMEOUT_MS (750 ms) before every tap. Each pass
+asks the device whether the window is updating, and one probe can block
+for 500 ms on the device. The loop ignores waitToSettleTimeoutMs, so a
+flow that asks for no settle wait still pays it, and a one-step tap takes
+about 1.5 s.
+
+With waitToSettleTimeoutMs 0, AndroidDriver.waitForAppToSettle now returns
+null for an app id without asking the device. Maestro.tap then aims with
+the hierarchy it already holds, as it does when IOSDriver finds the screen
+static, and it still re-reads the element after a recent scroll. A
+positive timeout, or none, runs the loop as before.
+---
+ .../java/maestro/drivers/AndroidDriver.kt     |  7 ++-
+ .../drivers/AndroidDriverWindowSettleTest.kt  | 49 +++++++++++++++++++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+ create mode 100644 maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+
+diff --git a/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt b/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
+index 8211337..6ad0f78 100644
+--- a/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
++++ b/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
+@@ -715,7 +715,12 @@ class AndroidDriver(
+ 
+     override fun waitForAppToSettle(initialHierarchy: ViewHierarchy?, appId: String?, timeoutMs: Int?): ViewHierarchy? {
+         return metrics.measured("operation", mapOf("command" to "waitForAppToSettle", "appId" to appId, "timeoutMs" to timeoutMs.toString())) {
+-            if (appId != null) {
++            if (appId != null && timeoutMs == 0) {
++                // waitToSettleTimeoutMs: 0 asks for no settle wait. The window loop below ignores the timeout and
++                // always runs for WINDOW_UPDATE_TIMEOUT_MS, so it is skipped; a null result makes Maestro.tap aim with
++                // the hierarchy it already holds, as it does when IOSDriver finds the screen static.
++                null
++            } else if (appId != null) {
+                 waitForWindowToSettle(appId, initialHierarchy, timeoutMs)
+             } else {
+                 ScreenshotUtils.waitForAppToSettle(initialHierarchy, this, timeoutMs)
+diff --git a/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt b/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+new file mode 100644
+index 0000000..2832a4c
+--- /dev/null
++++ b/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+@@ -0,0 +1,49 @@
++package maestro.drivers
++
++import com.google.common.truth.Truth.assertThat
++import io.mockk.MockKException
++import io.mockk.mockk
++import maestro.TreeNode
++import maestro.ViewHierarchy
++import maestro.android.AndroidDeviceConnection
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertThrows
++
++/**
++ * [AndroidDriver.waitForAppToSettle] with an app id. The connection is a strict mock, so any device call throws
++ * MockKException naming the call: a test passes without one only if the driver asked the device nothing.
++ */
++class AndroidDriverWindowSettleTest {
++
++    private val hierarchy = ViewHierarchy(TreeNode(attributes = mutableMapOf("resource-id" to "root")))
++
++    @Test
++    fun `a zero waitToSettleTimeoutMs skips the window settle loop and asks the device nothing`() {
++        val driver = AndroidDriver(mockk<AndroidDeviceConnection>())
++
++        val started = System.nanoTime()
++        val settled = driver.waitForAppToSettle(hierarchy, "com.example.app", 0)
++        val elapsedMs = (System.nanoTime() - started) / 1_000_000
++
++        assertThat(settled).isNull()
++        assertThat(elapsedMs).isLessThan(500)
++    }
++
++    @Test
++    fun `without a timeout the window settle loop still asks the device whether the window is updating`() {
++        val driver = AndroidDriver(mockk<AndroidDeviceConnection>())
++
++        val error = assertThrows<MockKException> { driver.waitForAppToSettle(hierarchy, "com.example.app", null) }
++
++        assertThat(error.message).contains("isWindowUpdating")
++    }
++
++    @Test
++    fun `a positive timeout still runs the window settle loop`() {
++        val driver = AndroidDriver(mockk<AndroidDeviceConnection>())
++
++        val error = assertThrows<MockKException> { driver.waitForAppToSettle(hierarchy, "com.example.app", 200) }
++
++        assertThat(error.message).contains("isWindowUpdating")
++    }
++}

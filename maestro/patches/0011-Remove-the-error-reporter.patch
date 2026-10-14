@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:32:56 -0400
+Subject: [PATCH] Remove the error reporter
+
+When a command threw, the CLI posted the exception and the expanded
+command line to api.copilot.mobile.dev/maestro/error, with no setting to
+turn it off. The error still prints locally; nothing is sent.
+---
+ maestro-cli/src/main/java/maestro/cli/App.kt  |  3 --
+ .../main/java/maestro/cli/api/ApiClient.kt    | 10 -----
+ .../java/maestro/cli/util/ErrorReporter.kt    | 44 -------------------
+ 3 files changed, 57 deletions(-)
+ delete mode 100644 maestro-cli/src/main/java/maestro/cli/util/ErrorReporter.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/App.kt b/maestro-cli/src/main/java/maestro/cli/App.kt
+index 49e621e..2495985 100644
+--- a/maestro-cli/src/main/java/maestro/cli/App.kt
++++ b/maestro-cli/src/main/java/maestro/cli/App.kt
+@@ -42,7 +42,6 @@ import maestro.cli.command.StudioCommand
+ import maestro.cli.command.TestCommand
+ import maestro.cli.insights.TestAnalysisManager
+ import maestro.cli.mcp.claimMcpStdout
+-import maestro.cli.util.ErrorReporter
+ import maestro.debuglog.DebugLogStore
+ import maestro.debuglog.LogConfig
+ import picocli.AutoComplete.GenerateCompletion
+@@ -146,8 +145,6 @@ fun main(args: Array<String>) {
+             .setExecutionStrategy(DisableAnsiMixin::executionStrategy)
+             .setExecutionExceptionHandler { ex, cmd, cmdParseResult ->
+ 
+-                runCatching { ErrorReporter.report(ex, cmdParseResult) }
+-
+                 // make errors red
+                 println()
+                 cmd.colorScheme = CommandLine.Help.ColorScheme.Builder()
+diff --git a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+index 1f1573c..0f7d39c 100644
+--- a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
++++ b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+@@ -84,16 +84,6 @@ class ApiClient(
+             return domain ?: "mobile.dev"
+         }
+ 
+-    fun sendErrorReport(exception: Exception, commandLine: String) {
+-        post<Unit>(
+-            path = "/maestro/error",
+-            body = mapOf(
+-                "exception" to exception,
+-                "commandLine" to commandLine
+-            )
+-        )
+-    }
+-
+     fun sendScreenReport(maxDepth: Int) {
+         post<Unit>(
+             path = "/maestro/screen",
+diff --git a/maestro-cli/src/main/java/maestro/cli/util/ErrorReporter.kt b/maestro-cli/src/main/java/maestro/cli/util/ErrorReporter.kt
+deleted file mode 100644
+index 1571bac..0000000
+--- a/maestro-cli/src/main/java/maestro/cli/util/ErrorReporter.kt
++++ /dev/null
+@@ -1,44 +0,0 @@
+-package maestro.cli.util
+-
+-import maestro.cli.api.ApiClient
+-import picocli.CommandLine
+-import java.security.MessageDigest
+-import java.util.concurrent.Executors
+-import java.util.concurrent.TimeUnit
+-import kotlin.Exception
+-
+-object ErrorReporter {
+-
+-    private val executor = Executors.newCachedThreadPool {
+-        Executors.defaultThreadFactory().newThread(it).apply { isDaemon = true }
+-    }
+-
+-    fun report(exception: Exception, parseResult: CommandLine.ParseResult) {
+-        val args = parseResult.expandedArgs()
+-        val scrubbedArgs = args.mapIndexed { idx, arg ->
+-            if (idx > 0 && args[idx - 1] in listOf("-e", "--env")) {
+-                val (key, value) = arg.split("=", limit = 1)
+-                key + "=" + hashString(value)
+-            } else arg
+-        }
+-
+-        val task = executor.submit {
+-            ApiClient(EnvUtils.BASE_API_URL).sendErrorReport(
+-                exception,
+-                scrubbedArgs.joinToString(" ")
+-            )
+-        }
+-
+-        runCatching { task.get(1, TimeUnit.SECONDS) }
+-    }
+-
+-    private fun hashString(input: String): String {
+-        return MessageDigest
+-            .getInstance("SHA-256")
+-            .digest(input.toByteArray())
+-            .fold(StringBuilder()) { sb, it ->
+-                sb.append("%02x".format(it))
+-            }.toString()
+-    }
+-
+-}

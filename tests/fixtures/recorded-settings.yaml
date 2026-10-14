@@ -1,0 +1,8 @@
+appId: com.apple.Preferences
+---
+- launchApp
+- waitForAnimationToEnd
+- tapOn:
+    id: com.apple.settings.general
+- assertVisible: About
+- assertNotVisible: Bluetooth

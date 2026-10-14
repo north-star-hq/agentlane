@@ -1,0 +1,66 @@
+name: Release Maestro
+
+on:
+  push:
+    tags: ['maestro-v*']
+
+concurrency:
+  group: release-maestro-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the pinned version
+        run: cat maestro/upstream.env >> "$GITHUB_ENV"
+      - name: Check the tag and that no release exists
+        run: |
+          if [ "$TAG" != "maestro-v$BUILD_VERSION" ]; then
+            echo "::error::Tag $TAG doesn't match BUILD_VERSION in maestro/upstream.env; the tag for this commit is maestro-v$BUILD_VERSION."
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Bump BUILD_VERSION in maestro/upstream.env and tag again."
+            exit 1
+          fi
+      - name: Select JDK 17
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_arm64" >> "$GITHUB_ENV"
+          xcodebuild -version
+          "$JAVA_HOME_17_arm64/bin/java" -version
+      - name: Build
+        run: maestro/build.sh --release --out "$RUNNER_TEMP/out"
+      - name: Verify
+        run: maestro/verify-release.sh --from-dir "$RUNNER_TEMP/out"
+      - name: Publish
+        run: |
+          zip="$RUNNER_TEMP/out/maestro-$BUILD_VERSION.zip"
+          sha=$(cut -d ' ' -f 1 "$zip.sha256")
+          {
+            echo "Maestro $MAESTRO_TAG ($MAESTRO_COMMIT) with these patches:"
+            echo
+            for patch in maestro/patches/*.patch; do
+              echo "- \`$(basename "$patch")\`"
+            done
+            echo
+            echo "sha256 of \`maestro-$BUILD_VERSION.zip\`: \`$sha\`"
+            echo
+            echo "Built with $(xcodebuild -version | head -n 1) on macOS $(sw_vers -productVersion)."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$zip" "$zip.sha256" \
+            --verify-tag \
+            --title "Maestro $BUILD_VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md"

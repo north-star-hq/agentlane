@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:45:19 -0400
+Subject: [PATCH] fix(ios): give each CLI session a free runner port instead of
+ 22087
+
+maestro record, hierarchy and query pass the root --driver-host-port to
+MaestroSessionManager, and without it an iOS session used the fixed port
+22087. Two of them on different simulators at the same time therefore met
+on one port. The runner token makes the second fail with "port taken".
+Without the token, the second would have driven the first one's simulator.
+
+Without --driver-host-port, an iOS session now binds a loopback socket to
+port 0 and uses the port the OS assigns, as maestro test's selectPort and
+the MCP server's per-session ports already do. A port the caller passes is
+still used as is. Android is unchanged: its driver port, 7001, is a port on
+the device, which Maestro opens through the adb transport of that device's
+serial, so no host port is shared.
+
+A second process on a simulator that another CLI session is using no
+longer reaches that session's runner on the shared port. It starts its own
+runner, as maestro test already does.
+---
+ .../cli/session/MaestroSessionManager.kt      | 18 ++++++++----
+ .../cli/session/MaestroSessionManagerTest.kt  | 28 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+ create mode 100644 maestro-cli/src/test/kotlin/maestro/cli/session/MaestroSessionManagerTest.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt b/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
+index 37c5fdc..3c850cc 100644
+--- a/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
++++ b/maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
+@@ -44,6 +44,8 @@ import xcuitest.XCTestDriverClient
+ import xcuitest.installer.Context
+ import xcuitest.installer.LocalXCTestInstaller
+ import xcuitest.installer.LocalXCTestInstaller.*
++import java.net.InetSocketAddress
++import java.net.ServerSocket
+ import java.nio.file.Paths
+ import java.util.UUID
+ import java.util.concurrent.Executors
+@@ -54,7 +56,6 @@ import kotlin.io.path.pathString
+ object MaestroSessionManager {
+     private const val defaultHost = "localhost"
+     private const val defaultXctestHost = "127.0.0.1"
+-    private const val defaultXcTestPort = 22087
+ 
+     private val executor = Executors.newScheduledThreadPool(1)
+     private val logger = LoggerFactory.getLogger(MaestroSessionManager::class.java)
+@@ -243,7 +244,7 @@ object MaestroSessionManager {
+                 maestro = pickIOSDevice(
+                     deviceId = selectedDevice.deviceId,
+                     openDriver = !connectToExistingSession,
+-                    driverHostPort = driverHostPort ?: defaultXcTestPort,
++                    driverHostPort = driverHostPort,
+                     reinstallDriver = reinstallDriver,
+                     platformConfiguration = platformConfiguration,
+                 ),
+@@ -312,7 +313,7 @@ object MaestroSessionManager {
+     private fun pickIOSDevice(
+         deviceId: String?,
+         openDriver: Boolean,
+-        driverHostPort: Int,
++        driverHostPort: Int?,
+         reinstallDriver: Boolean,
+         platformConfiguration: PlatformConfiguration?,
+     ): Maestro {
+@@ -405,10 +406,11 @@ object MaestroSessionManager {
+             else -> throw UnsupportedOperationException("Unsupported device type $deviceType for iOS platform")
+         }
+ 
++        val xcTestPort = xcTestPort(driverHostPort)
+         val xcTestInstaller = LocalXCTestInstaller(
+             deviceId = deviceId,
+             host = defaultXctestHost,
+-            defaultPort = driverHostPort ?: defaultXcTestPort,
++            defaultPort = xcTestPort,
+             reinstallDriver = reinstallDriver,
+             deviceType = iOSDeviceType,
+             iOSDriverConfig = iOSDriverConfig,
+@@ -419,7 +421,7 @@ object MaestroSessionManager {
+ 
+         val xcTestDriverClient = XCTestDriverClient(
+             installer = xcTestInstaller,
+-            client = XCTestClient(defaultXctestHost, driverHostPort ?: defaultXcTestPort),
++            client = XCTestClient(defaultXctestHost, xcTestPort),
+             reinstallDriver = reinstallDriver,
+         )
+ 
+@@ -447,6 +449,12 @@ object MaestroSessionManager {
+         )
+     }
+ 
++    internal fun xcTestPort(driverHostPort: Int?): Int =
++        driverHostPort ?: ServerSocket().use {
++            it.bind(InetSocketAddress(defaultXctestHost, 0))
++            it.localPort
++        }
++
+     private fun pickWebDevice(isStudio: Boolean, isHeadless: Boolean, screenSize: String?): Maestro {
+         return Maestro.web(isStudio, isHeadless, screenSize)
+     }
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/session/MaestroSessionManagerTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/session/MaestroSessionManagerTest.kt
+new file mode 100644
+index 0000000..db327ac
+--- /dev/null
++++ b/maestro-cli/src/test/kotlin/maestro/cli/session/MaestroSessionManagerTest.kt
+@@ -0,0 +1,28 @@
++package maestro.cli.session
++
++import com.google.common.truth.Truth.assertThat
++import org.junit.jupiter.api.Test
++import java.net.InetSocketAddress
++import java.net.ServerSocket
++
++class MaestroSessionManagerTest {
++
++    @Test
++    fun `an iOS session without a driver host port takes a free port, not the 22087 every such session used to share`() {
++        ServerSocket().use { anotherRunner ->
++            anotherRunner.bind(InetSocketAddress("127.0.0.1", 0))
++
++            val port = MaestroSessionManager.xcTestPort(driverHostPort = null)
++
++            assertThat(port).isNotEqualTo(22087)
++            assertThat(port).isNotEqualTo(anotherRunner.localPort)
++            ServerSocket().use { it.bind(InetSocketAddress("127.0.0.1", port)) }
++        }
++    }
++
++    @Test
++    fun `an iOS session uses the driver host port its caller passed`() {
++        assertThat(MaestroSessionManager.xcTestPort(driverHostPort = 22087)).isEqualTo(22087)
++        assertThat(MaestroSessionManager.xcTestPort(driverHostPort = 40123)).isEqualTo(40123)
++    }
++}

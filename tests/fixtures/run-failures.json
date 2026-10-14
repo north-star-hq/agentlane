@@ -1,0 +1,86 @@
+[
+  {
+    "name": "missing-id",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOn:\n    id: \"com.apple.settings.genral\"\n",
+    "error": "Failed to run flow: Element not found: Id matching regex: com.apple.settings.genral",
+    "screen": "settings"
+  },
+  {
+    "name": "missing-text",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOn: \"Genral\"\n",
+    "error": "Failed to run flow: Element not found: Text matching regex: Genral",
+    "screen": "settings"
+  },
+  {
+    "name": "missing-text-index",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOn:\n    text: \"Genral\"\n    index: 1\n",
+    "error": "Failed to run flow: Element not found: Text matching regex: Genral, Index: 1",
+    "screen": "settings"
+  },
+  {
+    "name": "assert-visible",
+    "flow": "appId: com.apple.Preferences\n---\n- assertVisible: \"Bluetooth Settings\"\n",
+    "error": "Failed to run flow: Assertion is false: \"Bluetooth Settings\" is visible",
+    "screen": "settings"
+  },
+  {
+    "name": "assert-visible-id",
+    "flow": "appId: com.apple.Preferences\n---\n- assertVisible:\n    id: com.apple.settings.nope\n    text: Nope\n",
+    "error": "Failed to run flow: Assertion is false: \"Nope\", id: com.apple.settings.nope is visible",
+    "screen": "settings"
+  },
+  {
+    "name": "assert-not-visible",
+    "flow": "appId: com.apple.Preferences\n---\n- assertNotVisible: \"General\"\n",
+    "error": "Failed to run flow: Assertion is false: \"General\" is not visible",
+    "screen": "settings"
+  },
+  {
+    "name": "invalid-yaml",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOn: [General\n",
+    "error": "Failed to run flow: Parsing Failed at /var/folders/2m/j321pv4n7w51fsxrqhsrbjb80000gn/T/maestro-flow133227347758185463.yaml:3:18",
+    "screen": "settings"
+  },
+  {
+    "name": "unknown-command",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOnn: General\n",
+    "error": "Failed to run flow: Invalid Command: tapOnn at /var/folders/2m/j321pv4n7w51fsxrqhsrbjb80000gn/T/maestro-flow13746447664119113069.yaml:3:9",
+    "screen": "settings"
+  },
+  {
+    "name": "no-header",
+    "flow": "- launchApp\n",
+    "error": "Failed to run flow: Config Section Required at /var/folders/2m/j321pv4n7w51fsxrqhsrbjb80000gn/T/maestro-flow10169331395352247607.yaml:1:1",
+    "screen": "settings"
+  },
+  {
+    "name": "timeout",
+    "flow": "appId: com.apple.Preferences\n---\n- extendedWaitUntil:\n    visible: \"Wi-Fi Calling\"\n    timeout: 3000\n",
+    "error": "Failed to run flow: Assertion is false: \"Wi-Fi Calling\" is visible",
+    "screen": "settings"
+  },
+  {
+    "name": "assert-true",
+    "flow": "appId: com.apple.Preferences\n---\n- assertTrue: ${1 == 2}\n",
+    "error": "Failed to run flow: Assertion is false: false is true",
+    "screen": "settings"
+  },
+  {
+    "name": "launch-missing-app",
+    "flow": "appId: com.example.not.installed\n---\n- launchApp\n",
+    "error": "Failed to run flow: An error was encountered processing the command (domain=FBSOpenApplicationServiceErrorDomain, code=4):\nSimulator device failed to launch com.example.not.installed.\nUnderlying error (domain=FBSOpenApplicationServiceErrorDomain, code=4):\n\tThe request to open \"com.example.not.installed\" failed.\n",
+    "screen": "settings"
+  },
+  {
+    "name": "second-step",
+    "flow": "appId: com.apple.Preferences\n---\n- tapOn: \"General\"\n- tapOn: \"Abuot\"\n",
+    "error": "Failed to run flow: Element not found: Text matching regex: Abuot",
+    "screen": "settings-general"
+  },
+  {
+    "name": "open-link-refused",
+    "flow": "appId: com.apple.mobilesafari\n---\n- openLink: 'data:text/html,<canvas>'\n",
+    "error": "Failed to run flow: kotlin.Unit java.lang.IllegalStateException: An error was encountered processing the command (domain=LSApplicationWorkspaceErrorDomain, code=115):\nSimulator device failed to open data:text/html,%3Ccanvas%3E.\nUnderlying error (domain=LSApplicationWorkspaceErrorDomain, code=115):\n\tThe operation couldn\u2019t be completed. (LSApplicationWorkspaceErrorDomain error 115.)\n",
+    "screen": "progress-3"
+  }
+]

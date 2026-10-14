@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 02:35:02 -0400
+Subject: [PATCH] fix(android): let waitToSettleTimeoutMs 0 skip the settle
+ after a tap too
+
+0007 made waitToSettleTimeoutMs 0 skip the window settle loop that runs
+before a tap, where the flow's app id is passed. After the tap,
+Maestro.hierarchyBasedTap calls waitForAppToSettle again without an app
+id, and AndroidDriver sends that to ScreenshotUtils.waitForAppToSettle,
+which reads the view hierarchy twice to compare them. Each read first
+waits on the device for the accessibility event stream to go quiet for
+500 ms (MaestroDriverService.refreshAccessibilityCache), and right after a
+tap that stream is busy, so a tap that asked for no settle wait still
+spends most of a second there. With retryTapIfNoChange false, Maestro's
+default, there is only one attempt, so the comparison decides nothing.
+
+With waitToSettleTimeoutMs 0, AndroidDriver.waitForAppToSettle now returns
+null with or without an app id and asks the device nothing. A positive
+timeout, or none, settles as before.
+
+hierarchyBasedTap counts a null settle as a change, so on its own that
+would stop a tapOn with retryTapIfNoChange: true from ever tapping a
+second time. When another attempt may follow, hierarchyBasedTap now reads
+the hierarchy once itself and compares, so the retry still sees an
+unchanged screen. The last attempt reads nothing, so a quick tap without
+retryTapIfNoChange still reads no hierarchy after the tap.
+---
+ .../src/main/java/maestro/Maestro.kt          |  4 +-
+ .../java/maestro/drivers/AndroidDriver.kt     |  9 ++-
+ .../src/test/java/maestro/TapRetryTest.kt     | 55 +++++++++++++++++++
+ .../drivers/AndroidDriverWindowSettleTest.kt  | 20 ++++++-
+ 4 files changed, 83 insertions(+), 5 deletions(-)
+ create mode 100644 maestro-client/src/test/java/maestro/TapRetryTest.kt
+
+diff --git a/maestro-client/src/main/java/maestro/Maestro.kt b/maestro-client/src/main/java/maestro/Maestro.kt
+index 1f850dc..f0e7542 100644
+--- a/maestro-client/src/main/java/maestro/Maestro.kt
++++ b/maestro-client/src/main/java/maestro/Maestro.kt
+@@ -410,7 +410,7 @@ class Maestro(
+         val hierarchyBeforeTap = initialHierarchy ?: viewHierarchy()
+ 
+         val retries = getNumberOfRetries(retryIfNoChange)
+-        repeat(retries) {
++        repeat(retries) { attempt ->
+             if (longPress) {
+                 runInterruptible(Dispatchers.IO) { driver.longPress(Point(x, y)) }
+             } else if (tapRepeat != null) {
+@@ -427,7 +427,9 @@ class Maestro(
+             } else {
+                 runInterruptible(Dispatchers.IO) { driver.tap(Point(x, y)) }
+             }
++            val anotherTapMayFollow = attempt < retries - 1
+             val hierarchyAfterTap = waitForAppToSettle(waitToSettleTimeoutMs = waitToSettleTimeoutMs)
++                ?: if (anotherTapMayFollow) viewHierarchy() else null
+ 
+             if (hierarchyAfterTap == null || hierarchyBeforeTap != hierarchyAfterTap) {
+                 LOGGER.info("Something has changed in the UI judging by view hierarchy. Proceed.")
+diff --git a/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt b/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
+index 6ad0f78..41aa931 100644
+--- a/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
++++ b/maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
+@@ -715,10 +715,13 @@ class AndroidDriver(
+ 
+     override fun waitForAppToSettle(initialHierarchy: ViewHierarchy?, appId: String?, timeoutMs: Int?): ViewHierarchy? {
+         return metrics.measured("operation", mapOf("command" to "waitForAppToSettle", "appId" to appId, "timeoutMs" to timeoutMs.toString())) {
+-            if (appId != null && timeoutMs == 0) {
++            if (timeoutMs == 0) {
+                 // waitToSettleTimeoutMs: 0 asks for no settle wait. The window loop below ignores the timeout and
+-                // always runs for WINDOW_UPDATE_TIMEOUT_MS, so it is skipped; a null result makes Maestro.tap aim with
+-                // the hierarchy it already holds, as it does when IOSDriver finds the screen static.
++                // always runs for WINDOW_UPDATE_TIMEOUT_MS, and the hierarchy comparison fetches the hierarchy twice,
++                // each fetch waiting on the device for the accessibility stream to go quiet. Both are skipped: a null
++                // result makes Maestro.tap aim with the hierarchy it already holds, as it does when IOSDriver finds the
++                // screen static. After a tap, Maestro.hierarchyBasedTap reads the hierarchy once itself, and only when
++                // retryTapIfNoChange may tap again.
+                 null
+             } else if (appId != null) {
+                 waitForWindowToSettle(appId, initialHierarchy, timeoutMs)
+diff --git a/maestro-client/src/test/java/maestro/TapRetryTest.kt b/maestro-client/src/test/java/maestro/TapRetryTest.kt
+new file mode 100644
+index 0000000..518b2a5
+--- /dev/null
++++ b/maestro-client/src/test/java/maestro/TapRetryTest.kt
+@@ -0,0 +1,55 @@
++package maestro
++
++import com.google.common.truth.Truth.assertThat
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.verify
++import kotlinx.coroutines.runBlocking
++import maestro.device.Platform
++import org.junit.jupiter.api.Test
++
++/**
++ * [Maestro.tap] on a driver with [Capability.FAST_HIERARCHY] that skips the settle for a zero
++ * waitToSettleTimeoutMs by returning null, as AndroidDriver does.
++ */
++class TapRetryTest {
++
++    private val before = TreeNode(attributes = mutableMapOf("text" to "Off"))
++    private val after = TreeNode(attributes = mutableMapOf("text" to "On"))
++
++    private fun driver(screens: () -> TreeNode): Driver = mockk(relaxed = true) {
++        every { capabilities() } returns listOf(Capability.FAST_HIERARCHY)
++        every { deviceInfo() } returns DeviceInfo(Platform.ANDROID, 1080, 2400, 1080, 2400)
++        every { contentDescriptor(any()) } answers { screens() }
++        every { waitForAppToSettle(null, null, 0) } returns null
++    }
++
++    @Test
++    fun `retryTapIfNoChange with a zero settle timeout taps again when the first tap changed nothing`() {
++        val driver = driver { before }
++
++        runBlocking { Maestro(driver).tap(x = 540, y = 1200, retryIfNoChange = true, waitToSettleTimeoutMs = 0) }
++
++        verify(exactly = 2) { driver.tap(Point(540, 1200)) }
++    }
++
++    @Test
++    fun `retryTapIfNoChange with a zero settle timeout doesn't tap again after a tap that changed the screen`() {
++        val screens = ArrayDeque(listOf(before, after))
++        val driver = driver { screens.removeFirstOrNull() ?: after }
++
++        runBlocking { Maestro(driver).tap(x = 540, y = 1200, retryIfNoChange = true, waitToSettleTimeoutMs = 0) }
++
++        verify(exactly = 1) { driver.tap(Point(540, 1200)) }
++    }
++
++    @Test
++    fun `a zero settle timeout without retryTapIfNoChange taps once and reads no hierarchy after the tap`() {
++        val driver = driver { before }
++
++        runBlocking { Maestro(driver).tap(x = 540, y = 1200, retryIfNoChange = false, waitToSettleTimeoutMs = 0) }
++
++        verify(exactly = 1) { driver.tap(Point(540, 1200)) }
++        verify(exactly = 1) { driver.contentDescriptor(any()) }
++    }
++}
+diff --git a/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt b/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+index 2832a4c..8b64fab 100644
+--- a/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
++++ b/maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test
+ import org.junit.jupiter.api.assertThrows
+ 
+ /**
+- * [AndroidDriver.waitForAppToSettle] with an app id. The connection is a strict mock, so any device call throws
++ * [AndroidDriver.waitForAppToSettle]. The connection is a strict mock, so any device call throws
+  * MockKException naming the call: a test passes without one only if the driver asked the device nothing.
+  */
+ class AndroidDriverWindowSettleTest {
+@@ -29,6 +29,24 @@ class AndroidDriverWindowSettleTest {
+         assertThat(elapsedMs).isLessThan(500)
+     }
+ 
++    @Test
++    fun `a zero waitToSettleTimeoutMs without an app id skips the hierarchy comparison and asks the device nothing`() {
++        val driver = AndroidDriver(mockk<AndroidDeviceConnection>())
++
++        val settled = driver.waitForAppToSettle(null, null, 0)
++
++        assertThat(settled).isNull()
++    }
++
++    @Test
++    fun `without an app id a positive timeout still reads the hierarchy from the device`() {
++        val driver = AndroidDriver(mockk<AndroidDeviceConnection>())
++
++        val error = assertThrows<MockKException> { driver.waitForAppToSettle(null, null, 200) }
++
++        assertThat(error.message).contains("AndroidDeviceConnection")
++    }
++
+     @Test
+     fun `without a timeout the window settle loop still asks the device whether the window is updating`() {
+         val driver = AndroidDriver(mockk<AndroidDeviceConnection>())

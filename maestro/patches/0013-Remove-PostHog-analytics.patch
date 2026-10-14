@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:34:37 -0400
+Subject: [PATCH] Remove PostHog analytics
+
+Events went to us.i.posthog.com unless MAESTRO_CLI_NO_ANALYTICS was set
+or ~/.maestro/analytics.json said no, so a fresh machine reported every
+command. Login also called api.copilot.mobile.dev for the user and org
+to identify them in PostHog.
+
+The posthog-server dependency is gone and Analytics is now an object
+whose methods do nothing. Upstream's trackEvent calls stay where they
+are, so this patch doesn't touch the commands that make them. Cloud
+requests no longer carry the analytics id as X-UUID. The first-run
+"Anonymous analytics enabled" notice goes too.
+---
+ gradle/libs.versions.toml                     |   2 -
+ maestro-cli/build.gradle.kts                  |   1 -
+ maestro-cli/src/main/java/maestro/cli/App.kt  |   6 -
+ .../java/maestro/cli/analytics/Analytics.kt   | 245 +-----------------
+ .../main/java/maestro/cli/api/ApiClient.kt    |   1 -
+ 5 files changed, 7 insertions(+), 248 deletions(-)
+
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index cc2454a..c157b62 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -47,7 +47,6 @@ micrometerCore = "1.13.4"
+ mockk = "1.12.0"
+ mordant = "3.0.2"
+ picocli = "4.6.3"
+-posthog = "1.0.3"
+ selenium = "4.43.0"
+ selenium-devtools = "4.43.0"
+ simulatorServer = "10dae08e"
+@@ -131,7 +130,6 @@ mockk = { module = "io.mockk:mockk", version.ref = "mockk" }
+ mordant = { module = "com.github.ajalt.mordant:mordant", version.ref = "mordant" }
+ picocli = { module = "info.picocli:picocli", version.ref = "picocli" }
+ picocli-codegen = { module = "info.picocli:picocli-codegen", version.ref = "picocli" }
+-posthog = { module = "com.posthog:posthog-server", version.ref = "posthog" }
+ selenium = { module = "org.seleniumhq.selenium:selenium-java", version.ref = "selenium" }
+ selenium-devtools = { module = "org.seleniumhq.selenium:selenium-devtools-v147", version.ref = "selenium-devtools" }
+ skiko-macos-arm64 = { module = "org.jetbrains.skiko:skiko-awt-runtime-macos-arm64", version.ref = "skiko" }
+diff --git a/maestro-cli/build.gradle.kts b/maestro-cli/build.gradle.kts
+index 1f6ad66..bf9a80d 100644
+--- a/maestro-cli/build.gradle.kts
++++ b/maestro-cli/build.gradle.kts
+@@ -172,7 +172,6 @@ dependencies {
+     implementation(project(":maestro-ios-driver"))
+     implementation(libs.apk.parser)
+     implementation(libs.dd.plist)
+-    implementation(libs.posthog)
+     implementation(libs.dadb)
+     implementation(libs.picocli)
+     implementation(libs.jackson.core.databind)
+diff --git a/maestro-cli/src/main/java/maestro/cli/App.kt b/maestro-cli/src/main/java/maestro/cli/App.kt
+index 2495985..d667c74 100644
+--- a/maestro-cli/src/main/java/maestro/cli/App.kt
++++ b/maestro-cli/src/main/java/maestro/cli/App.kt
+@@ -22,7 +22,6 @@ package maestro.cli
+ import maestro.MaestroException
+ import maestro.cli.analytics.Analytics
+ import maestro.cli.analytics.CliCommandRunEvent
+-import maestro.cli.analytics.CommandArgsSanitizer
+ import maestro.cli.command.BugReportCommand
+ import maestro.cli.command.ChatCommand
+ import maestro.cli.command.CheckSyntaxCommand
+@@ -127,15 +126,10 @@ fun main(args: Array<String>) {
+     // litter the state dir; commands that want a maestro.log still opt in via install().
+     LogConfig.configure(logFileName = null, printToConsole = args.contains("--verbose"))
+ 
+-    // Capture a sanitized representation of the invocation as a super-property on every
+-    // PostHog event. Must run before any analytics event can fire.
+-    Analytics.commandString = CommandArgsSanitizer.sanitize(args)
+-
+     // Disable icon in Mac dock
+     // https://stackoverflow.com/a/17544259
+     try {
+         System.setProperty("apple.awt.UIElement", "true")
+-        Analytics.warnAndEnableAnalyticsIfNotDisable()
+ 
+         Dependencies.install()
+ 
+diff --git a/maestro-cli/src/main/java/maestro/cli/analytics/Analytics.kt b/maestro-cli/src/main/java/maestro/cli/analytics/Analytics.kt
+index 7823aed..e5638b2 100644
+--- a/maestro-cli/src/main/java/maestro/cli/analytics/Analytics.kt
++++ b/maestro-cli/src/main/java/maestro/cli/analytics/Analytics.kt
+@@ -1,245 +1,14 @@
+ package maestro.cli.analytics
+ 
+-import com.fasterxml.jackson.databind.DeserializationFeature
+-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+-import com.posthog.server.PostHog
+-import com.posthog.server.PostHogConfig
+-import com.posthog.server.PostHogInterface
+-import maestro.auth.ApiKey
+-import maestro.cli.api.ApiClient
+-import maestro.cli.util.EnvUtils
+-import org.slf4j.LoggerFactory
+-import java.nio.file.Path
+-import java.util.concurrent.Executors
+-import java.util.concurrent.TimeUnit
+-import kotlin.String
+-
++/**
++ * Sends nothing: this build carries no analytics client. Upstream calls these entry points from
++ * many commands, so they stay as no-ops to keep the patch small across Maestro releases.
++ */
+ object Analytics : AutoCloseable {
+-    private const val POSTHOG_API_KEY: String = "phc_XKhdIS7opUZiS58vpOqbjzgRLFpi0I6HU2g00hR7CVg"
+-    private const val POSTHOG_HOST: String = "https://us.i.posthog.com"
+-    private const val DISABLE_ANALYTICS_ENV_VAR = "MAESTRO_CLI_NO_ANALYTICS"
+-    private val JSON = jacksonObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+-    private val apiClient = ApiClient(EnvUtils.BASE_API_URL)
+-    private val posthog: PostHogInterface = PostHog.with(
+-        PostHogConfig.builder(POSTHOG_API_KEY)
+-            .host(POSTHOG_HOST)
+-            .build()
+-    )
+-
+-    private val logger = LoggerFactory.getLogger(Analytics::class.java)
+-    private val analyticsStatePath: Path = EnvUtils.xdgStateHome().resolve("analytics.json")
+-    private val analyticsStateManager = AnalyticsStateManager(analyticsStatePath)
+-
+-    // Simple executor for analytics events - following ErrorReporter pattern
+-    private val executor = Executors.newCachedThreadPool {
+-        Executors.defaultThreadFactory().newThread(it).apply { isDaemon = true }
+-    }
+-
+-    private val analyticsDisabledWithEnvVar: Boolean
+-      get() = System.getenv(DISABLE_ANALYTICS_ENV_VAR) != null
+-
+-    val hasRunBefore: Boolean
+-        get() = analyticsStateManager.hasRunBefore()
+-
+-    val uuid: String
+-        get() = analyticsStateManager.getState().uuid
+-
+-
+-    /**
+-     * Super properties to be sent with the event
+-     */
+-    private val superProperties = SuperProperties.create()
+-
+-    /**
+-     * Sanitized representation of the CLI invocation (`maestro <subcommand> --flag value ...`),
+-     * set once from `App.main()` via [CommandArgsSanitizer.sanitize]. When non-null, it is merged
+-     * into every PostHog event's properties under the key `commandStringUsed` by
+-     * [convertEventToEventData].
+-     *
+-     * This effectively attaches `commandStringUsed` to every event the CLI fires today:
+-     * - `maestro_cli_command_run`
+-     * - `cloud_upload_triggered`, `cloud_upload_started`, `cloud_upload_succeeded`
+-     * - `cloud_run_finished`
+-     * - `test_run_started`, `test_run_failed`, `test_run_finished`
+-     * - `workspace_run_started`, `workspace_run_failed`, `workspace_run_finished`
+-     * - Auth and record events (harmless; filter out in PostHog queries if undesired).
+-     */
+-    @Volatile
+-    var commandString: String? = null
+-
+-    /**
+-     * Call initially just to inform user and set a default state
+-     */
+-    fun warnAndEnableAnalyticsIfNotDisable() {
+-        if (hasRunBefore) return
+-        val analyticsShouldBeEnabled = !analyticsDisabledWithEnvVar
+-        if (analyticsShouldBeEnabled)
+-            println("Anonymous analytics enabled. To opt out, set $DISABLE_ANALYTICS_ENV_VAR environment variable to any value before running Maestro.\n")
+-        analyticsStateManager.saveInitialState(granted = analyticsShouldBeEnabled, uuid = uuid)
+-    }
+-
+-    /**
+-     * Identify user in PostHog and update local state.
+-     *
+-     * This function:
+-     * 1. Sends user identification to PostHog analytics
+-     * 2. Updates local analytics state with user info
+-     * 3. Tracks login event for analytics
+-     *
+-     * Should only be called when user identity changes (login/logout).
+-     */
+-    fun identifyAndUpdateState(token: String) {
+-        try {
+-            val user = apiClient.getUser(token)
+-            val org =  apiClient.getOrg(token)
+-
+-            // Update local state with user info
+-            val updatedAnalyticsState = analyticsStateManager.updateState(token, user, org)
+-            val identifyProperties = UserProperties.fromAnalyticsState(updatedAnalyticsState).toMap()
+ 
+-            // Send identification to PostHog
+-            posthog.identify(analyticsStateManager.getState().uuid, identifyProperties)
+-            // Track user authentication event
+-            val isFirstAuth = analyticsStateManager.getState().cachedToken == null
+-            trackEvent(UserAuthenticatedEvent(
+-                isFirstAuth = isFirstAuth,
+-                authMethod = "oauth"
+-            ))
+-        } catch (e: Exception) {
+-            // Analytics failures should never break CLI functionality or show errors to users
+-            logger.trace("Failed to identify user: ${e.message}", e)
+-        }
+-    }
++    fun trackEvent(event: PostHogEvent) = Unit
+ 
+-    /**
+-     * Conditionally identify user based on current and cashed token
+-     */
+-    fun identifyUserIfNeeded() {
+-        // No identification needed if token is null
+-        val token = ApiKey.getToken() ?: return
+-        val cachedToken = analyticsStateManager.getState().cachedToken
+-        // No identification needed if token is same as cachedToken
+-        if (!cachedToken.isNullOrEmpty() && (token == cachedToken)) return
+-        // Else Update identification
+-        identifyAndUpdateState(token)
+-    }
++    fun flush() = Unit
+ 
+-    /**
+-     * Track events asynchronously to prevent blocking CLI operations
+-     * Use this for important events like authentication, errors, test results, etc.
+-     * This method is "fire and forget" - it will never block the calling thread
+-     */
+-    fun trackEvent(event: PostHogEvent) {
+-        executor.submit {
+-            try {
+-                if (!analyticsStateManager.getState().enabled || analyticsDisabledWithEnvVar) return@submit
+-
+-                identifyUserIfNeeded()
+-
+-                // Include super properties in each event since PostHog Java client doesn't have register
+-                val eventData = convertEventToEventData(event)
+-                val userState = analyticsStateManager.getState()
+-                val groupProperties = userState.orgId?.let { orgId ->
+-                   mapOf(
+-                       "\$groups" to mapOf(
+-                           "company" to orgId
+-                       )
+-                   )
+-                } ?: emptyMap()
+-                val properties =
+-                    eventData.properties +
+-                    superProperties.toMap() +
+-                    UserProperties.fromAnalyticsState(userState).toMap() +
+-                    groupProperties
+-
+-                // Send Event
+-                posthog.capture(
+-                    uuid,
+-                    eventData.eventName,
+-                    properties
+-                )
+-            } catch (e: Exception) {
+-                // Analytics failures should never break CLI functionality
+-                logger.trace("Failed to track event ${event.name}: ${e.message}", e)
+-            }
+-        }
+-    }
+-
+-    /**
+-     * Flush pending PostHog events immediately
+-     * Use this when you need to ensure events are sent before continuing
+-     */
+-    fun flush() {
+-        try {
+-            posthog.flush()
+-        } catch (e: Exception) {
+-            // Analytics failures should never break CLI functionality or show errors to users
+-            logger.trace("Failed to flush PostHog: ${e.message}", e)
+-        }
+-    }
+-
+-    /**
+-     * Convert a PostHogEvent to EventData with eventName and properties separated
+-     * This allows for clean destructuring in the calling code
+-     */
+-    private fun convertEventToEventData(event: PostHogEvent): EventData {
+-        return try {
+-            // Use Jackson to convert the data class to a Map
+-            val jsonString = JSON.writeValueAsString(event)
+-            val eventMap = JSON.readValue(jsonString, Map::class.java) as Map<String, Any>
+-
+-            // Extract the name and create properties without it
+-            val eventName = event.name
+-            val baseProperties = eventMap.filterKeys { it != "name" }
+-
+-            // Merge the sanitized CLI invocation as a super-property on every event so we have
+-            // a queryable signal for deprecated/legacy flag usage without per-flag instrumentation.
+-            val properties = commandString?.let { baseProperties + ("commandStringUsed" to it) }
+-                ?: baseProperties
+-
+-            EventData(eventName, properties)
+-        } catch (e: Exception) {
+-            // Analytics failures should never break CLI functionality or show errors to users
+-            logger.trace("Failed to serialize event ${event.name}: ${e.message}", e)
+-            EventData(event.name, mapOf())
+-        }
+-    }
+-
+-   /**
+-    * Close and cleanup resources
+-    * Ensures pending analytics events are sent before shutdown
+-    */
+-    override fun close() {
+-        // First, flush any pending PostHog events before shutting down threads
+-        flush()
+-
+-        // Now shutdown PostHog to cleanup resources
+-        try {
+-            posthog.close()
+-        } catch (e: Exception) {
+-            // Analytics failures should never break CLI functionality or show errors to users
+-            logger.trace("Failed to close PostHog: ${e.message}", e)
+-        }
+-
+-        // Now shutdown the executor
+-        try {
+-            executor.shutdown()
+-            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+-                // Analytics failures should never break CLI functionality or show errors to users
+-                logger.trace("Analytics executor did not shutdown gracefully, forcing shutdown")
+-                executor.shutdownNow()
+-            }
+-        } catch (e: InterruptedException) {
+-            executor.shutdownNow()
+-            Thread.currentThread().interrupt()
+-        }
+-    }
++    override fun close() = Unit
+ }
+-
+-/**
+- * Data class to hold event name and properties for destructuring
+- */
+-data class EventData(
+-    val eventName: String,
+-    val properties: Map<String, Any>
+-)
+diff --git a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+index 8073c5c..ff844b7 100644
+--- a/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
++++ b/maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+@@ -1016,7 +1016,6 @@ data class CliVersion(
+ class SystemInformationInterceptor : Interceptor {
+     override fun intercept(chain: Interceptor.Chain): Response {
+         val newRequest = chain.request().newBuilder()
+-            .header("X-UUID", Analytics.uuid)
+             .header("X-VERSION", EnvUtils.getVersion().toString())
+             .header("X-OS", EnvUtils.OS_NAME)
+             .header("X-OSARCH", EnvUtils.OS_ARCH)

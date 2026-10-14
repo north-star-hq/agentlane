@@ -1,0 +1,40 @@
+appId: com.example.expoapp
+name: Launched with -apiBaseUrl while the API is stopped, the API screen shows the error state
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+      apiBaseUrl: http://localhost:${API_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-open-api
+    timeout: 60000
+- tapOn:
+    id: home-open-api
+- extendedWaitUntil:
+    visible:
+      id: api-error
+    timeout: 10000
+- assertVisible: Could not reach the API
+- assertNotVisible:
+    id: api-result
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn:
+          id: BackButton
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - back

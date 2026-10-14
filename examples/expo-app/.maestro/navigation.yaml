@@ -1,0 +1,29 @@
+appId: com.example.expoapp
+name: Navigate to Details and back
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+      apiBaseUrl: http://localhost:${API_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-open-details
+    timeout: 60000
+- tapOn:
+    id: home-open-details
+- assertVisible:
+    id: details-title
+    text: Second screen
+- tapOn:
+    id: details-back
+- assertVisible:
+    id: home-open-details

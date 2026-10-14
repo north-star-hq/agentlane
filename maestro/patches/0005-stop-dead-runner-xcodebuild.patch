@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:09:33 -0400
+Subject: [PATCH] fix(ios): stop the session's xcodebuild when its runner has
+ died
+
+LocalXCTestInstaller.uninstall() returned early when the runner no longer
+answered, before it stopped the xcodebuild test-without-building process it
+had started. When a runner dies, that xcodebuild keeps running, so a dead MCP
+session that #3385 rebuilds left one xcodebuild behind per rebuild, alongside
+the new session's xcodebuild on the same simulator.
+
+uninstall() now stops the xcodebuild it started before it checks the runner,
+waiting up to 10 seconds for it to exit before killing it.
+
+start() stops that xcodebuild too when the runner doesn't answer within the
+startup timeout. Nothing else did: maestro test registers its cleanup only
+after the driver has opened, so a runner that never came up left its
+xcodebuild running after Maestro exited.
+
+The installer takes XCRunnerCLIUtils and the startup timeout as constructor
+parameters, so the tests can launch a stand-in xcodebuild and time out
+quickly. The timeout still defaults to MAESTRO_DRIVER_STARTUP_TIMEOUT.
+---
+ .../installer/LocalXCTestInstaller.kt         |  37 +++++--
+ .../installer/LocalXCTestInstallerTest.kt     | 104 ++++++++++++++++++
+ 2 files changed, 129 insertions(+), 12 deletions(-)
+ create mode 100644 maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+
+diff --git a/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt b/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
+index 34c0a09..0aa9a8d 100644
+--- a/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
++++ b/maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
+@@ -18,6 +18,7 @@ import xcuitest.XCTestClient
+ import java.io.File
+ import java.io.IOException
+ import java.nio.file.Files
++import java.util.concurrent.TimeUnit
+ import kotlin.io.path.ExperimentalPathApi
+ import kotlin.io.path.deleteRecursively
+ import kotlin.time.Duration.Companion.seconds
+@@ -38,6 +39,8 @@ class LocalXCTestInstaller(
+     private val deviceController: IOSDevice,
+     private val tempFileHandler: TempFileHandler = TempFileHandler(),
+     private val logsDir: File,
++    private val xcRunnerCLIUtils: XCRunnerCLIUtils = XCRunnerCLIUtils(tempFileHandler),
++    private val startupTimeoutMs: Long = startupTimeoutFromEnvironment(),
+ ) : XCTestInstaller {
+ 
+     private val logger = LoggerFactory.getLogger(LocalXCTestInstaller::class.java)
+@@ -57,7 +60,6 @@ class LocalXCTestInstaller(
+         context = iOSDriverConfig.context,
+         deviceType = deviceType,
+     )
+-    private val xcRunnerCLIUtils = XCRunnerCLIUtils(tempFileHandler)
+ 
+     private var xcTestProcess: Process? = null
+ 
+@@ -71,17 +73,15 @@ class LocalXCTestInstaller(
+                 return@measured false
+             }
+ 
++            // When the runner dies, its xcodebuild keeps running and may relaunch it, so stop
++            // the xcodebuild we started even if the runner no longer answers.
++            stopXCTestProcess()
++
+             if (!isChannelAlive()) return@measured false
+ 
+             fun killXCTestRunnerProcess() {
+                 logger.trace("Will attempt to stop all alive XCTest Runner processes before uninstalling")
+ 
+-                if (xcTestProcess?.isAlive == true) {
+-                    logger.trace("XCTest Runner process started by us is alive, killing it")
+-                    xcTestProcess?.destroy()
+-                }
+-                xcTestProcess = null
+-
+                 val pid = xcRunnerCLIUtils.pidForApp(UI_TEST_RUNNER_APP_BUNDLE_ID, deviceId)
+                 if (pid != null) {
+                     logger.trace("Killing XCTest Runner process with the `kill` command")
+@@ -100,6 +100,17 @@ class LocalXCTestInstaller(
+         }
+     }
+ 
++    private fun stopXCTestProcess() {
++        val process = xcTestProcess ?: return
++        xcTestProcess = null
++        if (!process.isAlive) return
++        logger.trace("xcodebuild process started by us is alive, stopping it")
++        process.destroy()
++        if (!process.waitFor(XCODEBUILD_STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
++            process.destroyForcibly()
++        }
++    }
++
+     override fun start(): XCTestClient {
+         return metrics.measured("operation", mapOf("command" to "start")) {
+             logger.info("start()")
+@@ -124,23 +135,20 @@ class LocalXCTestInstaller(
+ 
+             val startTime = System.currentTimeMillis()
+ 
+-            while (System.currentTimeMillis() - startTime < getStartupTimeout()) {
++            while (System.currentTimeMillis() - startTime < startupTimeoutMs) {
+                 runCatching {
+                     if (isChannelAlive()) return@measured XCTestClient(host, defaultPort)
+                 }
+                 Thread.sleep(500)
+             }
+ 
++            stopXCTestProcess()
+             throw IOSDriverTimeoutException("iOS driver not ready in time, consider increasing timeout by configuring MAESTRO_DRIVER_STARTUP_TIMEOUT env variable")
+         }
+     }
+ 
+     class IOSDriverTimeoutException(message: String): RuntimeException(message)
+ 
+-    private fun getStartupTimeout(): Long = runCatching {
+-        System.getenv(MAESTRO_DRIVER_STARTUP_TIMEOUT).toLong()
+-    }.getOrDefault(SERVER_LAUNCH_TIMEOUT_MS)
+-
+     override fun isChannelAlive(): Boolean {
+         return metrics.measured("operation", mapOf("command" to "isChannelAlive")) {
+         return@measured xcTestDriverStatusCheck()
+@@ -266,7 +274,12 @@ class LocalXCTestInstaller(
+         const val UI_TEST_RUNNER_APP_BUNDLE_ID = "dev.mobile.maestro-driver-iosUITests.xctrunner"
+ 
+         private const val SERVER_LAUNCH_TIMEOUT_MS = 120000L
++        private const val XCODEBUILD_STOP_TIMEOUT_SECONDS = 10L
+         private const val MAESTRO_DRIVER_STARTUP_TIMEOUT = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
++
++        private fun startupTimeoutFromEnvironment(): Long = runCatching {
++            System.getenv(MAESTRO_DRIVER_STARTUP_TIMEOUT).toLong()
++        }.getOrDefault(SERVER_LAUNCH_TIMEOUT_MS)
+     }
+ 
+ }
+\ No newline at end of file
+diff --git a/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt b/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+new file mode 100644
+index 0000000..7b80d17
+--- /dev/null
++++ b/maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+@@ -0,0 +1,104 @@
++package xcuitest.installer
++
++import com.google.common.truth.Truth.assertThat
++import com.sun.net.httpserver.HttpServer
++import device.IOSDevice
++import io.mockk.every
++import io.mockk.mockk
++import maestro.utils.TempFileHandler
++import org.junit.jupiter.api.AfterEach
++import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertThrows
++import org.junit.jupiter.api.io.TempDir
++import util.IOSDeviceType
++import util.XCRunnerCLIUtils
++import java.net.InetAddress
++import java.net.InetSocketAddress
++import java.net.ServerSocket
++import java.nio.file.Path
++import java.util.Collections
++
++class LocalXCTestInstallerTest {
++
++    @TempDir
++    lateinit var logsDir: Path
++
++    private val tempFileHandler = TempFileHandler()
++    private val deviceController = mockk<IOSDevice>(relaxed = true)
++    private val xcodebuilds = Collections.synchronizedList(mutableListOf<Process>())
++    private var server: HttpServer? = null
++
++    @AfterEach
++    fun tearDown() {
++        server?.stop(0)
++        xcodebuilds.forEach { it.destroyForcibly() }
++        tempFileHandler.close()
++    }
++
++    private fun freePort(): Int = ServerSocket(0, 0, InetAddress.getLoopbackAddress()).use { it.localPort }
++
++    private fun runner(port: Int, status: Int, body: String) {
++        val http = HttpServer.create(InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0)
++        http.createContext("/") { exchange ->
++            val bytes = body.toByteArray()
++            exchange.sendResponseHeaders(status, bytes.size.toLong())
++            exchange.responseBody.use { it.write(bytes) }
++        }
++        http.start()
++        server = http
++    }
++
++    /**
++     * Stands in for `xcodebuild test-without-building`: each launch starts a child process that runs
++     * until it is stopped, and runs [onLaunch] first. A strict mock, so the installer can't reach for
++     * the runner's pid or kill anything else without the test failing.
++     */
++    private fun xcodebuild(onLaunch: () -> Unit = {}): XCRunnerCLIUtils = mockk {
++        every { runXcTestWithoutBuild(any(), any(), any(), any(), any()) } answers {
++            onLaunch()
++            ProcessBuilder("sleep", "600").start().also { xcodebuilds += it }
++        }
++    }
++
++    private fun installer(port: Int, xcRunnerCLIUtils: XCRunnerCLIUtils, startupTimeoutMs: Long = 120_000) =
++        LocalXCTestInstaller(
++            deviceId = "00000000-0000-0000-0000-000000000000",
++            deviceType = IOSDeviceType.SIMULATOR,
++            defaultPort = port,
++            iOSDriverConfig = LocalXCTestInstaller.IOSDriverConfig(
++                prebuiltRunner = false,
++                sourceDirectory = "driver-iPhoneSimulator",
++                context = Context.CLI,
++                snapshotKeyHonorModalViews = null,
++            ),
++            deviceController = deviceController,
++            tempFileHandler = tempFileHandler,
++            logsDir = logsDir.toFile(),
++            xcRunnerCLIUtils = xcRunnerCLIUtils,
++            startupTimeoutMs = startupTimeoutMs,
++        )
++
++    @Test
++    fun `uninstall stops the xcodebuild it started even when the runner no longer answers`() {
++        val port = freePort()
++        val installer = installer(port, xcodebuild { runner(port, 200, """{"status":"ok"}""") })
++        installer.start()
++        val xcodebuild = xcodebuilds.single()
++
++        server?.stop(0)
++        val uninstalled = installer.uninstall()
++
++        assertThat(uninstalled).isFalse()
++        assertThat(xcodebuild.isAlive).isFalse()
++    }
++
++    @Test
++    fun `a runner that never comes up fails the start, and the xcodebuild launched for it is stopped`() {
++        val installer = installer(freePort(), xcodebuild(), startupTimeoutMs = 1_500)
++
++        assertThrows<LocalXCTestInstaller.IOSDriverTimeoutException> { installer.start() }
++
++        assertThat(xcodebuilds).hasSize(1)
++        assertThat(xcodebuilds.single().isAlive).isFalse()
++    }
++}

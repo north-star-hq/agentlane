@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alex Gherschon <alex.gherschon@boards.com>
+Date: Thu, 25 Jun 2026 11:45:12 +0300
+Subject: [PATCH] fix(mcp): rebuild a dead device session instead of failing
+ forever
+
+The MCP server caches one device session per device and reuses it across
+every tool call. When the on-device driver dies out-of-band -- e.g. a second
+Maestro process (Maestro Studio, another CLI) reinstalls/restarts the shared
+on-device driver, or the device reboots -- the cached connection goes
+permanently DEAD. McpMaestroSessionManager kept handing back that dead session,
+so the first launchApp worked and every subsequent run/inspect_screen/
+take_screenshot failed ("Unable to launch app", inspect -> UNAVAILABLE) until
+the server was manually restarted/reconnected.
+
+withSession now self-heals: if the block throws and the cached session's driver
+reports isShutdown() (the connection is DEAD), it evicts and closes the stale
+session, rebuilds it -- which re-runs driver.open() and reinstalls the
+on-device driver -- and retries the call once. Web sessions are skipped from the
+liveness probe because CdpWebDriver.isShutdown() closes the browser as a side
+effect. A normal flow failure leaves the driver alive, so it is re-thrown
+unchanged; only genuine transport deaths trigger the one-shot rebuild.
+
+Fixes #2839
+
+Applied on top of #3647, which deletes DEFAULT_XCTEST_PORT: the companion
+object hunk lost that context line, so WEB_PLATFORM goes after WEB_DEVICE_ID
+and DEFAULT_XCTEST_PORT stays deleted. No other change from the PR.
+
+Upstream: https://github.com/mobile-dev-inc/Maestro/pull/3385
+---
+ .../cli/mcp/McpMaestroSessionManager.kt       | 30 ++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+index 118a023..ab3d160 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+@@ -40,7 +40,34 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         val session = sessions.computeIfAbsent(deviceId) {
+             createSession(deviceId).also { publishConnected(it) }
+         }
+-        return block(session)
++        return try {
++            block(session)
++        } catch (e: Exception) {
++            // The cached session can be killed out-of-band — e.g. another Maestro process
++            // (Maestro Studio, a second CLI) reinstalls/restarts the shared on-device driver,
++            // or the device reboots. The connection is then permanently DEAD and every later
++            // call fails until the server is restarted. Detect that, drop the dead session,
++            // and rebuild once so the next on-device-driver install heals the session in place.
++            if (!isSessionDead(session)) throw e
++            val fresh = rebuildSession(deviceId, dead = session)
++            block(fresh)
++        }
++    }
++
++    /**
++     * A driver whose transport died reports [isShutdown]; the cached session is then unusable.
++     * Skip web sessions: [CdpWebDriver.isShutdown] has the side effect of closing the browser,
++     * so probing it would tear down an otherwise-recoverable session.
++     */
++    private fun isSessionDead(session: McpMaestroSession): Boolean =
++        session.platform != WEB_PLATFORM && runCatching { session.maestro.driver.isShutdown() }.getOrDefault(true)
++
++    private fun rebuildSession(deviceId: String, dead: McpMaestroSession): McpMaestroSession {
++        sessions.remove(deviceId, dead)
++        runCatching { dead.close() }
++        return sessions.computeIfAbsent(deviceId) {
++            createSession(deviceId).also { publishConnected(it) }
++        }
+     }
+ 
+     private fun publishConnected(session: McpMaestroSession) {
+@@ -195,5 +222,6 @@ internal class McpMaestroSessionManager : AutoCloseable {
+     private companion object {
+         private const val DEFAULT_XCTEST_HOST = "127.0.0.1"
+         private const val WEB_DEVICE_ID = "chromium"
++        private const val WEB_PLATFORM = "web"
+     }
+ }

@@ -1,0 +1,675 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agentlane.json",
+  "description": "How agentlane runs this project: its mobile app, its web app, or both; the long-running services they need; what each lane gets of its own; and the hooks that set it up, build, launch and sign in. Commands run in the directory holding this file, with AGENTLANE_* variables for the lane (device, ports, worktree), the values of the lane's resources, and LANG and LC_ALL set to a UTF-8 locale: en_US.UTF-8 on macOS, C.UTF-8 on Linux.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "The path or URL of this schema, for editors."
+    },
+    "app": {
+      "$ref": "#/$defs/app"
+    },
+    "web": {
+      "$ref": "#/$defs/web"
+    },
+    "services": {
+      "type": "object",
+      "description": "The long-running servers the app needs, by name. Each gets a claimed port in AGENTLANE_<NAME>_PORT (the name upper-cased, dashes as underscores).",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/service"
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "What each lane gets of its own besides ports, such as a database, by name. `up` runs each create once per lane, in this order, after the setup hook and the build preconditions (also under --no-setup). The values a create exports then reach the lane's services, the hooks after setup, and `agentlane exec`, as AGENTLANE_<NAME>_PORT does; a command never takes an exported variable from the caller's environment. When the lane ends (release, the session-end release, or a reap of a lane whose owner died or was taken over), each teardown runs, last created first.",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/resource"
+      }
+    },
+    "hooks": {
+      "$ref": "#/$defs/hooks"
+    },
+    "preconditions": {
+      "type": "array",
+      "description": "Checks `up` runs before any slow step. A failing check refuses with its fix.",
+      "items": {
+        "$ref": "#/$defs/precondition"
+      }
+    },
+    "hygiene": {
+      "$ref": "#/$defs/hygiene"
+    },
+    "buildCache": {
+      "$id": "buildCache",
+      "type": "object",
+      "description": "Lets the toolkit skip the native build when its inputs have not changed. The key also covers the platform, the build variant, the toolchain and the contents of the env file the build uses. The toolchain is the Xcode version for iOS. For Android it is the version of the JDK at AGENTLANE_JAVA_HOME or JAVA_HOME (else the JDK 17 the toolkit finds), which the build hook gets as JAVA_HOME, the Gradle distribution in android/gradle/wrapper/gradle-wrapper.properties when that file is not git-ignored (a generated wrapper follows the inputs that generate it, such as the lockfile), and the revision of every installed Android SDK build-tools, platform, NDK and CMake package.",
+      "additionalProperties": false,
+      "required": [
+        "inputs",
+        "cacheableVariants"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "paths"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "files"
+                  },
+                  "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": "Files, directories or globs (`*`, `**`), relative to the directory holding the config file. Matched as git glob pathspecs over tracked files and untracked files git does not ignore; each enters the key by path, mode and content."
+                  },
+                  "exclude": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": "Files, directories or globs to leave out of `paths`."
+                  },
+                  "platforms": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "ios",
+                        "android"
+                      ]
+                    },
+                    "description": "The platforms whose key includes this input. Leave it out to include it for every platform."
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "run"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "command"
+                  },
+                  "run": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "A shell command run with `sh -c` in the config file's directory, with the lane's environment. Its stdout enters the key; a non-zero exit means no key, so the build runs uncached."
+                  },
+                  "platforms": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                      "enum": [
+                        "ios",
+                        "android"
+                      ]
+                    },
+                    "description": "The platforms whose key includes this input. Leave it out to include it for every platform."
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "cacheableVariants": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "The build variants whose output may be stored and served. Leave out any variant that embeds its JS bundle, such as a Release build."
+        },
+        "envFile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An env file the build bakes in, relative to the config file's directory. Its contents enter the key; a missing file counts as absent. Use this for files git ignores, which a files input never sees."
+        },
+        "maxAgeDays": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 14,
+          "description": "An entry unused for longer than this is pruned."
+        },
+        "maxEntries": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6,
+          "description": "Only the most recently used entries up to this count are kept."
+        }
+      }
+    },
+    "driver": {
+      "$ref": "#/$defs/driver"
+    }
+  },
+  "$defs": {
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The mobile app: what `up` builds, installs and launches on the claimed simulator or emulator.",
+      "required": [
+        "platform",
+        "bundleId",
+        "launch"
+      ],
+      "properties": {
+        "platform": {
+          "enum": [
+            "ios",
+            "android"
+          ],
+          "description": "The platform `up` claims a device for, unless `up --platform` names another."
+        },
+        "bundleId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$",
+          "description": "The bundle id or package name."
+        },
+        "scheme": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*$",
+          "description": "A URL scheme the app handles. It is approved on the simulator before it boots, so opening a link never stops at \"Open in ...?\"."
+        },
+        "launch": {
+          "enum": [
+            "dev-client",
+            "bundler-pin",
+            "hook"
+          ],
+          "description": "How the app is launched. dev-client: an Expo dev client opened on the bundler with --initialUrl. bundler-pin: a React Native app whose bundler location is written to its defaults and read back, then launched. hook: the project's launch hook."
+        },
+        "bundler": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "The service the app loads its JavaScript from. Default: the only service of type metro."
+        },
+        "variant": {
+          "type": "string",
+          "minLength": 1,
+          "default": "Debug",
+          "description": "The build variant, given to hooks as AGENTLANE_VARIANT and used by the build cache."
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The app the build hook produces (an .app or .apk), relative to this file. The toolkit installs it. Leave it out when the build hook installs the app itself; the installed app is then read back for the cache."
+        },
+        "device": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A simulator device type, or an Android device profile such as pixel_8. Default: the newest iPhone the runtime supports, or pixel_8."
+            },
+            "runtime": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A simulator runtime, or an Android system image (a package id or an API level). Default: the newest installed iOS runtime, or the newest Google APIs image."
+            },
+            "strict": {
+              "type": "boolean",
+              "default": false,
+              "description": "Take only a device of exactly this type and runtime. Without it, when the shared pool is full, a lane takes a free device of another type rather than deleting one to make this type."
+            }
+          }
+        },
+        "ios": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What differs on iOS: these replace app.bundleId, app.output and app.device when `up` runs for iOS.",
+          "properties": {
+            "bundleId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$",
+              "description": "The bundle id or package name."
+            },
+            "output": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The app the build hook produces (an .app or .apk), relative to this file. The toolkit installs it. Leave it out when the build hook installs the app itself; the installed app is then read back for the cache."
+            },
+            "device": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "A simulator device type, or an Android device profile such as pixel_8. Default: the newest iPhone the runtime supports, or pixel_8."
+                },
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "A simulator runtime, or an Android system image (a package id or an API level). Default: the newest installed iOS runtime, or the newest Google APIs image."
+                },
+                "strict": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Take only a device of exactly this type and runtime. Without it, when the shared pool is full, a lane takes a free device of another type rather than deleting one to make this type."
+                }
+              }
+            }
+          }
+        },
+        "android": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What differs on Android: these replace app.bundleId, app.output and app.device when `up` runs for Android.",
+          "properties": {
+            "bundleId": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+)+$",
+              "description": "The bundle id or package name."
+            },
+            "output": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The app the build hook produces (an .app or .apk), relative to this file. The toolkit installs it. Leave it out when the build hook installs the app itself; the installed app is then read back for the cache."
+            },
+            "device": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "A simulator device type, or an Android device profile such as pixel_8. Default: the newest iPhone the runtime supports, or pixel_8."
+                },
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "A simulator runtime, or an Android system image (a package id or an API level). Default: the newest installed iOS runtime, or the newest Google APIs image."
+                },
+                "strict": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Take only a device of exactly this type and runtime. Without it, when the shared pool is full, a lane takes a free device of another type rather than deleting one to make this type."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "web": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The web app: the service that serves it and the page to open. `up --platform web` (the default when there is no app) claims ports and no device, starts the services, and ends on doctor with the app's URL, also given to commands as AGENTLANE_WEB_URL.",
+      "properties": {
+        "service": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "The service that serves the web app. Default: the only service of type web."
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "default": "/",
+          "description": "The page to open, on the service's port."
+        },
+        "browser": {
+          "$ref": "#/$defs/browser"
+        }
+      }
+    },
+    "browser": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The lane's own browser, which `up` opens on the web app. Each lane gets its own profile folder, debugging port and driver session, released with the lane. The toolkit installs the driver and its browser at pinned versions in its own data folder (`agentlane browser install`). Drive it with the driver's own CLI under `agentlane exec`, which sets the driver's session, the web app's URL and the lane's saved login. The signin hook writes that saved login, in Playwright's storage-state format, to the file named by $AGENTLANE_STORAGE_STATE, and the browser starts with it.",
+      "properties": {
+        "driver": {
+          "enum": [
+            "playwright",
+            "agent-browser"
+          ],
+          "default": "playwright",
+          "description": "playwright: Playwright's own CLI, playwright-cli, and Playwright tests run with `exec -- npx playwright test`. agent-browser: Vercel's agent-browser CLI, headless. Both drive the toolkit's pinned Chrome for Testing."
+        },
+        "headed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the browser window, so a person can watch it. Default: headless. Playwright only: agent-browser runs headless, on the headless shell of Chrome for Testing."
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "create",
+        "teardown"
+      ],
+      "properties": {
+        "create": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that makes the resource for this lane. It writes each value it exports as a NAME=value line (quotes around the value are removed) to the file named by $AGENTLANE_EXPORTS. Its output goes to its log, and a failing create stops `up` with it. It runs again at the next `up` when it failed or never finished, so it must cope with what a partial run left."
+        },
+        "exports": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "uniqueItems": true,
+          "description": "The variables create writes, such as DATABASE_URL. Create must write each of them and no other. Names starting with AGENTLANE_, and LANG and LC_ALL, are the toolkit's."
+        },
+        "teardown": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that removes the resource when the lane ends. What it runs is recorded when create starts: this command, its folder and its variables (the lane's, plus the values create exported), so it runs even after this file changes and after the session that made the lane died. When the folder is gone (the worktree was deleted), it runs in the lane's log folder. A failed teardown is kept and tried again at the next release or reap, so it must cope with a resource that is already gone."
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The directory create and teardown run in, relative to this file."
+        },
+        "teardownTimeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 120,
+          "description": "How long teardown may run before it is stopped and counted as failed."
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "start",
+        "ready"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "The port block the service's port comes from: metro, api, web, or a name of your own with `ports`."
+        },
+        "ports": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 65535
+            },
+            {
+              "type": "integer",
+              "minimum": 1024,
+              "maximum": 65535
+            }
+          ],
+          "items": false,
+          "minItems": 2,
+          "description": "[first, last]: the port block for a type of your own. The Mac's own blocks (metro, api, web, and any in its registry config) take precedence."
+        },
+        "start": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The command that runs the server in the foreground on $AGENTLANE_<NAME>_PORT. It is started in its own process group and logged to a file per lane."
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The directory to start it in, relative to this file."
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "ios",
+              "android",
+              "web"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "The platforms that need it, such as [\"ios\", \"android\"] for a bundler the web app does not use. `up`, `doctor` and `restart` for another platform leave it out. Leave it out to run it for every platform."
+        },
+        "ready": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/httpReady"
+            },
+            {
+              "$ref": "#/$defs/tcpReady"
+            }
+          ]
+        },
+        "timeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 60,
+          "description": "How long to wait for the readiness check."
+        },
+        "dial": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argument"
+          ],
+          "description": "The app dials this service: launch it with this argument, so it talks to this lane's server.",
+          "properties": {
+            "argument": {
+              "type": "string",
+              "pattern": "^-[A-Za-z0-9_.-]+$",
+              "description": "The launch argument, such as -apiBaseUrl."
+            },
+            "value": {
+              "type": "string",
+              "pattern": "\\{port\\}",
+              "default": "http://localhost:{port}",
+              "description": "The argument's value; {port} is the service's port."
+            }
+          }
+        }
+      }
+    },
+    "httpReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path"
+      ],
+      "properties": {
+        "kind": {
+          "const": "http"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "The path to GET."
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "default": 200,
+          "description": "The status that means ready."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Text the response body must contain."
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "default": "127.0.0.1",
+          "description": "The host the readiness check connects to."
+        }
+      }
+    },
+    "tcpReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "const": "tcp"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "default": "127.0.0.1",
+          "description": "The host the readiness check connects to."
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "setup": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command run with `sh -c` first, to install dependencies."
+        },
+        "build": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command run with `sh -c` to build the app for the claimed device."
+        },
+        "launch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command run with `sh -c` to launch the app when app.launch is \"hook\"; AGENTLANE_LAUNCH_ARGS holds the dial arguments."
+        },
+        "signin": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command run with `sh -c` after launch, to sign in; for the web app it writes the lane's saved login, in Playwright's storage-state format, to $AGENTLANE_STORAGE_STATE."
+        },
+        "teardown": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command run with `sh -c` by `agentlane release`, after the services stop and before the resources' teardowns."
+        }
+      }
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "run",
+        "fix"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What is checked, as a short phrase."
+        },
+        "run": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that exits 0 when the precondition holds."
+        },
+        "fix": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What to do when it fails."
+        },
+        "before": {
+          "enum": [
+            "claim",
+            "build"
+          ],
+          "default": "claim",
+          "description": "claim: checked before anything is claimed. build: checked after the setup hook, before the build."
+        },
+        "platforms": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "ios",
+              "android",
+              "web"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "The platforms it applies to. Leave it out to check it for every platform."
+        }
+      }
+    },
+    "hygiene": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "location": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "latitude",
+            "longitude"
+          ],
+          "properties": {
+            "latitude": {
+              "type": "number",
+              "minimum": -90,
+              "maximum": 90
+            },
+            "longitude": {
+              "type": "number",
+              "minimum": -180,
+              "maximum": 180
+            }
+          }
+        },
+        "appearance": {
+          "enum": [
+            "light",
+            "dark"
+          ]
+        }
+      }
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The project drives its app with the toolkit (Maestro flows); `up` and `doctor` then check for Java 17.",
+      "properties": {
+        "flows": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The folder of committed flows, relative to this file."
+        }
+      }
+    }
+  }
+}

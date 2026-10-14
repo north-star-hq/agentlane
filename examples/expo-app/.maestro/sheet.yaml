@@ -1,0 +1,40 @@
+appId: com.example.expoapp
+name: Open and close the bottom sheet
+---
+- launchApp:
+    arguments:
+      '--initialUrl': http://localhost:${METRO_PORT}
+      apiBaseUrl: http://localhost:${API_PORT}
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # expo-dev-launcher ignores a link that arrives before its launcher screen is up.
+      - extendedWaitUntil:
+          visible: DEVELOPMENT SERVERS
+          timeout: 15000
+      - openLink: expoexample://expo-development-client/?url=http%3A%2F%2Flocalhost%3A${METRO_PORT}
+- extendedWaitUntil:
+    visible:
+      id: home-open-sheet
+    timeout: 60000
+- tapOn:
+    id: home-open-sheet
+- assertVisible:
+    id: sheet-title
+- tapOn:
+    id: sheet-close
+- assertNotVisible:
+    id: sheet-title
+- tapOn:
+    id: home-open-sheet
+- assertVisible:
+    id: sheet-title
+- swipe:
+    from:
+      id: sheet-title
+    direction: DOWN
+- assertNotVisible:
+    id: sheet-title
+- assertVisible:
+    id: home-open-sheet

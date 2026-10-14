@@ -1,0 +1,8 @@
+packages: []
+autoInstallPeers: false
+allowBuilds:
+  unrs-resolver: false
+peerDependencyRules:
+  ignoreMissing:
+    - react-native-gesture-handler
+    - react-native-reanimated

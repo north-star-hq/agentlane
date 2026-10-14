@@ -1,0 +1,139 @@
+:root {
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --text: #16181d;
+  --muted: #5b6270;
+  --accent: #2f5bea;
+  --danger: #c2362f;
+  --border: #e1e4ea;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  color: var(--text);
+  background: var(--background);
+}
+
+body {
+  margin: 0;
+  padding: 32px 16px;
+}
+
+.panel {
+  max-width: 560px;
+  margin: 0 auto;
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.narrow {
+  max-width: 360px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+header p {
+  margin: 0;
+}
+
+form {
+  display: grid;
+  gap: 12px;
+}
+
+form.add {
+  grid-template-columns: 1fr 96px auto;
+  align-items: end;
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+
+form.add .error {
+  grid-column: 1 / -1;
+}
+
+label {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+input {
+  font: inherit;
+  font-size: 16px;
+  color: var(--text);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+button {
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: #ffffff;
+  background: var(--accent);
+  border: none;
+  border-radius: 10px;
+  padding: 11px 16px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+}
+
+button.secondary {
+  color: var(--accent);
+  background: transparent;
+  padding: 6px 8px;
+}
+
+ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+li {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.muted {
+  color: var(--muted);
+  margin: 0;
+}
+
+.error {
+  color: var(--danger);
+  margin: 0;
+}
+
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+button.secondary[aria-pressed='true'] {
+  color: #ffffff;
+  background: var(--accent);
+}

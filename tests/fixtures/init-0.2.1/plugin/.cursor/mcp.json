@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agent-env": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" mcp; fi; echo \"agent-env: no node_modules/.bin/agent-env in $PWD or the folders above it; add the toolkit to this project\" >&2; exit 1"
+      ]
+    }
+  }
+}

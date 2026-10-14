@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "agentlane": {
+      "source": {
+        "source": "directory",
+        "path": "."
+      }
+    }
+  },
+  "enabledPlugins": {
+    "agentlane@agentlane": true
+  },
+  "disabledMcpjsonServers": ["agentlane"]
+}

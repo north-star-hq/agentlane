@@ -1,0 +1,54 @@
+This is a modified version of Maestro (https://github.com/mobile-dev-inc/Maestro)
+by mobile.dev inc., licensed under the Apache License, Version 2.0. The license
+text is in LICENSE-maestro.
+
+Files changed from Maestro cli-2.11.0:
+gradle/libs.versions.toml
+maestro-cli/build.gradle.kts
+maestro-cli/src/main/java/maestro/cli/App.kt
+maestro-cli/src/main/java/maestro/cli/analytics/Analytics.kt
+maestro-cli/src/main/java/maestro/cli/api/ApiClient.kt
+maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+maestro-cli/src/main/java/maestro/cli/mcp/McpServer.kt
+maestro-cli/src/main/java/maestro/cli/mcp/tools/OpenMaestroViewerTool.kt
+maestro-cli/src/main/java/maestro/cli/mcp/tools/RunTool.kt
+maestro-cli/src/main/java/maestro/cli/mcp/tools/ViewHierarchyFormatters.kt
+maestro-cli/src/main/java/maestro/cli/mcp/viewer/ViewerHint.kt
+maestro-cli/src/main/java/maestro/cli/session/MaestroSessionManager.kt
+maestro-cli/src/main/java/maestro/cli/update/Updates.kt
+maestro-cli/src/main/java/maestro/cli/util/ChangeLogUtils.kt
+maestro-cli/src/main/java/maestro/cli/util/EnvUtils.kt
+maestro-cli/src/main/java/maestro/cli/util/ErrorReporter.kt
+maestro-cli/src/main/java/maestro/cli/util/ScreenReporter.kt
+maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+maestro-cli/src/test/kotlin/maestro/cli/mcp/McpSessionRunnerTakenTest.kt
+maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/OpenMaestroViewerToolTest.kt
+maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/RunToolTest.kt
+maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/ViewHierarchyFormattersTest.kt
+maestro-cli/src/test/kotlin/maestro/cli/session/MaestroSessionManagerTest.kt
+maestro-client/src/main/java/maestro/Maestro.kt
+maestro-client/src/main/java/maestro/drivers/AndroidDriver.kt
+maestro-client/src/main/java/maestro/drivers/IOSDriver.kt
+maestro-client/src/test/java/maestro/TapRetryTest.kt
+maestro-client/src/test/java/maestro/drivers/AndroidDriverWindowSettleTest.kt
+maestro-client/src/test/java/maestro/drivers/IOSDriverTest.kt
+maestro-client/src/test/java/maestro/xctestdriver/XCTestDriverClientTest.kt
+maestro-ios-driver/src/main/kotlin/util/CommandLineUtils.kt
+maestro-ios-driver/src/main/kotlin/util/LocalIOSDeviceController.kt
+maestro-ios-driver/src/main/kotlin/util/LocalSimulatorUtils.kt
+maestro-ios-driver/src/main/kotlin/util/XCRunnerCLIUtils.kt
+maestro-ios-driver/src/main/kotlin/xcuitest/RunnerToken.kt
+maestro-ios-driver/src/main/kotlin/xcuitest/XCTestClient.kt
+maestro-ios-driver/src/main/kotlin/xcuitest/XCTestDriverClient.kt
+maestro-ios-driver/src/main/kotlin/xcuitest/installer/LocalXCTestInstaller.kt
+maestro-ios-driver/src/test/kotlin/util/XCRunnerCLIUtilsTest.kt
+maestro-ios-driver/src/test/kotlin/xcuitest/RunnerTokenTest.kt
+maestro-ios-driver/src/test/kotlin/xcuitest/installer/LocalXCTestInstallerTest.kt
+maestro-ios-xctest-runner/MaestroDriverLib/Sources/MaestroDriverLib/Helpers/RunnerToken.swift
+maestro-ios-xctest-runner/MaestroDriverLib/Tests/MaestroDriverLibTests/RunnerTokenTests.swift
+maestro-ios-xctest-runner/maestro-driver-ios.xcodeproj/project.pbxproj
+maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/Helpers/AppError.swift
+maestro-ios-xctest-runner/maestro-driver-iosUITests/Routes/XCTestHTTPServer.swift
+maestro-orchestra-models/build.gradle.kts
+maestro-orchestra-models/src/main/java/maestro/orchestra/util/Env.kt
+maestro-orchestra-models/src/test/kotlin/maestro/orchestra/util/EnvTest.kt

@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:37:56 -0400
+Subject: [PATCH] fix(mcp): release a session's XCTest runner port when the
+ session ends
+
+#3647 gives each iOS session its own runner port and keeps every port it hands
+out in a set that never shrinks, so a long-lived server leaks one reservation
+per session it creates, including each session #3385 rebuilds.
+
+Each iOS session now records its port, and the manager releases it when the
+session ends:
+
+- close() removes each session from the map, closes it and releases its port.
+- A rebuild closes the dead session and releases its port after the new
+  session has reserved one, so the new session never gets the dead runner's
+  port. Only the caller that removes the dead session from the map closes it,
+  so two calls that find the same session dead close it once.
+- A session that fails to start closes its driver first, which stops a runner
+  that may still come up on the port, and then releases the port.
+
+The session manager takes the port probe and the session factory as
+constructor parameters, and startIosSession takes the iOS driver factory, so
+the tests can drive these paths, a failed start included, without a device.
+---
+ .../cli/mcp/McpMaestroSessionManager.kt       |  89 ++++++---
+ .../cli/mcp/McpMaestroSessionManagerTest.kt   | 186 ++++++++++++++++++
+ 2 files changed, 250 insertions(+), 25 deletions(-)
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+index ab3d160..2e17de6 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+@@ -2,6 +2,7 @@ package maestro.cli.mcp
+ 
+ import device.SimctlIOSDevice
+ import ios.xctest.XCTestIOSDevice
++import maestro.Driver
+ import maestro.Maestro
+ import maestro.cli.CliError
+ import maestro.cli.mcp.viewer.McpViewerDriver
+@@ -29,7 +30,10 @@ import java.net.InetSocketAddress
+ import java.net.ServerSocket
+ import java.util.concurrent.ConcurrentHashMap
+ 
+-internal class McpMaestroSessionManager : AutoCloseable {
++internal class McpMaestroSessionManager(
++    private val findFreePort: () -> Int = { findFreeLoopbackPort() },
++    private val sessionFactory: ((deviceId: String) -> McpMaestroSession)? = null,
++) : AutoCloseable {
+     private val sessions = ConcurrentHashMap<String, McpMaestroSession>()
+     private val reservedXCTestPorts = ConcurrentHashMap.newKeySet<Int>()
+ 
+@@ -37,9 +41,7 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         deviceId: String,
+         block: (McpMaestroSession) -> T,
+     ): T {
+-        val session = sessions.computeIfAbsent(deviceId) {
+-            createSession(deviceId).also { publishConnected(it) }
+-        }
++        val session = sessions.computeIfAbsent(deviceId, ::openSession)
+         return try {
+             block(session)
+         } catch (e: Exception) {
+@@ -63,13 +65,23 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         session.platform != WEB_PLATFORM && runCatching { session.maestro.driver.isShutdown() }.getOrDefault(true)
+ 
+     private fun rebuildSession(deviceId: String, dead: McpMaestroSession): McpMaestroSession {
+-        sessions.remove(deviceId, dead)
+-        runCatching { dead.close() }
+-        return sessions.computeIfAbsent(deviceId) {
+-            createSession(deviceId).also { publishConnected(it) }
++        val removed = sessions.remove(deviceId, dead)
++        if (removed) runCatching { dead.close() }
++        try {
++            return sessions.computeIfAbsent(deviceId, ::openSession)
++        } finally {
++            if (removed) dead.xcTestPort?.let(::releaseXCTestPort)
+         }
+     }
+ 
++    private fun openSession(deviceId: String): McpMaestroSession =
++        (sessionFactory?.invoke(deviceId) ?: createSession(deviceId)).also { publishConnected(it) }
++
++    private fun endSession(session: McpMaestroSession) {
++        runCatching { session.close() }
++        session.xcTestPort?.let(::releaseXCTestPort)
++    }
++
+     private fun publishConnected(session: McpMaestroSession) {
+         McpViewerEvents.publish(
+             ViewerEvent.MaestroConnected(
+@@ -81,10 +93,9 @@ internal class McpMaestroSessionManager : AutoCloseable {
+     }
+ 
+     override fun close() {
+-        sessions.values.forEach { session ->
+-            runCatching { session.close() }
++        sessions.keys.forEach { deviceId ->
++            sessions.remove(deviceId)?.let(::endSession)
+         }
+-        sessions.clear()
+     }
+ 
+     private fun createSession(deviceId: String): McpMaestroSession {
+@@ -119,14 +130,34 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         )
+     }
+ 
+-    private fun createIosSession(device: Device.Connected, streamDeviceType: StreamDeviceType): McpMaestroSession {
+-        val driver = McpViewerDriver(createIOSDriver(device.instanceId, device.deviceType), "ios")
+-        return McpMaestroSession(
+-            maestro = Maestro.ios(driver, openDriver = true),
+-            platform = "ios",
+-            streamDeviceType = streamDeviceType,
+-            deviceId = device.instanceId,
+-        )
++    private fun createIosSession(device: Device.Connected, streamDeviceType: StreamDeviceType): McpMaestroSession =
++        startIosSession(device.instanceId, streamDeviceType) { xcTestPort ->
++            createIOSDriver(device.instanceId, device.deviceType, xcTestPort)
++        }
++
++    internal fun startIosSession(
++        deviceId: String,
++        streamDeviceType: StreamDeviceType?,
++        newDriver: (xcTestPort: Int) -> Driver,
++    ): McpMaestroSession {
++        val xcTestPort = reserveXCTestPort()
++        var driver: McpViewerDriver? = null
++        try {
++            driver = McpViewerDriver(newDriver(xcTestPort), "ios")
++            return McpMaestroSession(
++                maestro = Maestro.ios(driver, openDriver = true),
++                platform = "ios",
++                streamDeviceType = streamDeviceType,
++                deviceId = deviceId,
++                xcTestPort = xcTestPort,
++            )
++        } catch (e: Exception) {
++            // A runner that failed to start may still come up on this port, so stop it before
++            // the port can be handed to another session.
++            driver?.let { runCatching { it.close() } }
++            releaseXCTestPort(xcTestPort)
++            throw e
++        }
+     }
+ 
+     private fun createWebSession(): McpMaestroSession {
+@@ -143,6 +174,7 @@ internal class McpMaestroSessionManager : AutoCloseable {
+     private fun createIOSDriver(
+         deviceId: String,
+         deviceType: Device.DeviceType,
++        xcTestPort: Int,
+     ): IOSDriver {
+         require(deviceType == Device.DeviceType.SIMULATOR) {
+             "Unsupported device type $deviceType for iOS platform"
+@@ -155,8 +187,6 @@ internal class McpMaestroSessionManager : AutoCloseable {
+             snapshotKeyHonorModalViews = null,
+         )
+ 
+-        val xcTestPort = reserveXCTestPort()
+-
+         val tempFileHandler = TempFileHandler()
+         val deviceController = SimctlIOSDevice(
+             deviceId = deviceId,
+@@ -199,20 +229,24 @@ internal class McpMaestroSessionManager : AutoCloseable {
+     // The runner binds its port only after startup, so remember handed-out ports to avoid duplicates
+     internal fun reserveXCTestPort(): Int {
+         while (true) {
+-            val port = ServerSocket().use {
+-                it.bind(InetSocketAddress(DEFAULT_XCTEST_HOST, 0))
+-                it.localPort
+-            }
++            val port = findFreePort()
+             if (reservedXCTestPorts.add(port)) return port
+         }
+     }
+ 
++    internal fun releaseXCTestPort(port: Int) {
++        reservedXCTestPorts.remove(port)
++    }
++
++    internal fun isXCTestPortReserved(port: Int): Boolean = port in reservedXCTestPorts
++
+     data class McpMaestroSession(
+         val maestro: Maestro,
+         val platform: String,
+         // null for web sessions, which the viewer doesn't stream.
+         val streamDeviceType: StreamDeviceType?,
+         val deviceId: String,
++        val xcTestPort: Int? = null,
+     ) {
+         fun close() {
+             maestro.close()
+@@ -223,5 +257,10 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         private const val DEFAULT_XCTEST_HOST = "127.0.0.1"
+         private const val WEB_DEVICE_ID = "chromium"
+         private const val WEB_PLATFORM = "web"
++
++        private fun findFreeLoopbackPort(): Int = ServerSocket().use {
++            it.bind(InetSocketAddress(DEFAULT_XCTEST_HOST, 0))
++            it.localPort
++        }
+     }
+ }
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+index 9a70ef4..74d10b2 100644
+--- a/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+@@ -1,9 +1,23 @@
+ package maestro.cli.mcp
+ 
+ import com.google.common.truth.Truth.assertThat
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.verify
++import maestro.Driver
++import maestro.Maestro
++import maestro.cli.mcp.McpMaestroSessionManager.McpMaestroSession
+ import org.junit.jupiter.api.Test
++import org.junit.jupiter.api.assertThrows
++import java.io.IOException
+ import java.util.concurrent.Callable
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.CopyOnWriteArrayList
++import java.util.concurrent.CyclicBarrier
+ import java.util.concurrent.Executors
++import java.util.concurrent.ThreadLocalRandom
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicInteger
+ 
+ class McpMaestroSessionManagerTest {
+ 
+@@ -22,4 +36,176 @@ class McpMaestroSessionManagerTest {
+             manager.close()
+         }
+     }
++
++    @Test
++    fun `closing the manager releases every session's runner port`() {
++        val fixture = Fixture(probedPorts = listOf(50001, 50002, 50001))
++
++        val portA = fixture.manager.withSession("A") { it.xcTestPort }
++        val portB = fixture.manager.withSession("B") { it.xcTestPort }
++        assertThat(listOf(portA, portB)).containsExactly(50001, 50002)
++
++        fixture.manager.close()
++
++        assertThat(fixture.manager.isXCTestPortReserved(50001)).isFalse()
++        assertThat(fixture.manager.isXCTestPortReserved(50002)).isFalse()
++        fixture.created.forEach { verify(exactly = 1) { it.maestro.close() } }
++        assertThat(fixture.manager.reserveXCTestPort()).isEqualTo(50001)
++    }
++
++    @Test
++    fun `rebuilding a dead session releases its port after the new session reserves a different one`() {
++        val fixture = Fixture(probedPorts = listOf(50001, 50001, 50002))
++        val dead = fixture.manager.withSession("A") { it }
++        every { dead.maestro.driver.isShutdown() } returns true
++
++        val port = fixture.manager.withSession("A") { session ->
++            if (session === dead) throw IOException("runner gone")
++            session.xcTestPort
++        }
++
++        assertThat(port).isEqualTo(50002)
++        assertThat(fixture.manager.isXCTestPortReserved(50001)).isFalse()
++        assertThat(fixture.manager.isXCTestPortReserved(50002)).isTrue()
++        verify(exactly = 1) { dead.maestro.close() }
++        assertThat(fixture.manager.withSession("A") { it }).isSameInstanceAs(fixture.created.last())
++    }
++
++    @Test
++    fun `a failure on a live session keeps the session and its port`() {
++        val fixture = Fixture(probedPorts = listOf(50001))
++        val session = fixture.manager.withSession("A") { it }
++
++        assertThrows<IllegalStateException> {
++            fixture.manager.withSession("A") { error("element not found") }
++        }
++
++        assertThat(fixture.manager.withSession("A") { it }).isSameInstanceAs(session)
++        assertThat(fixture.manager.isXCTestPortReserved(50001)).isTrue()
++        verify(exactly = 0) { session.maestro.close() }
++    }
++
++    @Test
++    fun `two calls that find the same session dead rebuild it once`() {
++        val fixture = Fixture(probedPorts = listOf(50001, 50002))
++        val dead = fixture.manager.withSession("A") { it }
++        every { dead.maestro.driver.isShutdown() } returns true
++        val bothFailing = CyclicBarrier(2)
++        val executor = Executors.newFixedThreadPool(2)
++        try {
++            val ports = executor.invokeAll(List(2) {
++                Callable {
++                    fixture.manager.withSession("A") { session ->
++                        if (session === dead) {
++                            bothFailing.await(10, TimeUnit.SECONDS)
++                            throw IOException("runner gone")
++                        }
++                        session.xcTestPort
++                    }
++                }
++            }).map { it.get() }
++
++            assertThat(ports).containsExactly(50002, 50002)
++            assertThat(fixture.created).hasSize(2)
++            verify(exactly = 1) { dead.maestro.close() }
++            assertThat(fixture.manager.isXCTestPortReserved(50001)).isFalse()
++        } finally {
++            executor.shutdownNow()
++            fixture.manager.close()
++        }
++    }
++
++    @Test
++    fun `concurrent reserve and release never hand one port to two holders`() {
++        val manager = McpMaestroSessionManager(findFreePort = { ThreadLocalRandom.current().nextInt(50000, 50006) })
++        val held = ConcurrentHashMap.newKeySet<Int>()
++        val doubleHanded = AtomicInteger()
++        val executor = Executors.newFixedThreadPool(4)
++        try {
++            executor.invokeAll(List(4) {
++                Callable {
++                    repeat(5_000) {
++                        val port = manager.reserveXCTestPort()
++                        if (!held.add(port)) doubleHanded.incrementAndGet()
++                        held.remove(port)
++                        manager.releaseXCTestPort(port)
++                    }
++                }
++            }).forEach { it.get() }
++
++            assertThat(doubleHanded.get()).isEqualTo(0)
++            (50000 until 50006).forEach { assertThat(manager.isXCTestPortReserved(it)).isFalse() }
++        } finally {
++            executor.shutdownNow()
++        }
++    }
++
++    @Test
++    fun `an iOS session that fails to start stops its driver before its port can go to another session`() {
++        val ports = ArrayDeque(listOf(50001, 50001))
++        val runnerNeverAnswered = mockk<Driver>(relaxed = true)
++        val healthy = mockk<Driver>(relaxed = true)
++        val drivers = ArrayDeque(listOf(runnerNeverAnswered, healthy))
++        lateinit var manager: McpMaestroSessionManager
++        var portReservedWhileClosing: Boolean? = null
++        every { runnerNeverAnswered.open() } throws IllegalStateException("iOS driver not ready in time")
++        every { runnerNeverAnswered.close() } answers { portReservedWhileClosing = manager.isXCTestPortReserved(50001) }
++        manager = McpMaestroSessionManager(
++            findFreePort = { ports.removeFirst() },
++            sessionFactory = { deviceId ->
++                manager.startIosSession(deviceId, streamDeviceType = null) { drivers.removeFirst() }
++            },
++        )
++
++        val error = assertThrows<IllegalStateException> { manager.withSession("A") { it } }
++
++        assertThat(error).hasMessageThat().contains("not ready in time")
++        verify(exactly = 1) { runnerNeverAnswered.close() }
++        assertThat(portReservedWhileClosing).isTrue()
++        assertThat(manager.isXCTestPortReserved(50001)).isFalse()
++
++        val retried = manager.withSession("A") { it }
++        assertThat(retried.xcTestPort).isEqualTo(50001)
++        verify(exactly = 1) { healthy.open() }
++        manager.close()
++        verify(exactly = 1) { healthy.close() }
++    }
++
++    @Test
++    fun `an iOS driver that can't be created gives its port back`() {
++        lateinit var manager: McpMaestroSessionManager
++        manager = McpMaestroSessionManager(
++            findFreePort = { 50001 },
++            sessionFactory = { deviceId ->
++                manager.startIosSession(deviceId, streamDeviceType = null) {
++                    throw IllegalArgumentException("Unsupported device type REAL for iOS platform")
++                }
++            },
++        )
++
++        assertThrows<IllegalArgumentException> { manager.withSession("A") { it } }
++
++        assertThat(manager.isXCTestPortReserved(50001)).isFalse()
++    }
++
++    private class Fixture(probedPorts: List<Int>) {
++        private val ports = ArrayDeque(probedPorts)
++        val created = CopyOnWriteArrayList<McpMaestroSession>()
++        lateinit var manager: McpMaestroSessionManager
++
++        init {
++            manager = McpMaestroSessionManager(
++                findFreePort = { synchronized(ports) { ports.removeFirst() } },
++                sessionFactory = { deviceId ->
++                    McpMaestroSession(
++                        maestro = mockk<Maestro>(relaxed = true),
++                        platform = "ios",
++                        streamDeviceType = null,
++                        deviceId = deviceId,
++                        xcTestPort = manager.reserveXCTestPort(),
++                    ).also { created.add(it) }
++                },
++            )
++        }
++    }
+ }

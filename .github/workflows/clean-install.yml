@@ -1,0 +1,60 @@
+name: Clean install
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The agentlane version or npm dist-tag to install
+        type: string
+        default: next
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.platform }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            platform: web
+          - os: macos-26
+            platform: ios
+          - os: ubuntu-24.04
+            platform: web
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      EXPO_NO_TELEMETRY: 1
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - run: corepack enable
+      - name: Select Xcode and JDK 17
+        if: matrix.platform == 'ios'
+        run: |
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer" >> "$GITHUB_ENV"
+          echo "AGENTLANE_JAVA_HOME=$JAVA_HOME_17_arm64" >> "$GITHUB_ENV"
+      - name: Install agentlane from npm, then up, doctor, screenshot and release
+        run: .github/scripts/clean-install.sh "$RUNNER_TEMP/clean-install" "${{ matrix.platform }}" "$VERSION"
+      - name: Keep the screenshot and the lane's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clean-install-${{ matrix.platform }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/clean-install/
+            ~/.local/state/agentlane/claims/
+          if-no-files-found: ignore

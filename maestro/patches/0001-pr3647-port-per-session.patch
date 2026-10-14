@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Martin McGee <2734403+marseam@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 11:37:38 +0100
+Subject: [PATCH] fix(mcp): give each iOS Simulator session its own XCTest
+ runner port
+
+Every MCP iOS session used the fixed port 22087 on 127.0.0.1. Simulators share
+the host's loopback, so the first Simulator's runner answered every session and
+inspect_screen/run for one device_id read and drove another Simulator.
+
+Reserve an OS-assigned port per session, as maestro test does with
+driverHostPort, and remember handed-out ports so sessions created at the same
+time can't get the same one.
+
+Fixes #3611
+
+Upstream: https://github.com/mobile-dev-inc/Maestro/pull/3647
+---
+ .../cli/mcp/McpMaestroSessionManager.kt       | 21 +++++++++++++---
+ .../cli/mcp/McpMaestroSessionManagerTest.kt   | 25 +++++++++++++++++++
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+ create mode 100644 maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+index 889a703..118a023 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/McpMaestroSessionManager.kt
+@@ -25,10 +25,13 @@ import xcuitest.XCTestDriverClient
+ import xcuitest.installer.Context
+ import xcuitest.installer.LocalXCTestInstaller
+ import xcuitest.installer.LocalXCTestInstaller.IOSDriverConfig
++import java.net.InetSocketAddress
++import java.net.ServerSocket
+ import java.util.concurrent.ConcurrentHashMap
+ 
+ internal class McpMaestroSessionManager : AutoCloseable {
+     private val sessions = ConcurrentHashMap<String, McpMaestroSession>()
++    private val reservedXCTestPorts = ConcurrentHashMap.newKeySet<Int>()
+ 
+     fun <T> withSession(
+         deviceId: String,
+@@ -125,6 +128,8 @@ internal class McpMaestroSessionManager : AutoCloseable {
+             snapshotKeyHonorModalViews = null,
+         )
+ 
++        val xcTestPort = reserveXCTestPort()
++
+         val tempFileHandler = TempFileHandler()
+         val deviceController = SimctlIOSDevice(
+             deviceId = deviceId,
+@@ -134,7 +139,7 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         val xcTestInstaller = LocalXCTestInstaller(
+             deviceId = deviceId,
+             host = DEFAULT_XCTEST_HOST,
+-            defaultPort = DEFAULT_XCTEST_PORT,
++            defaultPort = xcTestPort,
+             reinstallDriver = true,
+             deviceType = IOSDeviceType.SIMULATOR,
+             iOSDriverConfig = iOSDriverConfig,
+@@ -147,7 +152,7 @@ internal class McpMaestroSessionManager : AutoCloseable {
+             deviceId = deviceId,
+             client = XCTestDriverClient(
+                 installer = xcTestInstaller,
+-                client = XCTestClient(DEFAULT_XCTEST_HOST, DEFAULT_XCTEST_PORT),
++                client = XCTestClient(DEFAULT_XCTEST_HOST, xcTestPort),
+                 reinstallDriver = true,
+             ),
+             getInstalledApps = { XCRunnerCLIUtils(tempFileHandler).listApps(deviceId) },
+@@ -164,6 +169,17 @@ internal class McpMaestroSessionManager : AutoCloseable {
+         )
+     }
+ 
++    // The runner binds its port only after startup, so remember handed-out ports to avoid duplicates
++    internal fun reserveXCTestPort(): Int {
++        while (true) {
++            val port = ServerSocket().use {
++                it.bind(InetSocketAddress(DEFAULT_XCTEST_HOST, 0))
++                it.localPort
++            }
++            if (reservedXCTestPorts.add(port)) return port
++        }
++    }
++
+     data class McpMaestroSession(
+         val maestro: Maestro,
+         val platform: String,
+@@ -178,7 +194,6 @@ internal class McpMaestroSessionManager : AutoCloseable {
+ 
+     private companion object {
+         private const val DEFAULT_XCTEST_HOST = "127.0.0.1"
+-        private const val DEFAULT_XCTEST_PORT = 22087
+         private const val WEB_DEVICE_ID = "chromium"
+     }
+ }
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+new file mode 100644
+index 0000000..9a70ef4
+--- /dev/null
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/McpMaestroSessionManagerTest.kt
+@@ -0,0 +1,25 @@
++package maestro.cli.mcp
++
++import com.google.common.truth.Truth.assertThat
++import org.junit.jupiter.api.Test
++import java.util.concurrent.Callable
++import java.util.concurrent.Executors
++
++class McpMaestroSessionManagerTest {
++
++    @Test
++    fun `reserveXCTestPort never hands out the same port twice, even when called concurrently`() {
++        val manager = McpMaestroSessionManager()
++        val executor = Executors.newFixedThreadPool(8)
++        try {
++            val ports = executor.invokeAll(List(64) { Callable { manager.reserveXCTestPort() } })
++                .map { it.get() }
++
++            assertThat(ports.toSet()).hasSize(ports.size)
++            assertThat(ports).doesNotContain(22087)
++        } finally {
++            executor.shutdownNow()
++            manager.close()
++        }
++    }
++}

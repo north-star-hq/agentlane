@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Omer Dangoor <omerdn1@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:36:03 -0400
+Subject: [PATCH] Stop telling the agent to surface the Viewer link
+
+The first local tool call of a session, usually list_devices or
+inspect_screen, came back prefixed with "Important: Maestro Viewer is
+available at ... Make sure to surface this link to the user before
+proceeding with your task." open_maestro_viewer added its own
+instructions about how to show the link.
+
+The prefix is gone. open_maestro_viewer still returns the URL, as one
+sentence, and the Viewer itself still starts unless --no-viewer is set.
+---
+ .../main/java/maestro/cli/mcp/McpServer.kt    |  2 --
+ .../cli/mcp/tools/OpenMaestroViewerTool.kt    |  8 +----
+ .../java/maestro/cli/mcp/viewer/ViewerHint.kt | 32 ------------------
+ .../mcp/tools/OpenMaestroViewerToolTest.kt    | 33 +++++++++++++++++++
+ 4 files changed, 34 insertions(+), 41 deletions(-)
+ delete mode 100644 maestro-cli/src/main/java/maestro/cli/mcp/viewer/ViewerHint.kt
+ create mode 100644 maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/OpenMaestroViewerToolTest.kt
+
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/McpServer.kt b/maestro-cli/src/main/java/maestro/cli/mcp/McpServer.kt
+index f097459..57d2cc4 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/McpServer.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/McpServer.kt
+@@ -21,7 +21,6 @@ import maestro.cli.mcp.tools.GetCloudRunStatusTool
+ import maestro.cli.mcp.tools.DescribeCloudRunTool
+ import maestro.cli.mcp.tools.ListCloudDevicesTool
+ import maestro.cli.mcp.tools.OpenMaestroViewerTool
+-import maestro.cli.mcp.viewer.withViewerHint
+ import maestro.cli.util.WorkingDirectory
+ import java.io.PrintStream
+ 
+@@ -93,7 +92,6 @@ fun runMaestroMcpServer(viewerUrl: String? = null) {
+         RunTool.create(sessionManager),
+         InspectScreenTool.create(sessionManager),
+         CheatSheetTool.create(),
+-    ).withViewerHint(viewerUrl) + listOf(
+         OpenMaestroViewerTool.create(viewerUrl),
+         ListCloudDevicesTool.create(),
+         RunOnCloudTool.create(),
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/tools/OpenMaestroViewerTool.kt b/maestro-cli/src/main/java/maestro/cli/mcp/tools/OpenMaestroViewerTool.kt
+index 30a77ce..a2ff990 100644
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/tools/OpenMaestroViewerTool.kt
++++ b/maestro-cli/src/main/java/maestro/cli/mcp/tools/OpenMaestroViewerTool.kt
+@@ -30,13 +30,7 @@ object OpenMaestroViewerTool {
+                     isError = true
+                 )
+             }
+-            CallToolResult(content = listOf(TextContent(
+-                "Maestro Viewer is available at $viewerUrl." +
+-                    " Surface this URL to the user and let them open it themselves — do not shell out to" +
+-                    " `open`, `xdg-open`, or any other launcher. Most environments running this MCP server" +
+-                    " (Claude Code, Cursor, Codex, etc.) have an embedded browser or preview pane the user" +
+-                    " would rather use, and forcing an external window is disruptive."
+-            )))
++            CallToolResult(content = listOf(TextContent("Maestro Viewer is available at $viewerUrl.")))
+         }
+     }
+ }
+diff --git a/maestro-cli/src/main/java/maestro/cli/mcp/viewer/ViewerHint.kt b/maestro-cli/src/main/java/maestro/cli/mcp/viewer/ViewerHint.kt
+deleted file mode 100644
+index 43233f2..0000000
+--- a/maestro-cli/src/main/java/maestro/cli/mcp/viewer/ViewerHint.kt
++++ /dev/null
+@@ -1,32 +0,0 @@
+-package maestro.cli.mcp.viewer
+-
+-import io.modelcontextprotocol.kotlin.sdk.server.RegisteredTool
+-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+-import java.util.concurrent.atomic.AtomicBoolean
+-
+-/**
+- * Prepends the viewer hint to the first tool response of a session, then no-ops. Tool
+- * responses are the most reliable channel for surfacing the URL — server `instructions` and tool
+- * `description` fields are suggestion-grade and several agents (Cursor, Codex) have been observed
+- * ignoring them. Repeating the hint on every call bloats outputs and fights the agent's task.
+- */
+-internal fun List<RegisteredTool>.withViewerHint(url: String?): List<RegisteredTool> {
+-    if (url == null) return this
+-    val hintFired = AtomicBoolean(false)
+-    val hint = TextContent(
+-        "Important: Maestro Viewer is available at $url." +
+-            " Open it in the embedded browser or share it with the user before running flows." +
+-            " Make sure to surface this link to the user before proceeding with your task."
+-    )
+-    return map { tool ->
+-        val original = tool.handler
+-        RegisteredTool(tool.tool) { request ->
+-            val result = original(request)
+-            if (hintFired.compareAndSet(false, true)) {
+-                result.copy(content = listOf(hint) + result.content)
+-            } else {
+-                result
+-            }
+-        }
+-    }
+-}
+diff --git a/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/OpenMaestroViewerToolTest.kt b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/OpenMaestroViewerToolTest.kt
+new file mode 100644
+index 0000000..6b2981a
+--- /dev/null
++++ b/maestro-cli/src/test/kotlin/maestro/cli/mcp/tools/OpenMaestroViewerToolTest.kt
+@@ -0,0 +1,33 @@
++package maestro.cli.mcp.tools
++
++import com.google.common.truth.Truth.assertThat
++import io.mockk.mockk
++import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
++import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
++import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequestParams
++import io.modelcontextprotocol.kotlin.sdk.types.TextContent
++import kotlinx.coroutines.runBlocking
++import kotlinx.serialization.json.buildJsonObject
++import org.junit.jupiter.api.Test
++
++class OpenMaestroViewerToolTest {
++
++    private val connection = mockk<ClientConnection>()
++    private val request = CallToolRequest(CallToolRequestParams(name = "open_maestro_viewer", arguments = buildJsonObject {}))
++
++    @Test
++    fun `returns the viewer URL and nothing addressed to the agent`() {
++        val result = runBlocking { OpenMaestroViewerTool.create("http://127.0.0.1:4567/").handler(connection, request) }
++
++        assertThat(result.isError).isNotEqualTo(true)
++        assertThat((result.content.single() as TextContent).text)
++            .isEqualTo("Maestro Viewer is available at http://127.0.0.1:4567/.")
++    }
++
++    @Test
++    fun `reports an error when the viewer is off`() {
++        val result = runBlocking { OpenMaestroViewerTool.create(null).handler(connection, request) }
++
++        assertThat(result.isError).isTrue()
++    }
++}

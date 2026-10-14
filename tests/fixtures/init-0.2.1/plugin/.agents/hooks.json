@@ -1,0 +1,16 @@
+{
+  "agent-env": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agent-env\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agent-env\" ]; then exec \"$d/node_modules/.bin/agent-env\" hook pre-tool-use --agent antigravity; fi; exit 0",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
