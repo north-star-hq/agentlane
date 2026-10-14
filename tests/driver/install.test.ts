@@ -182,6 +182,21 @@ test('a build whose --version is not the pinned version is refused', async () =>
   assert.equal(fs.existsSync(maestroHome(env, release)), false);
 });
 
+test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another version', async () => {
+  const root = fs.realpathSync(tempDir('jdk'));
+  const jdk17 = fakeJdk(root);
+  const jdk21 = fakeJdk(root, '21');
+  const found = await findJdk17({ AGENTLANE_JAVA_HOME: jdk17, JAVA_HOME: jdk21 });
+  assert.equal(found.javaHome, path.join(root, 'jdk-17'));
+  assert.equal(found.origin, `AGENTLANE_JAVA_HOME=${jdk17}`);
+  await assert.rejects(findJdk17({ AGENTLANE_JAVA_HOME: jdk21, JAVA_HOME: jdk17 }), (error: unknown) => {
+    assert.ok(error instanceof DriverError);
+    assert.match(error.message, /^AGENTLANE_JAVA_HOME=.* is Java 21, and Maestro runs on JDK 17/);
+    assert.match(error.fix, /set AGENTLANE_JAVA_HOME to a JDK 17 home/);
+    return true;
+  });
+});
+
 test('JDK 17 is required: a JAVA_HOME of another version or with no java is refused, naming the fix', async () => {
   const root = fs.realpathSync(tempDir('jdk'));
   assert.equal((await findJdk17({ JAVA_HOME: fakeJdk(root) })).javaHome, path.join(root, 'jdk-17'));

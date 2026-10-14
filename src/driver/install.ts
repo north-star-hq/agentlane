@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { JAVA_HOME_ENV } from '../hooks/env.ts';
 import { CLI, envName, TOOL } from '../name.ts';
 import { identityOf, systemProcesses, type ProcessTable } from '../processes.ts';
 import { DriverError } from './errors.ts';
@@ -51,7 +52,7 @@ interface Marker {
 /** A Maestro binary to use instead of the pinned build, such as a local build of `maestro/`. */
 export const MAESTRO_OVERRIDE_ENV = envName('MAESTRO');
 
-const JDK_FIX = `install JDK 17 ('brew install openjdk@17'), or set JAVA_HOME to a JDK 17 home`;
+const JDK_FIX = `install JDK 17 ('brew install openjdk@17'), or set ${JAVA_HOME_ENV} to a JDK 17 home`;
 const INSTALL_LOCK_WAIT_MS = 15 * 60_000;
 
 export function dataDir(env: NodeJS.ProcessEnv): string {
@@ -105,13 +106,14 @@ async function javaSettings(home: string): Promise<{ spec: string | undefined; j
   };
 }
 
-/** Finds JDK 17 the way maestro/build.sh does: JAVA_HOME, then java_home -v 17, then Homebrew's openjdk@17. */
+/** Finds JDK 17: AGENTLANE_JAVA_HOME, then the way maestro/build.sh does, JAVA_HOME, java_home -v 17 and Homebrew's openjdk@17. */
 export async function findJdk17(env: NodeJS.ProcessEnv): Promise<Jdk> {
   let candidate: string | undefined;
   let origin: string;
-  if (env.JAVA_HOME) {
-    candidate = env.JAVA_HOME;
-    origin = `JAVA_HOME=${env.JAVA_HOME}`;
+  const named = env[JAVA_HOME_ENV] ? JAVA_HOME_ENV : env.JAVA_HOME ? 'JAVA_HOME' : undefined;
+  if (named) {
+    candidate = env[named];
+    origin = `${named}=${candidate ?? ''}`;
   } else {
     const javaHome = await runCommand('/usr/libexec/java_home', ['-v', '17'], { timeoutMs: 10_000 });
     if (javaHome.code === 0 && javaHome.stdout.trim()) {
@@ -128,15 +130,13 @@ export async function findJdk17(env: NodeJS.ProcessEnv): Promise<Jdk> {
     }
   }
   if (!candidate) throw new DriverError('no JDK 17 found; Maestro runs on JDK 17', JDK_FIX);
+  const fix = named ? `${JDK_FIX}, or unset ${named} so ${TOOL} finds one` : JDK_FIX;
   const settings = await javaSettings(candidate);
   if (settings.spec === undefined) {
-    throw new DriverError(`${origin} has no working bin/java`, `${JDK_FIX}, or unset JAVA_HOME so ${TOOL} finds one`);
+    throw new DriverError(`${origin} has no working bin/java`, fix);
   }
   if (settings.spec !== '17') {
-    throw new DriverError(
-      `${origin} is Java ${settings.spec}, and Maestro runs on JDK 17`,
-      `${JDK_FIX}, or unset JAVA_HOME so ${TOOL} finds one`,
-    );
+    throw new DriverError(`${origin} is Java ${settings.spec}, and Maestro runs on JDK 17`, fix);
   }
   return { javaHome: settings.javaHome ?? candidate, origin };
 }
