@@ -1,6 +1,6 @@
 {
   "name": "agentlane",
-  "version": "0.4.1-rc.1",
+  "version": "0.4.1",
   "description": "Gives each coding agent its own lane: a running copy of your app with its own ports, dev servers, database, and a simulator, emulator or browser to drive it.",
   "keywords": [
     "ai-agents",
