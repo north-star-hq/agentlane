@@ -42,7 +42,6 @@ function build(root: string, printed = VERSION): { zip: Buffer; release: Maestro
   const release: MaestroRelease = {
     ...MAESTRO_RELEASE,
     version: VERSION,
-    tag: `maestro-v${VERSION}`,
     asset: `maestro-${VERSION}.zip`,
     size: zip.length,
     sha256,

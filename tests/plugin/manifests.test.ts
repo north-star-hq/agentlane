@@ -6,6 +6,8 @@ import { mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills } from '../../src/agents/skills.ts';
 
 const PLUGIN = path.resolve(import.meta.dirname, '..', '..', 'plugin');
+const PACKAGE_VERSION = (JSON.parse(fs.readFileSync(path.join(PLUGIN, '..', 'package.json'), 'utf8')) as { version: string })
+  .version;
 
 function read(file: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(PLUGIN, file), 'utf8')) as Record<string, unknown>;
@@ -39,7 +41,7 @@ test('the Codex, Cursor and Gemini manifests serve the same skills and the same 
   }
   const gemini = read('gemini-extension.json');
   assert.equal(gemini.name, 'agentlane');
-  assert.match(String(gemini.version), /^\d+\.\d+\.\d+$/);
+  assert.equal(gemini.version, PACKAGE_VERSION);
   assert.deepEqual(gemini.mcpServers, { device: { ...launcher, cwd: '${workspacePath}' } });
   assert.deepEqual(
     fs.readdirSync(path.join(PLUGIN, 'skills')).sort(),

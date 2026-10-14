@@ -146,7 +146,7 @@ test('a bare init with no terminal wires the agents it finds, says why, and adds
     const again = await init(p, [], { installer });
     assert.equal(again.code, 0, again.stderr);
     assert.equal(installer.calls.length, 1, 'a project that lists the toolkit gets no second install');
-    assert.match(again.stdout, /lists agentlane \^0\.3\.0, but it isn't installed: run npm install there/);
+    assert.ok(again.stdout.includes(`lists agentlane ^${VERSION}, but it isn't installed: run npm install there`), again.stdout);
   } finally {
     p.cleanup();
   }

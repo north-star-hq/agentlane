@@ -19,7 +19,7 @@ Newest first.
 
 ### The patched Maestro
 
-The patched Maestro build is renamed `2.11.0-agentlane.1`. The toolkit moves its pin to it when the public repository publishes it; until then 0.3.0 keeps downloading `2.11.0-agentenv.3`. Compared with that build:
+The patched Maestro build is renamed `2.11.0-agentlane.1`, and the toolkit downloads it over https from this repository's release, so first use no longer needs a signed-in `gh`. Compared with `2.11.0-agentenv.3`:
 
 - The MCP `run` tool's result lists only the `env` the call passed. It used to list every `MAESTRO_*` variable in the driver's own environment as well. Flows still get those variables.
 - On Android, a `tapOn` with `retryTapIfNoChange: true` and `waitToSettleTimeoutMs: 0` taps a second time again when the first tap changed nothing. The quick tap, which sends `retryTapIfNoChange: false`, still reads no hierarchy after the tap.

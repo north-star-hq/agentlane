@@ -8,6 +8,7 @@ import { checkSite } from '../site/build/check.ts';
 import { loadSections, SITE } from '../site/build/content.ts';
 import { checkFacts, undocumentedVariables } from '../site/build/facts.ts';
 import { referenceGaps } from '../site/build/reference.ts';
+import { MAESTRO_RELEASE } from '../src/driver/release.ts';
 
 function source(name: string): string {
   return fs.readFileSync(path.join(SITE, 'docs', `${name}.md`), 'utf8');
@@ -84,6 +85,10 @@ describe('the docs site', () => {
   test('leaves no command, flag, tool, config section or variable out of the reference', () => {
     for (const page of ['cli', 'mcp', 'config'] as const) assert.deepEqual(referenceGaps(page, source(page)), [], page);
     assert.deepEqual(undocumentedVariables(source('environment')), []);
+  });
+
+  test('names the pinned Maestro zip where it tells you to download it by hand', () => {
+    assert.ok(source('troubleshooting').includes(`--from ~/Downloads/${MAESTRO_RELEASE.asset}`));
   });
 
   test('stays small enough to publish as a preview', () => {

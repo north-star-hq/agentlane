@@ -150,27 +150,6 @@ export async function sha256Of(file: string): Promise<string> {
 const manualFix = (release: MaestroRelease) =>
   `download ${release.url} yourself and run '${CLI} driver install --from <that zip>'`;
 
-export const ghDownload: Downloader = async (release, dir) => {
-  fs.mkdirSync(dir, { recursive: true });
-  const args = ['release', 'download', release.tag, '--repo', release.repo, '--dir', dir, '--clobber'];
-  args.push('--pattern', release.asset, '--pattern', `${release.asset}.sha256`);
-  const ran = await runCommand('gh', args, { timeoutMs: 30 * 60_000 });
-  if (ran.error?.includes('ENOENT')) {
-    throw new DriverError(
-      `the GitHub CLI (gh) isn't installed, and ${release.repo} is private, so Maestro ${release.version} can't be downloaded`,
-      `install gh ('brew install gh') and run 'gh auth login', or ${manualFix(release)}`,
-    );
-  }
-  if (ran.code !== 0) {
-    throw new DriverError(
-      `'gh ${args.join(' ')}' failed (${ran.error ?? `exit ${String(ran.code)}`}):\n${tail(ran.stderr || ran.stdout, 8)}`,
-      `run 'gh auth login' with an account that can read ${release.repo}, or ${manualFix(release)}`,
-    );
-  }
-  const checksum = path.join(dir, `${release.asset}.sha256`);
-  return { zip: path.join(dir, release.asset), checksumFile: fs.existsSync(checksum) ? checksum : undefined };
-};
-
 export const httpsDownload: Downloader = async (release, dir) => {
   fs.mkdirSync(dir, { recursive: true });
   const fetchTo = async (url: string, file: string) => {
@@ -186,10 +165,6 @@ export const httpsDownload: Downloader = async (release, dir) => {
   await fetchTo(`${release.url}.sha256`, checksumFile);
   return { zip, checksumFile };
 };
-
-function defaultDownloader(release: MaestroRelease): Downloader {
-  return release.download === 'gh' ? ghDownload : httpsDownload;
-}
 
 async function verify(release: MaestroRelease, downloaded: Downloaded): Promise<void> {
   const refuse = (problem: string) =>
@@ -294,8 +269,8 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
     if (options.from !== undefined) {
       downloaded = { zip: path.resolve(options.from), checksumFile: undefined };
     } else {
-      log(`downloading Maestro ${release.version} (${String(Math.round(release.size / 1_048_576))} MB) from ${release.repo}`);
-      downloaded = await (options.download ?? defaultDownloader(release))(release, path.join(work, 'download'));
+      log(`downloading Maestro ${release.version} (${String(Math.round(release.size / 1_048_576))} MB) from ${release.url}`);
+      downloaded = await (options.download ?? httpsDownload)(release, path.join(work, 'download'));
     }
     await verify(release, downloaded);
     const unpacked = path.join(work, 'unpacked');

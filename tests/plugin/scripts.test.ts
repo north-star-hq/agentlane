@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
+import { toolVersion } from '../../src/agents/package.ts';
 import { tempDir } from '../support/fakes.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -183,7 +184,7 @@ test('agentlane on the Bash PATH runs the project’s toolkit from any subfolder
     const bin = path.join(PLUGIN, 'bin', 'agentlane');
     const ok = spawnSync(bin, ['--version'], { cwd: sub, env: env(dir), encoding: 'utf8' });
     assert.equal(ok.status, 0, ok.stderr);
-    assert.match(ok.stdout, /^\d+\.\d+\.\d+\n$/);
+    assert.equal(ok.stdout, `${toolVersion()}\n`);
     const missing = spawnSync(bin, ['status'], { cwd: none, env: env(none), encoding: 'utf8' });
     assert.equal(missing.status, 127);
     assert.match(missing.stderr, /doesn't have the toolkit installed/);
