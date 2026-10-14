@@ -81,7 +81,9 @@ test("the example app's config is valid and normalizes to the example's real com
       ['node_modules is installed', 'build'],
     ],
   );
-  assert.deepEqual(config.buildCache?.inputs[3], { kind: 'command', run: 'pod --version', platforms: ['ios'] });
+  const inputs = config.buildCache?.inputs ?? [];
+  assert.deepEqual(inputs[1], { kind: 'command', run: 'node scripts/native-deps.mjs' });
+  assert.deepEqual(inputs[4], { kind: 'command', run: 'pod --version', platforms: ['ios'] });
   assert.deepEqual(config.driver, { flows: '.maestro' });
 });
 

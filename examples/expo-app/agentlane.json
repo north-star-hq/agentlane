@@ -56,7 +56,8 @@
   ],
   "buildCache": {
     "inputs": [
-      { "kind": "files", "paths": ["app.json", "package.json", "pnpm-lock.yaml", "assets", "plugins"] },
+      { "kind": "files", "paths": ["app.json", "assets", "plugins", "scripts/native-deps.mjs"] },
+      { "kind": "command", "run": "node scripts/native-deps.mjs" },
       { "kind": "files", "paths": ["scripts/build-ios.sh", "scripts/ios-common.sh"], "platforms": ["ios"] },
       { "kind": "files", "paths": ["scripts/build-android.sh", "modules"], "platforms": ["android"] },
       { "kind": "command", "run": "pod --version", "platforms": ["ios"] }

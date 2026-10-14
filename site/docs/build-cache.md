@@ -12,7 +12,8 @@ The cache key is a hash of everything that can change the native build. You name
 {
   "buildCache": {
     "inputs": [
-      { "kind": "files", "paths": ["app.json", "package.json", "pnpm-lock.yaml", "assets", "plugins"] },
+      { "kind": "files", "paths": ["app.json", "assets", "plugins", "scripts/native-deps.mjs"] },
+      { "kind": "command", "run": "node scripts/native-deps.mjs" },
       { "kind": "files", "paths": ["scripts/build-ios.sh", "scripts/ios-common.sh"], "platforms": ["ios"] },
       { "kind": "files", "paths": ["scripts/build-android.sh", "modules"], "platforms": ["android"] },
       { "kind": "command", "run": "pod --version", "platforms": ["ios"] }
@@ -25,6 +26,8 @@ The cache key is a hash of everything that can change the native build. You name
 - A **files** input lists files, folders or globs. Each matching file that git tracks, or that git sees and doesn't ignore, enters the key by its path, mode and content. `exclude` leaves some out.
 - A **command** input runs a shell command, and its output enters the key. Use one for each tool whose version changes the native output, such as `pod --version` for CocoaPods. A command that fails means no key, and the build runs uncached.
 - `platforms` limits an input to iOS or Android.
+
+The example app keys on its native packages, not on `package.json` and the lockfile. Those two files change with every dev-dependency bump, agentlane's own upgrades included, and each change would rebuild an app whose native code is the same. Its `scripts/native-deps.mjs` prints the name and version of each installed package with a podspec, an Expo module, an Android project or a config plugin, plus the Expo and React Native packages that prebuild and codegen run. Hashing the lockfile is the safer default; a list like this one trades some of that safety for fewer rebuilds.
 
 agentlane adds the rest of the key itself: the platform, the build variant, and the toolchain. On iOS that is the Xcode version. On Android it is the JDK at `AGENTLANE_JAVA_HOME` or `JAVA_HOME` (which the build hook gets as `JAVA_HOME`), the Gradle distribution the wrapper names, and the revision of every installed SDK build-tools, platform, NDK and CMake package. An `envFile` that the build bakes in enters the key by its contents, which matters for env files git ignores.
 
