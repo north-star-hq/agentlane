@@ -126,8 +126,8 @@ find_jdk17() {
   if [ -n "${JAVA_HOME:-}" ]; then
     candidate=$JAVA_HOME
     origin="JAVA_HOME=$JAVA_HOME"
-  elif candidate=$(/usr/libexec/java_home -v 17 2>/dev/null); then
-    origin="/usr/libexec/java_home -v 17"
+  elif candidate=$(/usr/libexec/java_home -F -v 17 2>/dev/null); then
+    origin="/usr/libexec/java_home -F -v 17"
   else
     candidate=''
     for prefix in "$(brew --prefix openjdk@17 2>/dev/null || true)" /opt/homebrew/opt/openjdk@17 /usr/local/opt/openjdk@17; do

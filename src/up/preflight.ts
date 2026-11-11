@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { androidToolchain, CacheKeyError, xcodeVersion } from '../cache/key.ts';
 import type { DeviceBackend, DeviceSpec } from '../devices/backend.ts';
 import { findAndroidSdk } from '../devices/emulator.ts';
+import { registeredJdk17 } from '../driver/install.ts';
 import { HOOK_LOCALE, JAVA_HOME_ENV } from '../hooks/env.ts';
 import { runCheck } from '../hooks/run.ts';
 import { TOOL } from '../name.ts';
@@ -55,15 +56,6 @@ async function javaVersion(home: string): Promise<string | null> {
   }
 }
 
-async function macJavaHome17(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync('/usr/libexec/java_home', ['-v', '17'], { timeout: 10_000 });
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  }
-}
-
 function linuxJvms(): string[] {
   try {
     return fs
@@ -109,7 +101,7 @@ export const systemToolchain: Toolchain = {
       ? [pinned]
       : [
           env.JAVA_HOME,
-          await macJavaHome17(),
+          await registeredJdk17(),
           '/opt/homebrew/opt/openjdk@17',
           '/usr/local/opt/openjdk@17',
           ...linuxJvms(),
