@@ -9,7 +9,7 @@ import type { Agent } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { claudePluginInstall } from './claude-plugin.ts';
 import { isToolkitHook } from './launcher.ts';
-import { listedRange, nearestPackage } from './package.ts';
+import { listedRange, nearestPackage, toolVersion } from './package.ts';
 import type { Json } from './wiring.ts';
 import { agentEdits } from './wiring.ts';
 
@@ -27,6 +27,7 @@ export const MARK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 interface Route {
   where: string;
+  plugin: boolean;
   file: string;
   command: string;
   env: NodeJS.ProcessEnv;
@@ -57,31 +58,44 @@ function modified(file: string): number {
   try {
     return fs.statSync(file).mtimeMs;
   } catch {
-    return 0;
+    return Number.POSITIVE_INFINITY;
   }
 }
 
-function manifestAt(file: string): { file: string; version: string } | null {
+function real(file: string): string | null {
   try {
-    const manifest = JSON.parse(fs.readFileSync(file, 'utf8')) as { name?: unknown; version?: unknown };
-    return manifest.name === TOOL && typeof manifest.version === 'string'
-      ? { file: fs.realpathSync(file), version: manifest.version }
-      : null;
+    return fs.realpathSync(file);
   } catch {
     return null;
   }
 }
 
-function toolkitManifest(bin: string): { file: string; version: string } | null {
+interface Toolkit {
+  manifest: string;
+  version: string;
+  /** The file the manifest's `bin` runs, resolved through links when it exists. */
+  entry: string | null;
+}
+
+function manifestAt(file: string): Toolkit | null {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8')) as { name?: unknown; version?: unknown; bin?: unknown };
+    if (manifest.name !== TOOL || typeof manifest.version !== 'string') return null;
+    const at = fs.realpathSync(file);
+    const { bin } = manifest;
+    const named = typeof bin === 'string' ? bin : typeof bin === 'object' && bin !== null ? (bin as Json)[TOOL] : null;
+    const entry = typeof named === 'string' ? path.resolve(path.dirname(at), named) : null;
+    return { manifest: at, version: manifest.version, entry: entry === null ? null : (real(entry) ?? entry) };
+  } catch {
+    return null;
+  }
+}
+
+function toolkitManifest(bin: string): Toolkit | null {
   const beside = manifestAt(path.join(path.dirname(path.dirname(bin)), TOOL, 'package.json'));
   if (beside) return beside;
-  let target: string;
-  try {
-    target = fs.realpathSync(bin);
-  } catch {
-    return null;
-  }
-  if (target === bin) return null;
+  const target = real(bin);
+  if (target === null || target === bin) return null;
   for (let dir = path.dirname(target); path.dirname(dir) !== dir; dir = path.dirname(dir)) {
     const found = manifestAt(path.join(dir, 'package.json'));
     if (found) return found;
@@ -90,13 +104,12 @@ function toolkitManifest(bin: string): { file: string; version: string } | null 
 }
 
 function markHolds(mark: HookMark, bin: string, hookFile: string, now: number): boolean {
-  const manifest = toolkitManifest(bin);
+  const toolkit = toolkitManifest(bin);
+  if (!toolkit?.entry || real(mark.toolkit) !== toolkit.entry) return false;
   return (
-    manifest !== null &&
-    mark.version === manifest.version &&
+    mark.version === toolkit.version &&
     mark.at >= modified(hookFile) &&
-    mark.at > modified(bin) &&
-    mark.at > modified(manifest.file) &&
+    [bin, toolkit.manifest, toolkit.entry].every(file => mark.at > modified(file)) &&
     now - mark.at <= MARK_MAX_AGE_MS
   );
 }
@@ -164,8 +177,16 @@ function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJ
       ? `was stopped by ${String(result.signal)}`
       : `exited ${String(result.status)}${result.stderr.trim() ? `: ${firstLine(result.stderr)}` : ''}`;
   if (mark && result.status === 0) return { name, ok: true, detail: ran(mark, how), fix: '' };
-  const fix = `${CLI} init --agents ${agent}, then ${CLI} doctor`;
+  const toolkit = toolkitManifest(bin);
+  const fix = missingFix(route, toolkit, agent) ?? `${CLI} init --agents ${agent}, then ${CLI} doctor`;
   if (mark) return { name, ok: false, detail: `${ran(mark, how)}, then ${exit}`, fix };
+  if (result.status === 0 && toolkit && older(toolkit.version, toolVersion()))
+    return {
+      name,
+      ok: false,
+      detail: `${how} exited 0 without leaving a mark: the toolkit it runs, ${bin}, is ${TOOL} ${toolkit.version}, which leaves none (doctor is ${toolVersion()})`,
+      fix: `update the toolkit at ${bin} to ${TOOL} ${toolVersion()}, then ${CLI} doctor`,
+    };
   if (result.status === 0)
     return {
       name,
@@ -176,17 +197,39 @@ function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJ
   return { name, ok: false, detail: `${how} never reached the toolkit: it ${exit}`, fix };
 }
 
+function older(version: string, than: string): boolean {
+  const parts = (v: string) => v.split(/[-+]/, 1)[0]?.split('.').map(Number) ?? [];
+  const [a, b] = [parts(version), parts(than)];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const [x, y] = [a[i] ?? 0, b[i] ?? 0];
+    if (Number.isNaN(x) || Number.isNaN(y)) return false;
+    if (x !== y) return x < y;
+  }
+  return false;
+}
+
+function missingFix(route: Route, toolkit: Toolkit | null, agent: Agent): string | null {
+  if (!fs.existsSync(route.file))
+    return route.plugin
+      ? `${route.file} is missing, so the plugin's hooks can't run: reinstall the ${TOOL} plugin in Claude Code, or run ${CLI} init --agents ${agent} to write the hooks into ${guardFile(agent)}`
+      : `${route.file} is missing: ${CLI} init --agents ${agent} writes it`;
+  if (toolkit?.entry && !fs.existsSync(toolkit.entry))
+    return `${toolkit.entry}, the file ${toolkit.manifest} runs, is missing: install the project's dependencies again, or build the linked ${TOOL} checkout, then ${CLI} doctor`;
+  return null;
+}
+
 function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv, now: number): HookCheck {
   const name = `hooks ${agent}`;
   const file = guardFile(agent);
   const command = settingsCommand(root, file);
-  let route: Route | null = command ? { where: file, file: path.join(root, file), command, env: {} } : null;
+  let route: Route | null = command ? { where: file, plugin: false, file: path.join(root, file), command, env: {} } : null;
   if (route === null && agent === 'claude') {
     const install = claudePluginInstall(root, env);
     if (install?.kind === 'loaded') {
       const script = path.join(install.dir, 'scripts', 'hook.sh');
       route = {
         where: `the plugin in ${install.dir}`,
+        plugin: true,
         file: script,
         command: `"${script}" pre-tool-use`,
         env: { CLAUDE_PLUGIN_ROOT: install.dir },
@@ -229,9 +272,9 @@ function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv, now: numb
 }
 
 /**
- * One line per agent: whether its hooks run. The mark the hook left for this project folder answers while it is newer
- * than the hook and the toolkit, names the toolkit's version and is under a day old; otherwise doctor runs the guard
- * hook on a command it allows.
+ * One line per agent: whether its hooks run. The mark the hook left for this project folder answers while it names the
+ * file this project's toolkit runs, is newer than the hook, that file and the toolkit's manifest, names the toolkit's
+ * version and is under a day old; otherwise doctor runs the guard hook on a command it allows.
  */
 export function agentHookChecks(
   root: string,

@@ -181,6 +181,14 @@ export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: strin
 
 const PROJECT_ENV: Partial<Record<Agent, string>> = { claude: 'CLAUDE_PROJECT_DIR', cursor: 'CURSOR_PROJECT_DIR' };
 
+function realEntry(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
 function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
   try {
     let cwd: string | null = null;
@@ -196,7 +204,7 @@ function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
       event,
       project: project !== undefined && project !== '' ? project : (cwd ?? deps.cwd),
       at: (deps.clock ?? systemClock).now(),
-      toolkit: deps.toolkit ?? process.argv[1] ?? '',
+      toolkit: realEntry(deps.toolkit ?? process.argv[1] ?? ''),
       version: toolVersion(),
       probe: deps.env[HOOK_PROBE_ENV] ?? null,
     });

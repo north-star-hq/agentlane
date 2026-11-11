@@ -19,10 +19,9 @@ import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { tempDir } from '../support/fakes.ts';
 import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
-import { writeToolkit } from '../support/toolkit.ts';
+import { toolkitEntry, writeToolkit } from '../support/toolkit.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
-const CLI = path.join(ROOT, 'src', 'cli.ts');
 const HOOK_SH = path.join(ROOT, 'plugin', 'scripts', 'hook.sh');
 const GIT_ENV = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
 
@@ -64,7 +63,7 @@ function write(file: string, text: string): void {
 }
 
 /** A toolkit at `dir` that writes each call's arguments to `log`, then runs the real CLI. */
-function installToolkit(dir: string, log: string, run = `exec "${process.execPath}" "${CLI}" "$@"`): string {
+function installToolkit(dir: string, log: string, run = `exec "${process.execPath}" "${toolkitEntry(dir)}" "$@"`): string {
   return writeToolkit(dir, `printf '%s\\n' "$*" >> "${log}"\n${run}`);
 }
 
@@ -478,7 +477,10 @@ test('doctor fails a hook that points at a missing toolkit, naming the fix, and 
     const probed = agentHookChecks(dir, ['claude', 'codex'], f.env());
     for (const line of probed) {
       assert.equal(line.ok, true, `${line.name}: ${line.detail}`);
-      assert.match(line.detail, /^doctor ran the guard hook in \S+ on a command it allows, and it reached .*src\/cli\.ts/);
+      assert.match(
+        line.detail,
+        /^doctor ran the guard hook in \S+ on a command it allows, and it reached .*node_modules\/agentlane\/dist\/cli\.js/,
+      );
     }
     assert.deepEqual(calls(path.join(f.root, 'calls.log')), [
       'hook pre-tool-use --agent claude',
@@ -543,7 +545,7 @@ for (const route of ['settings', 'plugin'] as const) {
 
       const manifest = path.join(dir, 'node_modules/agentlane/package.json');
       const { mtime } = fs.statSync(manifest);
-      fs.writeFileSync(manifest, JSON.stringify({ name: 'agentlane', version: '0.0.1' }));
+      fs.writeFileSync(manifest, JSON.stringify({ ...(json(manifest) as object), version: '0.0.1' }));
       fs.utimesSync(manifest, mtime, mtime);
       assert.equal(check()?.ok, true);
       assert.equal(runs(), probes + 2, 'a mark from another version is checked again');
@@ -609,6 +611,128 @@ test('a mark left from a worktree nested in the project does not vouch for the p
     const [line] = agentHookChecks(dir, ['codex'], f.env());
     assert.equal(line?.ok, false, line?.detail);
     assert.match(line.detail, /never reached the toolkit: it exited 9/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+function later(file: string): void {
+  const soon = new Date(Date.now() + 2000);
+  fs.utimesSync(file, soon, soon);
+}
+
+test('under pnpm’s layout, doctor fails a hook once the file the shim runs breaks after a good mark, naming it when it is gone', async () => {
+  const f = fixture('hooks-pnpm-entry');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    installToolkit(dir, path.join(f.root, 'calls.log'));
+    const store = path.join(f.root, 'store/agentlane');
+    fs.mkdirSync(path.dirname(store), { recursive: true });
+    fs.renameSync(path.join(dir, 'node_modules/agentlane'), store);
+    fs.symlinkSync(path.relative(path.join(dir, 'node_modules'), store), path.join(dir, 'node_modules/agentlane'));
+    const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+    assert.equal(check()?.ok, true, check()?.detail);
+    assert.match(
+      check()?.detail ?? '',
+      /^the pre-tool-use hook in \.codex\/hooks\.json reached .*store\/agentlane\/dist\/cli\.js/,
+    );
+
+    const entry = path.join(store, 'dist/cli.js');
+    fs.writeFileSync(entry, 'console.error("SyntaxError: broken build"); process.exit(9);\n');
+    later(entry);
+    const broken = check();
+    assert.equal(broken?.ok, false, broken?.detail);
+    assert.match(broken.detail, /never reached the toolkit: it exited 9: SyntaxError: broken build/);
+
+    fs.rmSync(entry);
+    const gone = check();
+    assert.equal(gone?.ok, false, gone?.detail);
+    assert.equal(
+      gone.fix,
+      `${entry}, the file ${path.join(store, 'package.json')} runs, is missing: install the project's dependencies again, or build the linked agentlane checkout, then node_modules/.bin/agentlane doctor`,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('a mark left by another toolkit does not vouch for the project’s hook', async () => {
+  const f = fixture('hooks-other-toolkit');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    const bin = installToolkit(dir, path.join(f.root, 'calls.log'), 'exit 9');
+    const other = path.join(f.root, 'other');
+    installToolkit(other, path.join(f.root, 'calls.log'));
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    for (const file of [
+      bin,
+      toolkitEntry(dir),
+      toolkitEntry(other),
+      path.join(dir, 'node_modules/agentlane/package.json'),
+      path.join(dir, '.codex/hooks.json'),
+    ])
+      fs.utimesSync(file, hourAgo, hourAgo);
+    writeHookMark(f.state, {
+      agent: 'codex',
+      event: 'pre-tool-use',
+      project: dir,
+      at: Date.now(),
+      toolkit: toolkitEntry(other),
+      version: toolVersion(),
+      probe: null,
+    });
+    const [line] = agentHookChecks(dir, ['codex'], f.env());
+    assert.equal(line?.ok, false, line?.detail);
+    assert.match(line.detail, /never reached the toolkit: it exited 9/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('doctor fails the plugin’s hook once the plugin folder it ran from is deleted after a good mark, naming the missing script', () => {
+  const f = fixture('hooks-plugin-gone');
+  try {
+    const dir = f.repo('app');
+    write(path.join(dir, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }));
+    const copy = path.join(f.root, 'plugin-copy');
+    fs.cpSync(path.dirname(path.dirname(HOOK_SH)), copy, { recursive: true });
+    write(
+      path.join(f.root, 'home/.claude/plugins/installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { 'agentlane@agentlane': [{ scope: 'user', installPath: copy }] } }),
+    );
+    installToolkit(dir, path.join(f.root, 'calls.log'));
+    const check = () => agentHookChecks(dir, ['claude'], f.env())[0];
+    assert.equal(check()?.ok, true, check()?.detail);
+    assert.match(check()?.detail ?? '', /^the pre-tool-use hook in the plugin in .*plugin-copy reached /);
+
+    fs.rmSync(copy, { recursive: true });
+    const gone = check();
+    assert.equal(gone?.ok, false, gone?.detail);
+    assert.match(gone.detail, /never reached the toolkit: it exited 127/);
+    assert.equal(
+      gone.fix,
+      `${path.join(copy, 'scripts/hook.sh')} is missing, so the plugin's hooks can't run: reinstall the agentlane plugin in Claude Code, or run node_modules/.bin/agentlane init --agents claude to write the hooks into .claude/settings.json`,
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('doctor says when the toolkit a hook runs is too old to leave a mark, and to update it', async () => {
+  const f = fixture('hooks-old-toolkit');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    const bin = writeToolkit(dir, 'cat >/dev/null; exit 0', '0.0.1');
+    const [line] = agentHookChecks(dir, ['codex'], f.env());
+    assert.equal(line?.ok, false);
+    assert.equal(
+      line.detail,
+      `doctor ran the guard hook in .codex/hooks.json on a command it allows, and it exited 0 without leaving a mark: the toolkit it runs, ${bin}, is agentlane 0.0.1, which leaves none (doctor is ${toolVersion()})`,
+    );
+    assert.equal(line.fix, `update the toolkit at ${bin} to agentlane ${toolVersion()}, then node_modules/.bin/agentlane doctor`);
   } finally {
     f.cleanup();
   }

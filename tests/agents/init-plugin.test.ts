@@ -11,7 +11,7 @@ import { diagnose, renderDoctor } from '../../src/up/doctor.ts';
 import { tempDir } from '../support/fakes.ts';
 import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
-import { writeToolkit } from '../support/toolkit.ts';
+import { toolkitEntry, writeToolkit } from '../support/toolkit.ts';
 
 const PLUGIN = path.resolve(import.meta.dirname, '..', '..', 'plugin');
 const TOOLKIT = listSkills().map(skill => skill.name);
@@ -229,7 +229,7 @@ test('a project left to a plugin that is not loaded says so, and init without th
 });
 
 function installToolkit(dir: string): void {
-  writeToolkit(dir, `exec "${process.execPath}" "${path.join(PLUGIN, '..', 'src', 'cli.ts')}" "$@"`);
+  writeToolkit(dir, `exec "${process.execPath}" "${toolkitEntry(dir)}" "$@"`);
 }
 
 type Line = [ok: boolean, warning: boolean, detail: string, fix: string];
@@ -288,7 +288,7 @@ test('a project that enables the plugin from a GitHub marketplace without instal
     assert.equal(after['hooks claude']?.[0], true, after['hooks claude']?.[2]);
     assert.match(
       after['hooks claude'][2],
-      /^doctor ran the guard hook in \.claude\/settings\.json on a command it allows, and it reached .*src\/cli\.ts \(\d+\.\d+\.\d+.*\) at /,
+      /^doctor ran the guard hook in \.claude\/settings\.json on a command it allows, and it reached .*node_modules\/agentlane\/dist\/cli\.js \(\d+\.\d+\.\d+.*\) at /,
     );
     assert.equal(after['wiring claude']?.[0], true);
     const marked = await claudeLines(p, p.env());
