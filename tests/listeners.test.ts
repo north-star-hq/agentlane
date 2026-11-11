@@ -5,8 +5,12 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { test } from 'node:test';
+import type { Clock } from '../src/clock.ts';
+import { systemClock } from '../src/clock.ts';
 import { systemProcesses } from '../src/processes.ts';
+import { RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
 import { tcpProbe } from '../src/registry/ports.ts';
+import { readRegistryStatus } from '../src/registry/registry.ts';
 import { runRegistryCommand } from '../src/registry-cli.ts';
 import { FakeDevices, tempDir } from './support/fakes.ts';
 import { portBlock } from './support/ports.ts';
@@ -62,7 +66,7 @@ test('a listener the toolkit did not start survives every registry command, on a
   const listeners: ChildProcess[] = [];
   const out: string[] = [];
   const as =
-    (owner: ChildProcess, folder: string) =>
+    (owner: ChildProcess, folder: string, clock?: Clock) =>
     (command: string, ...args: string[]) =>
       runRegistryCommand(
         command,
@@ -75,6 +79,7 @@ test('a listener the toolkit did not start survives every registry command, on a
           processes: systemProcesses,
           ports: tcpProbe,
           devices: { ios: devices },
+          ...(clock ? { clock } : {}),
         },
       );
   const folder = (name: string) => {
@@ -118,6 +123,7 @@ test('a listener the toolkit did not start survives every registry command, on a
     const b = as(ownerB, folder('b'));
     out.length = 0;
     assert.equal(await b('claim'), 0, out.join(''));
+    const laneB = /claimed lane (\w+) for process/.exec(out.join(''))?.[1] ?? '';
     assert.match(out.join(''), new RegExp(`export AGENTLANE_METRO_PORT=${String(PORTS + 2)}`));
     assert.match(out.join(''), new RegExp(`export AGENTLANE_API_PORT=${String(PORTS + 11)}`));
     await listen(PORTS + 11);
@@ -129,9 +135,16 @@ test('a listener the toolkit did not start survives every registry command, on a
     const c = as(ownerC, folder('c'));
     out.length = 0;
     assert.equal(await c('claim', '--no-device', '--services', 'api'), 0, out.join(''));
-    assert.match(out.join(''), /freed lane .* owner dead/);
     assert.match(out.join(''), new RegExp(`export AGENTLANE_API_PORT=${String(PORTS + 12)}`));
-    await survivors('a sweep that freed the lane under a listener');
+    assert.equal(await c('reap'), 0, out.join(''));
+    assert.match(out.join(''), /parked lane .*, whose owner is gone/);
+    await survivors("a sweep that parked a gone owner's lane under a listener");
+    const at =
+      readRegistryStatus({ dir: stateDir, processes: systemProcesses }).lanes.find(l => l.id === laneB)?.ownerGone?.foundAt ?? 0;
+    const later: Clock = { now: () => at + RETURN_WINDOW_MS, sleep: ms => systemClock.sleep(ms) };
+    assert.equal(await as(ownerC, folder('c'), later)('reap'), 0, out.join(''));
+    assert.match(out.join(''), new RegExp(`ended lane ${laneB}: its owner was found gone`));
+    await survivors("a sweep that ended a gone owner's lane under a listener");
 
     const id = /claimed lane (\w+) for process/.exec(laneA)?.[1] ?? '';
     out.length = 0;

@@ -47,6 +47,7 @@ function lane(
     deviceState: extra.deviceState ?? 'booted',
     park: null,
     hold: null,
+    ownerGone: null,
   };
 }
 

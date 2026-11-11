@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { systemClock, type Clock } from '../clock.ts';
 import { CLI } from '../name.ts';
 import type { ProcessTable } from '../processes.ts';
 import { describeOwner, ownerKey, resolveOwner, type Owner } from '../registry/owner.ts';
@@ -17,6 +18,7 @@ export interface Caller {
   /** The folder whose lane to use; the caller's git worktree when absent. */
   worktree?: string | undefined;
   processes: ProcessTable;
+  clock?: Clock;
   selfPid?: number;
   /** A resolved owner, for a long-lived caller such as the MCP server. */
   owner?: Owner;
@@ -49,7 +51,13 @@ export function resolveCallerLane(caller: Caller): CallerLane {
   if (!fs.existsSync(databasePath(dir))) {
     throw new NotClaimed(`${describeOwner(owner)} holds no lane (there is no registry yet)`, claimCommand(folder.worktree));
   }
-  const registry = Registry.open({ dir, processes: caller.processes, ports: tcpProbe, devices: {} });
+  const registry = Registry.open({
+    dir,
+    processes: caller.processes,
+    ports: tcpProbe,
+    devices: {},
+    ...(caller.clock ? { clock: caller.clock } : {}),
+  });
   try {
     const need = caller.need ?? 'device';
     const holds = (c: { device: unknown; browser: unknown }, parked: ParkRestarts | null = null) => {
@@ -57,7 +65,7 @@ export function resolveCallerLane(caller: Caller): CallerLane {
       const browser = c.browser !== null || (parked?.browser ?? null) !== null;
       return need === 'device' ? device : need === 'browser' ? browser : device || browser;
     };
-    let lane = registry.find(owner, folder.worktree);
+    let lane = registry.takeBack(owner, folder.worktree);
     if (!lane && caller.worktree === undefined) {
       const key = ownerKey(owner);
       const own = registry.status().lanes.filter(c => c.ownerKey === key && holds(c, c.park?.restarts));
@@ -71,7 +79,7 @@ export function resolveCallerLane(caller: Caller): CallerLane {
       }
     }
     if (!lane) throw new NotClaimed(`${describeOwner(owner)} holds no lane in ${folder.worktree}`, claimCommand(folder.worktree));
-    if (caller.counts) recordCall(dir, { id: lane.id, token: lane.token }, Date.now());
+    if (caller.counts) recordCall(dir, { id: lane.id, token: lane.token }, (caller.clock ?? systemClock).now());
     const park = registry.parkOf(lane.id);
     if (need === 'browser' && !lane.browser) {
       throw new NotClaimed(

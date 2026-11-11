@@ -64,10 +64,13 @@ test('codex exec runs its own app server, so the exec process is the owner, prov
 
     w.procs.kill(exec?.pid ?? 0);
     assert.equal(w.registry().status().lanes[0]?.ownerState, 'dead');
-    const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('next')));
-    assert.deepEqual(
-      next.freed.map(f => [f.id, f.reason]),
-      [[lane.lane.id, 'dead']],
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('next')));
+    assert.equal(
+      w
+        .registry()
+        .status()
+        .lanes.find(c => c.id === lane.lane.id)?.ownerGone?.state,
+      'dead',
     );
   } finally {
     w.close();

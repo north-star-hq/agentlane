@@ -38,4 +38,6 @@ export interface EnvDeps {
   heartbeatMs?: number;
   selfPid?: number;
   onCancel?: (cancel: () => void) => () => void;
+  /** Starts the sweep when it has work, as every command does at its start; a claim calls it when it finds work for it. */
+  passBy?: () => void;
 }

@@ -22,8 +22,19 @@ import {
   leaseReservations,
   sameProcess,
 } from './leases.ts';
-import type { Owner } from './owner.ts';
-import { describeOwner, describeState, isProven, judgeProcess, ownerKey, ownerState, worktreeState } from './owner.ts';
+import type { Owner, ProvenState } from './owner.ts';
+import {
+  describeOwner,
+  describeState,
+  hostSession,
+  isProven,
+  judgeProcess,
+  ownerKey,
+  ownerState,
+  worktreeState,
+} from './owner.ts';
+import type { OwnerGone } from './owner-checks.ts';
+import { dropCheck, noteChecked, noteGone, readCheck, RETURN_WINDOW_MS, startReap, stopReap } from './owner-checks.ts';
 import type { LaneHold } from './holds.ts';
 import { dropHold, readHold, writeHold } from './holds.ts';
 import type { LanePark, ParkRestarts } from './parks.ts';
@@ -105,11 +116,17 @@ export interface RegistryOptions {
   lockWaitMs?: number;
   self?: ProcessIdentity;
   onStep?: (step: Step) => void;
+  /**
+   * Called when a claim finds work for the sweep: a lane whose owner it found gone, which the sweep parks, or a wait in
+   * the queue for a device, which such a park may free.
+   */
+  sweepSoon?: () => void;
 }
 
 interface Verdicts {
   table: ReadonlyMap<number, string> | undefined;
-  lanes: ReadonlySet<string>;
+  /** Each lane's owner process as the snapshot judged it. */
+  lanes: ReadonlyMap<string, ProcessIdentity | null>;
   reservations: ReadonlyMap<string, ProcessIdentity>;
   leases: ReadonlyMap<string, ProcessIdentity>;
   tickets: ReadonlySet<number>;
@@ -146,8 +163,9 @@ interface Caller {
 }
 
 interface Progress {
-  freed: EndedLane[];
   notes: string[];
+  /** The claim found a lane's owner gone. */
+  found: boolean;
   replacedDriver: BrowserDriverName | null;
 }
 
@@ -201,6 +219,30 @@ export interface Kept {
 export type WakeStart =
   { kind: 'awake' } | { kind: 'busy'; park: LanePark; worktree: string } | { kind: 'taken'; park: LanePark };
 
+/** A lane as the sweep reads it: its owner, what the checks of that owner found, and its park and hold. */
+export interface SweptLane {
+  ref: LaneRef;
+  owner: Owner;
+  ownerKey: string;
+  worktree: string;
+  lastUsedAt: number;
+  checkedAt: number | null;
+  gone: OwnerGone | null;
+  park: LanePark | null;
+  hold: LaneHold | null;
+  /** The lane records a service process: one its last park could not stop, or it was never parked. */
+  running: boolean;
+}
+
+/** A lane's owner as a check judged it: the owner key and the process the check looked at. */
+export interface JudgedOwner {
+  id: string;
+  ownerKey: string;
+  process: ProcessIdentity | null;
+}
+
+export type ReapStart = { kind: 'taken'; lane: Lane; gone: OwnerGone } | { kind: 'left'; reason: string };
+
 const NOUN: Readonly<Record<Platform, string>> = { ios: 'simulator', android: 'emulator' };
 
 function emulatorConsolePorts(): number[] {
@@ -226,6 +268,10 @@ function consolePortOf(serial: string | undefined): number | null {
   return port === undefined ? null : Number(port);
 }
 
+function sameIdentity(a: ProcessIdentity | null, b: ProcessIdentity | null): boolean {
+  return a === null || b === null ? a === b : a.pid === b.pid && a.start === b.start;
+}
+
 function settlementKey(s: Settlement): string {
   return s.kind === 'lease' ? s.lease.reservation : s.name;
 }
@@ -246,6 +292,7 @@ export class Registry {
   private readonly clock: Clock;
   private readonly pollMs: number;
   private readonly onStep: (step: Step) => void;
+  private readonly sweepSoon: () => void;
   private selfIdentity: ProcessIdentity | undefined;
   private keeperIdentity: ProcessIdentity | null | undefined;
   private claiming = false;
@@ -260,6 +307,7 @@ export class Registry {
     this.clock = options.clock ?? systemClock;
     this.pollMs = options.pollMs ?? 500;
     this.onStep = options.onStep ?? (() => undefined);
+    this.sweepSoon = options.sweepSoon ?? (() => undefined);
     this.selfIdentity = options.self;
   }
 
@@ -334,11 +382,11 @@ export class Registry {
   private snapshotBeforeLock(): Verdicts {
     const db = this.store.db;
     const pids: number[] = [];
-    const lanes = new Set<string>();
-    for (const row of db.prepare('SELECT id, owner_pid FROM claims').all()) {
-      lanes.add(text(row, 'id'));
-      const pid = optInt(row, 'owner_pid');
-      if (pid !== null) pids.push(pid);
+    const lanes = new Map<string, ProcessIdentity | null>();
+    for (const row of db.prepare('SELECT * FROM claims').all()) {
+      const owner = ownerFromRow(row).process;
+      lanes.set(text(row, 'id'), owner);
+      if (owner) pids.push(owner.pid);
     }
     const reservations = new Map<string, ProcessIdentity>();
     const known = new Map<string, string>();
@@ -437,7 +485,10 @@ export class Registry {
   }
 
   private verdictFor(row: Row, verdicts: Verdicts) {
-    return verdicts.lanes.has(text(row, 'id')) ? judgeProcess(ownerFromRow(row).process, verdicts.table) : 'alive';
+    const judged = verdicts.lanes.get(text(row, 'id'));
+    const owner = ownerFromRow(row).process;
+    if (judged === undefined || !sameIdentity(judged, owner)) return 'alive';
+    return judgeProcess(owner, verdicts.table);
   }
 
   private candidatePorts(services: readonly ServiceRequest[], platform: Platform | null): number[] {
@@ -496,7 +547,7 @@ export class Registry {
     const keeper = this.keeper();
     const started = this.clock.now();
     const deadline = started + request.waitMs;
-    const progress: Progress = { freed: [], notes: [], replacedDriver: null };
+    const progress: Progress = { notes: [], found: false, replacedDriver: null };
     const settling: Settlement[] = this.unstash(me);
     const stopped = new Set<string>();
     let relisted = false;
@@ -526,6 +577,10 @@ export class Registry {
           return keeper === null ? this.finishedInWrite(attempted, me, progress.notes) : attempted;
         });
         settling.length = 0;
+        if (progress.found) {
+          progress.found = false;
+          this.sweepSoon();
+        }
         if (result.kind === 'refused') throw result.refusal;
         if (result.kind === 'relist') {
           if (relisted && this.clock.now() >= deadline) throw this.poolChanging(request, verdicts.ended, started);
@@ -555,6 +610,7 @@ export class Registry {
         this.step('claim:waiting');
         const left = deadline - this.clock.now();
         if (left <= 0) throw this.poolBusy(result, request);
+        this.sweepSoon();
         await this.clock.sleep(Math.min(this.pollMs, left));
       }
     } catch (error) {
@@ -859,13 +915,15 @@ export class Registry {
     const db = this.store.db;
     const now = this.clock.now();
     const retiring = this.landLeftovers(settling, listings, me, keeper, progress.notes);
-    progress.freed.push(...this.sweep(verdicts, now, caller));
+    if (this.sweep(verdicts, now)) progress.found = true;
     const { listed, leases } = this.reconcileAll(verdicts, backend, listings, me, keeper, now, stopped, progress.notes);
     this.step('claim:swept');
     if (retiring.length + leases.length > 0) return { kind: 'leased', leases: [...retiring, ...leases] };
     if (request.device !== null && this.freedSinceListing(verdicts.ended, listings)) return { kind: 'relist' };
 
-    const existing = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(caller.key, caller.worktree);
+    const mine = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(caller.key, caller.worktree);
+    if (mine) this.recognise(mine, request.owner);
+    const existing = mine ?? this.returning(request.owner, caller, now, row => isProven(this.verdictFor(row, verdicts)));
     const existingId = existing ? text(existing, 'id') : null;
     let needDevice = request.device !== null;
     let held: Row | undefined;
@@ -1013,12 +1071,12 @@ export class Registry {
       .run(me.pid, me.start);
   }
 
-  private sweep(verdicts: Verdicts, now: number, caller: Caller): EndedLane[] {
+  private sweep(verdicts: Verdicts, now: number): boolean {
     const db = this.store.db;
-    const freed: EndedLane[] = [];
+    let found = false;
     for (const row of db.prepare('SELECT * FROM claims').all()) {
       const state = ownerState(this.verdictFor(row, verdicts), worktreeState(text(row, 'worktree')));
-      if (isProven(state)) freed.push(this.end(row, state, caller, now));
+      if (isProven(state) && this.foundGone(row, state, now)) found = true;
     }
     for (const row of db.prepare('SELECT * FROM queue').all()) {
       const ticket = int(row, 'ticket');
@@ -1027,7 +1085,91 @@ export class Registry {
       if (isProven(verdict)) db.prepare('DELETE FROM queue WHERE ticket = ?').run(ticket);
     }
     db.prepare('DELETE FROM history WHERE ended_at < ?').run(now - HISTORY_KEEP_MS);
-    return freed;
+    return found;
+  }
+
+  /** Records the lane's owner as found gone, which ends its hold; the sweep parks the lane, and ends it once it stays gone. */
+  private foundGone(row: Row, state: ProvenState, now: number): boolean {
+    const db = this.store.db;
+    const id = text(row, 'id');
+    const key = text(row, 'owner_key');
+    if (!noteGone(db, id, key, state, now)) return false;
+    dropHold(db, id, key);
+    return true;
+  }
+
+  private beingEnded(row: Row, gone: OwnerGone): Refusal {
+    const pid = String(gone.reaper?.pid ?? 'unknown');
+    return new Refusal(
+      'lane-busy',
+      `lane ${text(row, 'id')} is being ended: its owner was found ${describeState(gone.state)} at ${formatTime(gone.foundAt)} and did not come back within ${formatAge(RETURN_WINDOW_MS)}`,
+      [
+        {
+          who: `the sweep ending it (pid ${pid})`,
+          folder: text(row, 'worktree'),
+          since: formatTime(gone.reapingSince ?? gone.foundAt),
+        },
+      ],
+      [`${CLI} up   (again once it has ended; it claims a new lane)`, `${CLI} status   (the lane, and the process ending it)`],
+    );
+  }
+
+  /**
+   * Takes `owner`, which presents the lane's own owner key, as the process to judge the lane by: a Codex thread's
+   * process that came back, or an owner a check took for gone. Either way the lane is its owner's again.
+   */
+  private recognise(row: Row, owner: Owner): void {
+    const db = this.store.db;
+    const id = text(row, 'id');
+    const gone = readCheck(db, id, text(row, 'owner_key'))?.gone ?? null;
+    if (gone?.reaper) throw this.beingEnded(row, gone);
+    const moved = owner.process !== null && !sameIdentity(ownerFromRow(row).process, owner.process);
+    if (!moved && gone === null) return;
+    if (owner.process && moved) {
+      db.prepare('UPDATE claims SET owner_pid = ?, owner_start = ? WHERE id = ?').run(owner.process.pid, owner.process.start, id);
+    }
+    dropCheck(db, id);
+  }
+
+  /**
+   * The lane a gone process of the caller's own Claude Code session held in the caller's folder, taken over by the
+   * caller with its ports, resources and record: when the lane's owner was found gone less than RETURN_WINDOW_MS ago
+   * and nothing has begun to end the lane, or when `gone` judges that owner gone now.
+   */
+  private returning(owner: Owner, caller: Caller, now: number, gone: (row: Row) => boolean): Row | undefined {
+    const db = this.store.db;
+    const session = hostSession(owner);
+    if (owner.kind !== 'claude' || session === null) return undefined;
+    const rows = db
+      .prepare(
+        `SELECT * FROM claims WHERE worktree = ? AND owner_kind = 'claude' AND owner_session = ? AND owner_key != ?
+           ORDER BY last_used_at DESC, id`,
+      )
+      .all(caller.worktree, session, caller.key);
+    for (const row of rows) {
+      const found = readCheck(db, text(row, 'id'), text(row, 'owner_key'))?.gone ?? null;
+      const back = found ? found.reaper === null && now < found.foundAt + RETURN_WINDOW_MS : gone(row);
+      if (!back) continue;
+      const id = text(row, 'id');
+      db.prepare(
+        `UPDATE claims SET owner_key = ?, owner_kind = ?, owner_pid = ?, owner_start = ?, owner_session = ?, owner_thread = ?,
+           last_used_at = ?, last_action = ? WHERE id = ?`,
+      ).run(
+        caller.key,
+        owner.kind,
+        owner.process?.pid ?? null,
+        owner.process?.start ?? null,
+        owner.sessionId,
+        owner.threadId,
+        now,
+        'returned',
+        id,
+      );
+      db.prepare('DELETE FROM holds WHERE claim_id = ?').run(id);
+      dropCheck(db, id);
+      return db.prepare('SELECT * FROM claims WHERE id = ?').get(id);
+    }
+    return undefined;
   }
 
   private reconcileAll(
@@ -1696,6 +1838,187 @@ export class Registry {
     return row ? loadLane(this.store.db, text(row, 'id')) : null;
   }
 
+  /**
+   * As `find`, for a call by `owner` itself: the lane is its owner's again if a check took the owner for gone, and a
+   * gone process of the same Claude Code session gives `owner` its lane in this folder while the lane's window lasts.
+   * Refused while the lane is being ended.
+   */
+  takeBack(owner: Owner, worktree: string): Lane | null {
+    const db = this.store.db;
+    const key = ownerKey(owner);
+    const mine = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(key, worktree);
+    const session = hostSession(owner);
+    if (mine) {
+      const gone = readCheck(db, text(mine, 'id'), key)?.gone ?? null;
+      const moved = owner.process !== null && !sameIdentity(ownerFromRow(mine).process, owner.process);
+      if (gone === null && !moved) return loadLane(db, text(mine, 'id'));
+    } else if (owner.kind !== 'claude' || session === null) return null;
+    const others = mine
+      ? []
+      : db
+          .prepare(`SELECT * FROM claims WHERE worktree = ? AND owner_kind = 'claude' AND owner_session = ? AND owner_key != ?`)
+          .all(worktree, session, key);
+    const pids = others.flatMap(row => {
+      const identity = ownerFromRow(row).process;
+      return identity ? [identity.pid] : [];
+    });
+    if (!mine && others.length === 0) return null;
+    const table = pids.length > 0 ? this.processes.startTimes(pids) : new Map<number, string>();
+    return this.store.write(() => {
+      const caller = this.caller(owner, worktree);
+      const now = this.clock.now();
+      const own = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(key, worktree);
+      if (own) {
+        this.recognise(own, owner);
+        return loadLane(db, text(own, 'id'));
+      }
+      const back = this.returning(owner, caller, now, row => isProven(judgeProcess(ownerFromRow(row).process, table)));
+      return back ? loadLane(db, text(back, 'id')) : null;
+    });
+  }
+
+  /** Every lane, with what the sweep needs to judge it, in one read of the registry. */
+  sweepList(): SweptLane[] {
+    const db = this.store.db;
+    const now = this.clock.now();
+    return db
+      .prepare('SELECT * FROM claims ORDER BY last_used_at, id')
+      .all()
+      .map(row => {
+        const id = text(row, 'id');
+        const key = text(row, 'owner_key');
+        const check = readCheck(db, id, key);
+        return {
+          ref: { id, token: text(row, 'token') },
+          owner: ownerFromRow(row),
+          ownerKey: key,
+          worktree: text(row, 'worktree'),
+          lastUsedAt: int(row, 'last_used_at'),
+          checkedAt: check?.checkedAt ?? null,
+          gone: check?.gone ?? null,
+          park: readPark(db, id),
+          hold: readHold(db, id, key, now),
+          running: db.prepare('SELECT 1 FROM processes WHERE claim_id = ? LIMIT 1').get(id) !== undefined,
+        };
+      });
+  }
+
+  /**
+   * Records what a check of the lanes' owners found, in one write: `seen` alive or past telling, `gone` with what the
+   * check found. Each counts only while the lane's owner is still the one the check judged. Returns the lanes whose
+   * owner this check is the first to find gone; their holds end.
+   */
+  noteOwners(seen: readonly JudgedOwner[], gone: readonly (JudgedOwner & { state: ProvenState })[]): string[] {
+    if (seen.length + gone.length === 0) return [];
+    return this.store.write(() => {
+      const db = this.store.db;
+      const now = this.clock.now();
+      const current = (judged: JudgedOwner): Row | undefined => {
+        const row = db.prepare('SELECT * FROM claims WHERE id = ? AND owner_key = ?').get(judged.id, judged.ownerKey);
+        return row && sameIdentity(ownerFromRow(row).process, judged.process) ? row : undefined;
+      };
+      for (const judged of seen) if (current(judged)) noteChecked(db, judged.id, judged.ownerKey, now);
+      const found: string[] = [];
+      for (const judged of gone) {
+        const row = current(judged);
+        if (row && this.foundGone(row, judged.state, now)) found.push(judged.id);
+      }
+      return found;
+    });
+  }
+
+  /**
+   * Takes the lane for ending as attempt `attempt` of this process, once its owner has stayed gone for RETURN_WINDOW_MS:
+   * `dead` names processes proven gone before this call, whose end or park of the lane may be taken over. Left while a
+   * service it records may still run, since its ports would go to another lane.
+   */
+  beginReap(ref: LaneRef, attempt: string, dead: readonly ProcessIdentity[]): ReapStart {
+    const me = this.self();
+    return this.store.write(() => {
+      const db = this.store.db;
+      const row = db.prepare('SELECT * FROM claims WHERE id = ?').get(ref.id);
+      if (!row || text(row, 'token') !== ref.token) return { kind: 'left', reason: 'it has ended' };
+      this.store.actor = { who: `${TOOL} ending lane ${ref.id}`, folder: text(row, 'worktree') };
+      const gone = readCheck(db, ref.id, text(row, 'owner_key'))?.gone ?? null;
+      const now = this.clock.now();
+      const isDead = (p: ProcessIdentity | null) => p !== null && dead.some(d => sameProcess(d, p));
+      if (!gone) return { kind: 'left', reason: 'its owner came back' };
+      if (now < gone.foundAt + RETURN_WINDOW_MS)
+        return { kind: 'left', reason: `its owner may come back until ${formatTime(gone.foundAt + RETURN_WINDOW_MS)}` };
+      if (gone.reaper && !isDead(gone.reaper)) return { kind: 'left', reason: `pid ${String(gone.reaper.pid)} is ending it` };
+      const park = readPark(db, ref.id);
+      if (park && park.state !== 'parked' && !isDead(park.holder)) {
+        return {
+          kind: 'left',
+          reason: `pid ${String(park.holder?.pid ?? 'unknown')} is ${park.state === 'waking' ? 'waking' : 'parking'} it`,
+        };
+      }
+      const running = processesOf(db, ref.id).map(p => p.service);
+      if (running.length > 0)
+        return { kind: 'left', reason: `it still records ${running.join(', ')}, which no stop proved down` };
+      startReap(db, ref.id, me, attempt, now);
+      const lane = loadLane(db, ref.id);
+      if (!lane) throw new Error(`lane ${ref.id} vanished inside its own transaction`);
+      return { kind: 'taken', lane, gone: { ...gone, reaper: me, reapingSince: now, attempt } };
+    });
+  }
+
+  /** Gives up attempt `attempt` at ending the lane, so a later sweep tries again. */
+  abortReap(ref: LaneRef, attempt: string): void {
+    this.store.write(() => {
+      stopReap(this.store.db, ref.id, attempt);
+    });
+  }
+
+  /**
+   * Ends the lane attempt `attempt` of this process took for ending, as a release does: its device goes back to the
+   * pool once it is shut down, and the resources it made wait for their teardown. Null when the attempt no longer holds it.
+   */
+  endReaped(ref: LaneRef, attempt: string, notes: string[] = []): EndedLane | null {
+    const me = this.self();
+    const by: Caller = { key: `reap:${String(me.pid)}:${me.start}`, label: `${TOOL} reap (pid ${String(me.pid)})`, worktree: '' };
+    const [ended] = this.releasing(
+      notes,
+      () => undefined,
+      (mine, keeper) => {
+        const db = this.store.db;
+        const row = db.prepare('SELECT * FROM claims WHERE id = ? AND token = ?').get(ref.id, ref.token);
+        const gone = row ? (readCheck(db, ref.id, text(row, 'owner_key'))?.gone ?? null) : null;
+        if (!row || gone?.attempt !== attempt || !gone.reaper || !sameProcess(gone.reaper, mine))
+          return { ended: [], leases: [] };
+        by.worktree = text(row, 'worktree');
+        this.store.actor = { who: by.label, folder: by.worktree };
+        return this.endAndLease([row], gone.state, by, mine, keeper);
+      },
+    );
+    return ended ?? null;
+  }
+
+  /** Whether this process holds device work it could not record as done in `dir`'s registry, for `settleOwn` to land. */
+  static holdsLeftovers(dir: string): boolean {
+    const prefix = `${dir}\0${String(process.pid)}\0`;
+    return [...unsettled.keys()].some(key => key.startsWith(prefix));
+  }
+
+  /** Lands the device work this process could not record as done earlier, as every claim and release does first. */
+  settleOwn(notes: string[] = []): void {
+    const me = this.self();
+    const keeper = this.keeper();
+    const pending = this.unstash(me);
+    let work: Work;
+    try {
+      const listings = this.listOwn(me, pending);
+      work = this.store.write(() => {
+        const others = this.landLeftovers(pending, listings, me, keeper, notes);
+        return this.inWrite({ own: [], others }, me, keeper, notes, 'release:stopped-device');
+      });
+    } catch (error) {
+      this.stash(me, pending);
+      throw error;
+    }
+    this.afterWrite(work, me, keeper, notes, 'release:stopped-device');
+  }
+
   private releasing<V extends Verdicts | undefined>(
     notes: string[],
     judge: () => V,
@@ -1879,16 +2202,22 @@ export class Registry {
   /**
    * Starts parking the lane as attempt `attempt` of this process, if the registry's record still has it unused since
    * `idleSince`, no hold keeps it up, and nobody else is parking or waking it; `dead` is the holder of an earlier park
-   * or wake that was proven gone before this call. Null when the lane is not to be parked now.
+   * or wake that was proven gone before this call. With `owner-gone` instead of a time, the lane is parked while a check
+   * has its owner as gone and nothing has begun to end it, however lately it was used. Null when it is not to be parked now.
    */
-  beginPark(ref: LaneRef, idleSince: number, attempt: string, dead: ProcessIdentity | null): Lane | null {
+  beginPark(ref: LaneRef, idleSince: number | 'owner-gone', attempt: string, dead: ProcessIdentity | null): Lane | null {
     const me = this.self();
     return this.store.write(() => {
       const row = this.requireLane(ref);
       this.parkActor(row, 'parking');
-      if (int(row, 'last_used_at') > idleSince) return null;
       const db = this.store.db;
-      if (readHold(db, ref.id, text(row, 'owner_key'), this.clock.now())) return null;
+      if (idleSince === 'owner-gone') {
+        const gone = readCheck(db, ref.id, text(row, 'owner_key'))?.gone;
+        if (!gone || gone.reaper) return null;
+      } else {
+        if (int(row, 'last_used_at') > idleSince) return null;
+        if (readHold(db, ref.id, text(row, 'owner_key'), this.clock.now())) return null;
+      }
       const park = readPark(db, ref.id);
       if (park && park.state !== 'parked' && !this.heldByDead(park, dead)) return null;
       writePark(db, ref.id, {
@@ -2040,7 +2369,7 @@ export class Registry {
 
   touchOwn(owner: Owner, worktree: string, action: string): Lane {
     this.caller(owner, worktree);
-    const lane = this.find(owner, worktree);
+    const lane = this.takeBack(owner, worktree);
     if (!lane)
       throw new NotClaimed(`${describeOwner(owner)} holds no lane in ${worktree}`, `${CLI} claim   (run in ${worktree})`);
     return this.touch({ id: lane.id, token: lane.token }, action);

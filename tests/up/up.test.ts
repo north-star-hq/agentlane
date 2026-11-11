@@ -224,7 +224,7 @@ test('preconditions refuse before any build, naming the fix', async t => {
   assert.ok(w.lines.some(l => l.includes('which this run made, so the refusal leaves nothing behind')));
 });
 
-test('the services of a lane whose owner died are stopped by the next claim that frees it', async t => {
+test('the services of a lane whose owner died are stopped by the sweep once a claim finds the owner gone', async t => {
   const w = world(t);
   const owner = sleeper();
   t.after(() => owner.kill('SIGKILL'));
@@ -249,9 +249,22 @@ test('the services of a lane whose owner died are stopped by the next claim that
     system: realServiceSystem,
   });
   assert.equal(code, 0, out.join(''));
-  assert.match(out.join(''), /freed lane [0-9a-f]{8} of process \d+ in /);
+  out.length = 0;
+  const reaped2 = await runRegistryCommand('reap', [], {
+    env: deps.env,
+    cwd: other,
+    stdout: text => out.push(text),
+    stderr: text => out.push(text),
+    processes: systemProcesses,
+    ports: tcpProbe,
+    devices: deps.devices,
+    system: realServiceSystem,
+    sim: w.sim,
+  });
+  assert.equal(reaped2, 0, out.join(''));
+  assert.match(out.join(''), /parked lane [0-9a-f]{8}, whose owner is gone; it ends at .* nothing can take it back/);
   for (const p of procs) await until(() => !alive(p.pid));
-  assert.match(out.join(''), /stopped metro/);
+  assert.deepEqual(w.processes(), [], 'the parked lane records no service still running');
 });
 
 test('a bundler-pin app is pinned to its own Metro and read back, keeps its dial across a relaunch without arguments, and release clears both', async t => {

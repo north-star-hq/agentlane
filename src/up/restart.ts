@@ -52,7 +52,7 @@ export async function restart(deps: EnvDeps, names: readonly string[], worktree?
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
   });
   try {
-    const found = registry.find(owner, folder.worktree);
+    const found = registry.takeBack(owner, folder.worktree);
     if (!found) {
       throw new NotClaimed(
         `${describeOwner(owner)} holds no lane in ${folder.worktree}, so there is no service to restart`,

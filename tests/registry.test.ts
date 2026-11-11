@@ -12,6 +12,7 @@ import { DEFAULT_CONFIG, DEVICE_MEMORY_MB, HOUR_MS } from '../src/registry/confi
 import type { RegistryConfig } from '../src/registry/config.ts';
 import { allLeases, endLease, leaseDevice } from '../src/registry/leases.ts';
 import type { Owner } from '../src/registry/owner.ts';
+import { RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
 import { databasePath } from '../src/registry/paths.ts';
 import type { PortProbe } from '../src/registry/ports.ts';
 import { Refusal } from '../src/registry/refusal.ts';
@@ -241,7 +242,7 @@ test('a strict lane with the pool full of another type replaces an unclaimed sim
   }
 });
 
-test("a lane whose owner is gone is freed by the next claim; a can't-tell owner is reported in status and left alone", async () => {
+test("a claim that finds a lane's owner gone records when, and ends nothing: the lane keeps all it holds for the sweep to park; a can't-tell owner is left alone", async () => {
   const w = world();
   try {
     const dead = w.procs.owner();
@@ -252,22 +253,39 @@ test("a lane whose owner is gone is freed by the next claim; a can't-tell owner 
 
     const before = w.registry().status();
     assert.equal(before.lanes.find(c => c.id === deadLane.lane.id)?.ownerState, 'dead');
+    assert.equal(before.lanes.find(c => c.id === deadLane.lane.id)?.ownerGone, null);
     assert.equal(before.lanes.find(c => c.id === codexLane.lane.id)?.ownerState, 'cant-tell');
 
+    await w.clock.advance(60_000);
     const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('next')));
-    assert.deepEqual(
-      next.freed.map(f => [f.id, f.reason]),
-      [[deadLane.lane.id, 'dead']],
-    );
-    assert.equal(next.lane.device?.id, deadLane.lane.device?.id);
+    assert.notEqual(next.lane.device?.id, deadLane.lane.device?.id);
 
     const after = w.registry().status();
+    const gone = after.lanes.find(c => c.id === deadLane.lane.id);
+    assert.deepEqual(gone?.ownerGone, {
+      state: 'dead',
+      foundAt: w.clock.now(),
+      endsAt: w.clock.now() + RETURN_WINDOW_MS,
+      session: null,
+      by: null,
+    });
+    assert.equal(gone.device?.id, deadLane.lane.device?.id);
+    assert.deepEqual(gone.ports, deadLane.lane.ports);
+    assert.deepEqual(after.recent, []);
     const left = after.lanes.find(c => c.id === codexLane.lane.id);
     assert.equal(left?.ownerState, 'cant-tell');
+    assert.equal(left.ownerGone, null);
     assert.equal(left.device?.id, codexLane.lane.device?.id);
+
+    await w.clock.advance(60_000);
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('later'), NO_DEVICE));
     assert.equal(
-      after.lanes.some(c => c.id === deadLane.lane.id),
-      false,
+      w
+        .registry()
+        .status()
+        .lanes.find(c => c.id === deadLane.lane.id)?.ownerGone?.foundAt,
+      w.clock.now() - 60_000,
+      'a later claim keeps the moment the owner was first found gone',
     );
   } finally {
     w.close();
@@ -281,47 +299,51 @@ test('when ps cannot be read every owner is can-not-tell, and nothing is freed e
     const lane = await w.registry().claim(w.request(dead, w.folder('dead'), NO_DEVICE));
     w.procs.kill(dead.process?.pid ?? 0);
     w.procs.blind = true;
-    const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('next'), NO_DEVICE));
-    assert.deepEqual(next.freed, []);
-    assert.equal(
-      w
-        .registry()
-        .status()
-        .lanes.find(c => c.id === lane.lane.id)?.ownerState,
-      'cant-tell',
-    );
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('next'), NO_DEVICE));
+    const seen = w
+      .registry()
+      .status()
+      .lanes.find(c => c.id === lane.lane.id);
+    assert.equal(seen?.ownerState, 'cant-tell');
+    assert.equal(seen.ownerGone, null);
   } finally {
     w.close();
   }
 });
 
-test('a recycled pid is classified pid-reused, not alive, and its lane is freed', async () => {
+test('a recycled pid is classified pid-reused, not alive, and its owner is recorded as gone', async () => {
   const w = world();
   try {
     const owner = w.procs.owner();
     const lane = await w.registry().claim(w.request(owner, w.folder('a'), NO_DEVICE));
     w.procs.recycle(owner.process?.pid ?? 0);
     assert.equal(w.registry().status().lanes[0]?.ownerState, 'pid-reused');
-    const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('b'), NO_DEVICE));
-    assert.deepEqual(
-      next.freed.map(f => [f.id, f.reason]),
-      [[lane.lane.id, 'pid-reused']],
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('b'), NO_DEVICE));
+    assert.equal(
+      w
+        .registry()
+        .status()
+        .lanes.find(c => c.id === lane.lane.id)?.ownerGone?.state,
+      'pid-reused',
     );
   } finally {
     w.close();
   }
 });
 
-test('a lane whose worktree was deleted is freed even though its owner is alive', async () => {
+test('a lane whose worktree was deleted is recorded as gone even though its owner is alive', async () => {
   const w = world();
   try {
     const folder = w.folder('doomed');
     const lane = await w.registry().claim(w.request(w.procs.owner(), folder, NO_DEVICE));
     fs.rmSync(folder, { recursive: true });
-    const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('b'), NO_DEVICE));
-    assert.deepEqual(
-      next.freed.map(f => [f.id, f.reason]),
-      [[lane.lane.id, 'worktree-gone']],
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('b'), NO_DEVICE));
+    assert.equal(
+      w
+        .registry()
+        .status()
+        .lanes.find(c => c.id === lane.lane.id)?.ownerGone?.state,
+      'worktree-gone',
     );
   } finally {
     w.close();
@@ -341,15 +363,13 @@ test('a lane recorded after the pre-lock process snapshot is not judged from tha
     const late = w.procs.owner();
     const lateLane = await w.registry().claim(w.request(late, w.folder('late'), NO_DEVICE));
     open();
-    const out = await slow;
-    assert.deepEqual(out.freed, []);
-    assert.equal(
-      w
-        .registry()
-        .status()
-        .lanes.find(c => c.id === lateLane.lane.id)?.ownerState,
-      'alive',
-    );
+    await slow;
+    const late2 = w
+      .registry()
+      .status()
+      .lanes.find(c => c.id === lateLane.lane.id);
+    assert.equal(late2?.ownerState, 'alive');
+    assert.equal(late2.ownerGone, null);
   } finally {
     w.close();
   }
@@ -492,7 +512,6 @@ test("a live owner's idle lane is never ended by another claim at any idle age: 
     await w.clock.advance(500);
     const got = await b;
     assert.equal(got.lane.device?.id, a.lane.device?.id);
-    assert.deepEqual(got.freed, []);
     const parked = w.registry().touch(ref, 'look');
     assert.deepEqual(parked.ports, a.lane.ports);
     assert.equal(parked.device, null);
@@ -513,8 +532,14 @@ test("a can't-tell lane is never freed by the sweep nor taken over, for a device
     const unknown = await w.registry().claim(w.request(thread, w.folder('unknown')));
     await w.clock.advance(3 * 24 * HOUR_MS);
 
-    const sweeper = await w.registry().claim(w.request(w.procs.owner(), w.folder('sweeper'), { device: null, services: [] }));
-    assert.deepEqual(sweeper.freed, []);
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('sweeper'), { device: null, services: [] }));
+    assert.equal(
+      w
+        .registry()
+        .status()
+        .lanes.find(c => c.id === unknown.lane.id)?.ownerGone,
+      null,
+    );
     await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('device'), { services: [] })), {
       code: 'pool-busy',
     });
@@ -1462,14 +1487,29 @@ function busyMb(dir: string): number {
   }
 }
 
-test('a claim whose device listing predates the boot of a lane it sweeps looks again before it plans, so nobody admits a device while that one runs uncounted', async () => {
+/** Ends a lane as 0.4.1's claim ends a dead owner's lane inside its lock, leaving its device to the next claim's reconcile. */
+function endAs041(dir: string, lane: Lane, at: number): void {
+  const db = new DatabaseSync(databasePath(dir));
+  try {
+    db.exec('PRAGMA foreign_keys = ON');
+    db.prepare(
+      `INSERT INTO history (claim_id, owner_key, owner_label, worktree, device, reason, created_at, last_used_at, last_action,
+         by_owner_key, by_label, by_worktree, ended_at)
+       VALUES (?, ?, 'a dead owner', ?, ?, 'dead', ?, ?, 'claim', 'process:1:0', 'agentlane 0.4.1', ?, ?)`,
+    ).run(lane.id, lane.ownerKey, lane.worktree, lane.device?.name ?? null, lane.createdAt, lane.lastUsedAt, lane.worktree, at);
+    db.prepare('DELETE FROM claims WHERE id = ?').run(lane.id);
+  } finally {
+    db.close();
+  }
+}
+
+test('a claim whose device listing predates the boot of a lane that ended meanwhile looks again before it plans, so nobody admits a device while that one runs uncounted', async () => {
   const w = world({ poolSize: 2, memoryBudgetMb: 4000 });
   try {
     const owner = w.procs.owner();
     const a = await w.registry().claim(w.request(owner, w.folder('a')));
     const device = a.lane.device;
     assert.ok(device);
-    w.procs.kill(owner.process?.pid ?? 0);
 
     const over: string[] = [];
     const audit = (who: string, step: Step) => {
@@ -1492,6 +1532,7 @@ test('a claim whose device listing predates the boot of a lane it sweeps looks a
       })
       .claim(w.request(w.procs.owner(), w.folder('late'), strict));
     w.devices.setBooted(device.id, true);
+    endAs041(w.dir, a.lane, w.clock.now());
     openProbe();
     for (let i = 0; i < 200 && !probe.regated; i++) await new Promise(resolve => setImmediate(resolve));
     assert.ok(probe.regated, 'the sweeper reserved a simulator to create');
@@ -1628,6 +1669,14 @@ for (const cut of ['release:committed', 'release:stopped-device'] as const) {
       assert.equal(leaseRows(w.dir), 0);
 
       w.procs.kill(owner.process?.pid ?? 0);
+      if (
+        w
+          .registry()
+          .status()
+          .lanes.some(c => c.id === a.lane.id)
+      ) {
+        assert.equal(w.registry().releaseById(a.lane.id, w.procs.owner(), false).reason, 'dead');
+      }
       const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c'), { boot: true }));
       assert.equal(c.lane.device?.id, device.id);
       assert.deepEqual(

@@ -27,7 +27,7 @@ import { realServiceSystem } from './services/system.ts';
 import { UP_COMMANDS, UP_HELP, UP_USAGE, runUpCommand } from './up-cli.ts';
 import type { EnvDeps } from './up/deps.ts';
 import { systemToolchain } from './up/preflight.ts';
-import { passBy, runSweep, sweeper, SWEEP_COMMAND } from './up/sweep.ts';
+import { passBy, runSweep, sweeper, SWEEP_COMMAND, sweepTick } from './up/sweep.ts';
 import { upWaker } from './up/waker.ts';
 import { asksForHelp, helpOf, type UsageGroup } from './usage.ts';
 
@@ -92,7 +92,11 @@ async function main(args: string[]): Promise<number> {
     return 0;
   }
   const state = stateDir(process.env);
-  if (command !== 'hook' && command !== SWEEP_COMMAND) passBy({ dir: state }, sweeper(process.argv[1] ?? '', process.env));
+  const startSweep = sweeper(process.argv[1] ?? '', process.env);
+  const passingBy = () => {
+    passBy({ dir: state }, startSweep);
+  };
+  if (command !== 'hook' && command !== SWEEP_COMMAND && command !== 'reap') passingBy();
   const mac = process.platform === 'darwin';
   const android = createEmulatorBackend({ env: process.env, logDir: path.join(state, 'emulators') });
   const devices = mac ? { ios: simctlBackend, android } : { android };
@@ -118,6 +122,7 @@ async function main(args: string[]): Promise<number> {
     },
     clock: systemClock,
     onCancel,
+    passBy: passingBy,
   });
   if (command === SWEEP_COMMAND) {
     if (rest.length > 0) {
@@ -131,6 +136,7 @@ async function main(args: string[]): Promise<number> {
       system: realServiceSystem,
       clock: systemClock,
       devices,
+      sim,
       ports: tcpProbe,
       log: line => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
     });
@@ -148,11 +154,12 @@ async function main(args: string[]): Promise<number> {
       onCancel,
       sim,
       system: realServiceSystem,
+      passBy: passingBy,
     });
   }
   if ((HOOK_COMMANDS as readonly string[]).includes(command)) {
     const worker = process.env[SESSION_END_OWNER_ENV] !== undefined;
-    return runHookCommand(rest, {
+    const code = await runHookCommand(rest, {
       env: process.env,
       cwd: process.cwd(),
       stdout: text => process.stdout.write(text),
@@ -165,6 +172,8 @@ async function main(args: string[]): Promise<number> {
       stdin: worker || process.stdin.isTTY ? '' : fs.readFileSync(0, 'utf8'),
       startWorker: detachedWorker(process.argv[1] ?? ''),
     });
+    if (worker) passingBy();
+    return code;
   }
   if ((UP_COMMANDS as readonly string[]).includes(command)) {
     return runUpCommand(command, rest, envDeps(), text => process.stdout.write(text));
@@ -179,6 +188,11 @@ async function main(args: string[]): Promise<number> {
       output: process.stdout,
       processes: systemProcesses,
       wake: upWaker(envDeps()),
+      sweep: {
+        run: () => {
+          sweepTick({ dir: state }, devices, startSweep);
+        },
+      },
     });
   }
   if ((AGENT_COMMANDS as readonly string[]).includes(command)) {
