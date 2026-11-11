@@ -174,11 +174,13 @@ export function world(t: TestContext): World {
   const browser = new FakeBrowser(root);
   const env = {
     PATH: process.env.PATH,
-    HOME: process.env.HOME,
+    HOME: path.join(root, 'home'),
     AGENTLANE_STATE_DIR: state,
     ANDROID_HOME: sdk,
     CLAUDE_CONFIG_DIR: path.join(root, 'claude-config'),
     XDG_STATE_HOME: path.join(root, 'xdg-state'),
+    XDG_DATA_HOME: path.join(root, 'xdg-data'),
+    XDG_CONFIG_HOME: path.join(root, 'xdg-config'),
   };
   const processes = () =>
     readRegistryStatus({ dir: state, processes: systemProcesses, devices: { ios: devices, android: avds } }).lanes.flatMap(

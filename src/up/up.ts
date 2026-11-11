@@ -13,7 +13,7 @@ import {
 import { realBrowserTools, type BrowserTools } from '../browser/tools.ts';
 import type { CachedBuildResult, CacheMode } from '../cache/build.ts';
 import { cachedBuild } from '../cache/build.ts';
-import { computeKey } from '../cache/key.ts';
+import { computeKey, type FileDigests } from '../cache/key.ts';
 import { BuildCache, cacheDirFor } from '../cache/store.ts';
 import { adbTools, type AdbTools } from '../devices/adb.ts';
 import {
@@ -50,12 +50,13 @@ import { formatAge, shellQuote } from '../registry/format.ts';
 import { resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
-import { Registry } from '../registry/registry.ts';
+import { readRegistryStatus, Registry } from '../registry/registry.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
 import { laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
 import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
+import { rememberAnswers } from './answers.ts';
 import type { EnvDeps } from './deps.ts';
 import type { DoctorReport } from './doctor.ts';
 import { bundlerPort, diagnose, dialArguments, reversePorts } from './doctor.ts';
@@ -231,6 +232,7 @@ async function buildApp(ctx: DeviceCtx, mode: CacheMode): Promise<BuildSummary> 
   }
   const cache = new BuildCache({ dir: await cacheDirFor(config.dir), config: cacheConfig });
   const builder = identityOf(ctx.deps.processes, process.pid);
+  const digests: FileDigests = new Map();
   return cachedBuild({
     cache,
     variant: config.app.variant,
@@ -248,6 +250,7 @@ async function buildApp(ctx: DeviceCtx, mode: CacheMode): Promise<BuildSummary> 
             : await ctx.deps.toolchain.androidToolchain(config.dir, env),
         ...(cacheConfig.envFile !== undefined ? { envFile: cacheConfig.envFile } : {}),
         env: ctx.env,
+        digests,
       }),
     install,
     build,
@@ -565,7 +568,8 @@ function describeResources(made: { created: string[]; kept: string[] }): string 
   return parts.filter(p => p !== '').join('; ');
 }
 
-export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
+export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> {
+  const deps = rememberAnswers(given);
   const started = deps.clock.now();
   const run = new Run(deps);
   const start = options.worktree ?? deps.cwd;
@@ -595,12 +599,13 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
   }
 
   const state = stateDir(deps.env);
+  const registryConfig = withProjectBlocks(loadConfig(state), projectBlocks(config), config.file);
   const registry = Registry.open({
     dir: state,
     processes: deps.processes,
     ports: deps.ports,
     devices: deps.devices,
-    config: withProjectBlocks(loadConfig(state), projectBlocks(config), config.file),
+    config: registryConfig,
     clock: deps.clock,
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
   });
@@ -668,7 +673,12 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
     });
     pruneEndedLaneFiles(
       state,
-      new Set([...registry.status().lanes.map(c => c.id), ...registry.pendingTeardowns().map(t => t.lane)]),
+      new Set([
+        ...readRegistryStatus({ dir: state, processes: deps.processes, config: registryConfig, clock: deps.clock }).lanes.map(
+          c => c.id,
+        ),
+        ...registry.pendingTeardowns().map(t => t.lane),
+      ]),
       deps.clock.now(),
       deps.env,
     );
