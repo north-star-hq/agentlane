@@ -79,6 +79,8 @@ export interface ServiceProcess {
   pid: number;
   start: string;
   cwd: string | null;
+  /** The last moment, in ms since the epoch, a check found this pid running with this start time. */
+  aliveAt?: number;
 }
 
 export type ResourceValues = Record<string, string>;

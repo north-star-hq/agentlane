@@ -15,6 +15,7 @@ import type {
   EndedLane,
   EndReason,
   ResourceValues,
+  ServiceProcess,
 } from './types.ts';
 
 export function ownerFromRow(row: Row): Owner {
@@ -77,6 +78,26 @@ export function loadLane(db: DatabaseSync, id: string): Lane | null {
   return info && row ? { ...info, token: text(row, 'token') } : null;
 }
 
+export function processesOf(db: DatabaseSync, id: string): ServiceProcess[] {
+  return db
+    .prepare(
+      `SELECT p.service, p.pid, p.start, p.cwd, a.alive_at FROM processes p
+       LEFT JOIN process_alive a ON a.claim_id = p.claim_id AND a.service = p.service AND a.pid = p.pid AND a.start = p.start
+       WHERE p.claim_id = ? ORDER BY p.service`,
+    )
+    .all(id)
+    .map(p => {
+      const aliveAt = optInt(p, 'alive_at');
+      return {
+        service: text(p, 'service'),
+        pid: int(p, 'pid'),
+        start: text(p, 'start'),
+        cwd: optText(p, 'cwd'),
+        ...(aliveAt === null ? {} : { aliveAt }),
+      };
+    });
+}
+
 export function loadLaneInfo(db: DatabaseSync, id: string): LaneInfo | null {
   const row = db.prepare('SELECT * FROM claims WHERE id = ?').get(id);
   if (!row) return null;
@@ -98,10 +119,7 @@ export function loadLaneInfo(db: DatabaseSync, id: string): LaneInfo | null {
     device: device ? deviceFromRow(device, ports.find(p => p.service === EMULATOR_SERVICE)?.port ?? null) : null,
     browser: browser ? browserFromRow(browser, ports) : null,
     ports,
-    processes: db
-      .prepare('SELECT * FROM processes WHERE claim_id = ? ORDER BY service')
-      .all(id)
-      .map(p => ({ service: text(p, 'service'), pid: int(p, 'pid'), start: text(p, 'start'), cwd: optText(p, 'cwd') })),
+    processes: processesOf(db, id),
     resources: db
       .prepare('SELECT name, exports FROM resources WHERE claim_id = ? ORDER BY seq')
       .all(id)

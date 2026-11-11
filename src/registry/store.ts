@@ -37,8 +37,16 @@ CREATE TABLE IF NOT EXISTS browsers (
   worktree TEXT NOT NULL,
   created_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS process_alive (
+  claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+  service TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  start TEXT NOT NULL,
+  alive_at INTEGER NOT NULL,
+  PRIMARY KEY (claim_id, service)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers'];
+const ADDED_TABLES = ['resources', 'browsers', 'process_alive'];
 
 const SCHEMA = `
 CREATE TABLE claims (

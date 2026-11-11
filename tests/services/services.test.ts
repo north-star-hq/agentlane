@@ -6,10 +6,12 @@ import path from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { systemClock } from '../../src/clock.ts';
 import type { ServiceConfig } from '../../src/project/config.ts';
+import { startMs } from '../../src/processes.ts';
 import type { ServiceProcess } from '../../src/registry/types.ts';
 import {
   explainInspection,
   inspectService,
+  leaderAliveAt,
   listenersOn,
   probeReady,
   ServiceFailed,
@@ -17,14 +19,21 @@ import {
   stopService,
   waitForService,
 } from '../../src/services/services.ts';
-import { realServiceSystem as system } from '../../src/services/system.ts';
+import { realServiceSystem as system, type ServiceSystem } from '../../src/services/system.ts';
 import { stopRecordedProcesses } from '../../src/up/release.ts';
 import { tempDir } from '../support/fakes.ts';
+import { world } from '../support/world.ts';
 
 /** Starts its command in a process group of its own, as pnpm exec does, and passes on no signal. */
 const WRAPPER = `import { spawn } from 'node:child_process';
 const child = spawn(process.execPath, process.argv.slice(2), { detached: true, stdio: 'inherit' });
 child.on('exit', code => process.exit(code ?? 1));
+`;
+
+/** Forks a long-lived worker in its process group, after the delay in ms its argument names. */
+const FORKER = `import { spawn } from 'node:child_process';
+setTimeout(() => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], { stdio: 'ignore' }), Number(process.argv[2]));
+setInterval(() => {}, 1e9);
 `;
 
 const SERVER = `import { createServer } from 'node:http';
@@ -64,6 +73,7 @@ function project(t: TestContext) {
   const dir = fs.realpathSync(tempDir('services'));
   fs.writeFileSync(path.join(dir, 'server.mjs'), SERVER);
   fs.writeFileSync(path.join(dir, 'wrap.mjs'), WRAPPER);
+  fs.writeFileSync(path.join(dir, 'forker.mjs'), FORKER);
   const groups: number[] = [];
   const children: ChildProcess[] = [];
   t.after(() => {
@@ -187,11 +197,14 @@ test('a recycled pid or a moved working directory is never signalled', async t =
   assert.equal((await inspectService(system, config, port, ready)).healthy, true);
 });
 
+function reaped(pid: number): boolean {
+  return spawnSync('ps', ['-o', 'pid=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim() === '';
+}
+
 /** Starts a service whose leader exits at once, leaving `members` processes in its group, and waits for that state. */
 async function orphaned(p: ReturnType<typeof project>, start: string, port: number, members = 1): Promise<ServiceProcess> {
   const proc = p.start(p.service(start), port);
-  const reaped = () => spawnSync('ps', ['-o', 'pid=', '-p', String(proc.pid)], { encoding: 'utf8' }).stdout.trim() === '';
-  await until(() => reaped() && (system.groupMembers(proc.pid) ?? []).length === members);
+  await until(() => reaped(proc.pid) && (system.groupMembers(proc.pid) ?? []).length === members);
   return proc;
 }
 
@@ -232,7 +245,7 @@ test('when the leader has exited, a group none of whose processes started with t
   assert.match(
     (older as { reason: string }).reason,
     new RegExp(
-      `none of processes ${String(orphan)} left in its group started with it, so they can't be proven ours; stop them with kill ${String(orphan)}$`,
+      `none of processes ${String(orphan)} left in its group started with it or before it was last seen running, so they can't be proven ours; stop them with kill ${String(orphan)}$`,
     ),
   );
   const unreadable = await stopService(
@@ -258,6 +271,103 @@ test('when the leader has exited, a process its group started seconds later is n
   assert.equal(outcome.kind, 'cant-tell');
   assert.match((outcome as { reason: string }).reason, new RegExp(`stop them with kill ${String(late)}$`));
   assert.equal(alive(late ?? 0), true);
+});
+
+/** The worker an `exec node forker.mjs` service forked, once it has, with its start time as ps prints it. */
+async function workerOf(proc: ServiceProcess): Promise<{ pid: number; start: string }> {
+  await until(() => (system.groupMembers(proc.pid) ?? []).length === 2, 8000);
+  const pid = (system.groupMembers(proc.pid) ?? []).find(member => member !== proc.pid) ?? 0;
+  const start = system.processes.startTimes([pid])?.get(pid) ?? '';
+  assert.ok(startMs(start) - startMs(proc.start) > 1000, 'the worker started with the leader');
+  return { pid, start };
+}
+
+async function killLeader(proc: ServiceProcess, worker: number): Promise<void> {
+  system.signal(proc.pid, 'SIGKILL');
+  await until(() => reaped(proc.pid) && (system.groupMembers(proc.pid) ?? []).join() === String(worker));
+}
+
+test('when an exec leader has exited, release stops a worker it forked seconds later, since the leader was seen running after', async t => {
+  const p = project(t);
+  const proc = p.start(p.service('exec node forker.mjs 2200'), 0);
+  const worker = await workerOf(proc);
+  await until(() => Date.now() >= startMs(worker.start) + 1000, 3000);
+  const aliveAt = leaderAliveAt(system, proc, systemClock);
+  assert.ok(aliveAt !== undefined, 'the leader was not seen running');
+  const w = world();
+  t.after(() => {
+    w.close();
+  });
+  const owner = w.procs.owner();
+  const { lane } = await w.registry().claim(w.request(owner, w.folder('a'), { device: null }));
+  const ref = { id: lane.id, token: lane.token };
+  w.registry().recordProcess(ref, proc);
+  assert.equal(w.registry().recordLeaderAlive(lane.id, proc, aliveAt), true);
+  await killLeader(proc, worker.pid);
+
+  const unproven = await stopService(system, proc, systemClock);
+  assert.equal(unproven.kind, 'cant-tell', 'without the moment the leader was seen running, the worker is not proven');
+  assert.equal(alive(worker.pid), true);
+  const ended = w.registry().release(ref, owner);
+  assert.deepEqual(ended.processes, [{ ...proc, aliveAt }]);
+  const into = { lane: lane.id, notes: [] as string[], problems: [] as string[] };
+  await stopRecordedProcesses({ system, clock: systemClock }, ended.processes ?? [], into);
+  assert.deepEqual(into.problems, []);
+  assert.match(into.notes.join('\n'), /^stopped api/);
+  assert.equal(alive(worker.pid), false, `the worker pid ${String(worker.pid)} outlived its service`);
+});
+
+test('when the leader has exited, a process that started after the leader was last seen running, and not with it, is left alone', async t => {
+  const p = project(t);
+  const proc = p.start(p.service('exec node forker.mjs 2200'), 0);
+  const aliveAt = leaderAliveAt(system, proc, systemClock);
+  assert.ok(aliveAt !== undefined);
+  const worker = await workerOf(proc);
+  await killLeader(proc, worker.pid);
+  const outcome = await stopService(system, { ...proc, aliveAt }, systemClock);
+  assert.equal(outcome.kind, 'cant-tell');
+  assert.match((outcome as { reason: string }).reason, new RegExp(`stop them with kill ${String(worker.pid)}$`));
+  assert.equal(alive(worker.pid), true, 'a process that failed the ownership check was signalled');
+});
+
+test('after the grace, SIGKILL goes only to the processes proven in the first check, not to one that joined the group since', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, "(trap '' TERM; exec sleep 30) & exit 0", 0);
+  const [stubborn] = system.groupMembers(proc.pid) ?? [];
+  assert.ok(stubborn !== undefined);
+  const newcomer = spawn('sleep', ['30'], { stdio: 'ignore' });
+  t.after(() => newcomer.kill('SIGKILL'));
+  const joined = newcomer.pid ?? 0;
+  const sent: string[] = [];
+  let termed = false;
+  const watched: ServiceSystem = {
+    ...system,
+    groupMembers: pgid => {
+      const members = system.groupMembers(pgid);
+      return termed && members ? [...members, joined] : members;
+    },
+    signalGroup: (pgid, signal) => {
+      sent.push(`group ${String(pgid)} ${signal}`);
+      termed = true;
+      return system.signalGroup(pgid, signal);
+    },
+    signal: (pid, signal) => {
+      sent.push(`${String(pid)} ${signal}`);
+      return system.signal(pid, signal);
+    },
+  };
+  const outcome = await stopService(watched, proc, systemClock, 300, 50);
+  assert.deepEqual(sent, [`group ${String(proc.pid)} SIGTERM`, `${String(stubborn)} SIGKILL`]);
+  assert.equal(alive(stubborn), false);
+  assert.equal(alive(joined), true, 'a process outside the proven set was signalled');
+  assert.deepEqual(outcome, { kind: 'survived', members: [joined] });
+});
+
+test('a start time is read only in the form ps prints it', () => {
+  assert.equal(startMs('Mon Jan  1 00:00:00 2024'), Date.UTC(2024, 0, 1));
+  assert.equal(startMs('Tue Nov 10 21:05:09 2026'), Date.UTC(2026, 10, 10, 21, 5, 9));
+  assert.ok(Number.isNaN(startMs('lun. 10 nov. 2026 21:05:09')));
+  assert.ok(Number.isNaN(startMs('2026-11-10T21:05:09Z')));
 });
 
 test('a service that exits before it is ready fails with the tail of its log', async t => {

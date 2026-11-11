@@ -29,7 +29,7 @@ import {
   startResource,
   takeTeardowns,
 } from './resources.ts';
-import { loadLane, ownerFromRow } from './rows.ts';
+import { loadLane, ownerFromRow, processesOf } from './rows.ts';
 import { readStatus } from './status.ts';
 import type { Row } from './store.ts';
 import { int, optInt, optText, Store, text } from './store.ts';
@@ -881,10 +881,7 @@ export class Registry {
     const db = this.store.db;
     const id = text(row, 'id');
     const device = db.prepare('SELECT name FROM devices WHERE claim_id = ?').get(id);
-    const processes = db
-      .prepare('SELECT * FROM processes WHERE claim_id = ? ORDER BY service')
-      .all(id)
-      .map(p => ({ service: text(p, 'service'), pid: int(p, 'pid'), start: text(p, 'start'), cwd: optText(p, 'cwd') }));
+    const processes = processesOf(db, id);
     const ended: EndedLane = {
       id,
       owner: describeOwner(ownerFromRow(row)),
@@ -1174,9 +1171,42 @@ export class Registry {
   recordProcess(ref: LaneRef, proc: ServiceProcess): void {
     this.store.write(() => {
       this.requireLane(ref);
-      this.store.db
-        .prepare('INSERT OR REPLACE INTO processes (claim_id, service, pid, start, cwd) VALUES (?, ?, ?, ?, ?)')
-        .run(ref.id, proc.service, proc.pid, proc.start, proc.cwd);
+      const db = this.store.db;
+      db.prepare('INSERT OR REPLACE INTO processes (claim_id, service, pid, start, cwd) VALUES (?, ?, ?, ?, ?)').run(
+        ref.id,
+        proc.service,
+        proc.pid,
+        proc.start,
+        proc.cwd,
+      );
+      db.prepare('DELETE FROM process_alive WHERE claim_id = ? AND service = ? AND NOT (pid = ? AND start = ?)').run(
+        ref.id,
+        proc.service,
+        proc.pid,
+        proc.start,
+      );
+    });
+  }
+
+  /**
+   * Records that a check at `at` found the lane's recorded process for `proc.service` running with `proc`'s pid and
+   * start time. Only a later moment replaces an earlier one, and nothing is written unless the lane still records that
+   * very process; returns whether it was written.
+   */
+  recordLeaderAlive(laneId: string, proc: ServiceProcess, at: number): boolean {
+    return this.store.write(() => {
+      const written = this.store.db
+        .prepare(
+          `INSERT INTO process_alive (claim_id, service, pid, start, alive_at)
+           SELECT claim_id, service, pid, start, ? FROM processes WHERE claim_id = ? AND service = ? AND pid = ? AND start = ?
+           ON CONFLICT (claim_id, service) DO UPDATE SET
+             alive_at = CASE WHEN pid = excluded.pid AND start = excluded.start THEN max(alive_at, excluded.alive_at)
+                        ELSE excluded.alive_at END,
+             pid = excluded.pid,
+             start = excluded.start`,
+        )
+        .run(at, laneId, proc.service, proc.pid, proc.start);
+      return Number(written.changes) > 0;
     });
   }
 
@@ -1184,6 +1214,7 @@ export class Registry {
     this.store.write(() => {
       this.requireLane(ref);
       this.store.db.prepare('DELETE FROM processes WHERE claim_id = ? AND service = ?').run(ref.id, service);
+      this.store.db.prepare('DELETE FROM process_alive WHERE claim_id = ? AND service = ?').run(ref.id, service);
     });
   }
 

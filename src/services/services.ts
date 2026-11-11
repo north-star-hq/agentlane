@@ -227,6 +227,7 @@ export async function waitForService(
 ): Promise<ServiceProcess> {
   const deadline = clock.now() + service.timeoutMs;
   for (;;) {
+    const checkedAt = clock.now();
     const leader = judgeLeader(system, proc);
     if (leader === 'gone' || leader === 'pid-reused')
       throw new ServiceFailed(service.name, `exited before it was ready (pid ${String(proc.pid)})`, log);
@@ -242,13 +243,22 @@ export async function waitForService(
     const probe = await probeReady(service.ready, port);
     if (probe.ready && listeners !== null && listeners.length > 0) {
       const cwd = system.processes.cwd(proc.pid);
-      return { ...proc, cwd: cwd ?? null };
+      return { ...proc, cwd: cwd ?? null, ...(leader === 'alive' ? { aliveAt: checkedAt } : {}) };
     }
     if (clock.now() >= deadline) {
       throw new ServiceFailed(service.name, `was not ready after ${String(service.timeoutMs / 1000)} s: ${probe.detail}`, log);
     }
     await clock.sleep(pollMs);
   }
+}
+
+/**
+ * The moment just before a check that found the leader's pid running with its recorded start time, or undefined when
+ * the check didn't find it. Store it with `Registry.recordLeaderAlive` so `stopService` can later prove the group.
+ */
+export function leaderAliveAt(system: ServiceSystem, proc: ServiceProcess, clock: Clock): number | undefined {
+  const at = clock.now();
+  return judgeLeader(system, { ...proc, cwd: null }) === 'alive' ? at : undefined;
 }
 
 export async function stopService(
@@ -261,62 +271,72 @@ export async function stopService(
   const leader = judgeLeader(system, proc);
   if (leader === 'pid-reused' || leader === 'moved') return { kind: 'not-ours', reason: describeLeader(leader, proc) };
   if (leader === 'cant-tell') return { kind: 'cant-tell', reason: describeLeader(leader, proc) };
-  let roots = [proc.pid];
+  let group: ProcessIdentity[];
   if (leader === 'gone') {
     const members = system.groupMembers(proc.pid);
     if (members === undefined) return { kind: 'cant-tell', reason: 'ps could not list the process group' };
     if (members.length === 0) return { kind: 'already-gone' };
-    const anchored = startedWithLeader(system, proc, members);
-    if (anchored === undefined)
+    const found = withStarts(system, members);
+    if (found === undefined)
       return { kind: 'cant-tell', reason: `ps could not read when processes ${members.join(', ')} started` };
-    if (!anchored) {
+    if (!found.some(member => inOriginalGroup(proc, member.start))) {
       return {
         kind: 'cant-tell',
-        reason: `its leader pid ${String(proc.pid)} exited and none of processes ${members.join(', ')} left in its group started with it, so they can't be proven ours; stop them with kill ${members.join(' ')}`,
+        reason: `its leader pid ${String(proc.pid)} exited and none of processes ${members.join(', ')} left in its group started with it or before it was last seen running, so they can't be proven ours; stop them with kill ${members.join(' ')}`,
       };
     }
-    roots = members;
+    group = found;
+  } else {
+    const members = system.groupMembers(proc.pid);
+    const found = members === undefined ? [] : (withStarts(system, members) ?? []);
+    group = [{ pid: proc.pid, start: proc.start }, ...found.filter(member => member.pid !== proc.pid)];
   }
-  const strays = outsideGroup(system, proc.pid, roots);
-  const straysLeft = () => {
-    const starts = system.processes.startTimes(strays.map(s => s.pid));
-    return strays.filter(s => starts?.get(s.pid) === s.start).map(s => s.pid);
+  const strays = outsideGroup(system, proc.pid, leader === 'gone' ? group.map(member => member.pid) : [proc.pid]);
+  const left = (processes: readonly ProcessIdentity[]) => {
+    const starts = system.processes.startTimes(processes.map(p => p.pid));
+    return processes.filter(p => starts?.get(p.pid) === p.start).map(p => p.pid);
   };
   const waitEmpty = async (ms: number): Promise<number[]> => {
     const until = clock.now() + ms;
     for (;;) {
-      const members = [...(system.groupMembers(proc.pid) ?? []), ...straysLeft()];
+      const members = [...(system.groupMembers(proc.pid) ?? []), ...left(strays)];
       if (members.length === 0 || clock.now() >= until) return members;
       await clock.sleep(pollMs);
     }
   };
-  const signal = (sig: NodeJS.Signals) => {
-    system.signalGroup(proc.pid, sig);
-    for (const pid of straysLeft()) system.signal(pid, sig);
-  };
-  signal('SIGTERM');
+  system.signalGroup(proc.pid, 'SIGTERM');
+  for (const pid of left(strays)) system.signal(pid, 'SIGTERM');
   if ((await waitEmpty(graceMs)).length === 0) return { kind: 'stopped', signal: 'SIGTERM' };
-  signal('SIGKILL');
-  const left = await waitEmpty(2000);
-  return left.length === 0 ? { kind: 'stopped', signal: 'SIGKILL' } : { kind: 'survived', members: left };
+  for (const pid of left([...group, ...strays])) system.signal(pid, 'SIGKILL');
+  const survivors = await waitEmpty(2000);
+  return survivors.length === 0 ? { kind: 'stopped', signal: 'SIGKILL' } : { kind: 'survived', members: survivors };
+}
+
+function withStarts(system: ServiceSystem, pids: readonly number[]): ProcessIdentity[] | undefined {
+  const starts = system.processes.startTimes(pids);
+  if (!starts) return undefined;
+  return pids.flatMap(pid => {
+    const start = starts.get(pid);
+    return start === undefined ? [] : [{ pid, start }];
+  });
 }
 
 const STARTED_WITH_LEADER_MS = 1000;
+const START_RESOLUTION_MS = 1000;
 
 /**
- * Whether the members left after the leader exited are still in the group it started. POSIX keeps a pid from naming a
- * new process while a process group of that id lives (XBD 4.14 Process ID Reuse; XNU's forkproc skips such pids), so
- * a later group of that id needs the pid to come round again, a full cycle of the pid space, which takes seconds at
- * any fork rate. A member started in the leader's second or the next is older than such a group could be.
+ * Whether a process left in the group after its leader exited proves the group is still the one the leader started.
+ * POSIX keeps a pid from naming a new process while a process group of that id lives (XBD 4.14 Process ID Reuse;
+ * XNU's forkproc skips such pids), so a later group of that id is made after the original group is gone, a full cycle
+ * of the pid space later. A process started in the leader's second or the next is older than such a group could be,
+ * and so is one started before a moment the leader was seen running, when the original group still held the id.
  */
-function startedWithLeader(system: ServiceSystem, proc: ServiceProcess, members: readonly number[]): boolean | undefined {
-  const starts = system.processes.startTimes(members);
-  if (!starts) return undefined;
-  const leader = startMs(proc.start);
-  return [...starts.values()].some(start => {
-    const after = startMs(start) - leader;
-    return after >= 0 && after <= STARTED_WITH_LEADER_MS;
-  });
+function inOriginalGroup(proc: ServiceProcess, start: string): boolean {
+  const member = startMs(start);
+  const after = member - startMs(proc.start);
+  if (Number.isNaN(after) || after < 0) return false;
+  if (after <= STARTED_WITH_LEADER_MS) return true;
+  return proc.aliveAt !== undefined && member + START_RESOLUTION_MS <= proc.aliveAt;
 }
 
 /** The service's processes that left its process group, found while a process of the group still ties them to it. */

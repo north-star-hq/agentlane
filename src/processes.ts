@@ -20,6 +20,7 @@ export interface ProcessTable {
 const LSTART = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}`;
 const START_LINE = new RegExp(String.raw`^\s*(\d+)\s+(${LSTART})\s*$`);
 const INFO_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${LSTART})\s?(.*)$`);
+const START_ONLY = new RegExp(`^${LSTART}$`);
 
 function normalizeStart(lstart: string): string {
   return lstart.replace(/\s+/g, ' ');
@@ -31,7 +32,8 @@ export function describeStart(start: string): string {
 
 /** The start time as milliseconds since the epoch, to the second `ps` reports; NaN when it isn't a `ps` start time. */
 export function startMs(start: string): number {
-  return Date.parse(describeStart(normalizeStart(start)));
+  const normal = normalizeStart(start);
+  return START_ONLY.test(normal) ? Date.parse(describeStart(normal)) : Number.NaN;
 }
 
 function ps(columns: string, pids: readonly number[]): string[] | undefined {
