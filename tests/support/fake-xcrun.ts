@@ -9,14 +9,18 @@ export interface FakeSimulator {
 
 export interface FakeXcrun {
   bin: string;
+  searchPath: string;
   set(simulators: readonly FakeSimulator[]): void;
   deleted(): string[];
 }
 
-/**
- * An `xcrun` that answers `simctl list -j devices` with the simulators last given to `set`, in whatever state they
- * were given, and records `simctl delete <udid>` without deleting anything.
- */
+export function xcrunsOn(searchPath: string): string[] {
+  return searchPath
+    .split(path.delimiter)
+    .map(dir => path.join(dir === '' ? '.' : dir, 'xcrun'))
+    .filter(file => fs.existsSync(file));
+}
+
 export function fakeXcrun(dir: string): FakeXcrun {
   const bin = path.join(dir, 'bin');
   const listing = path.join(dir, 'devices.json');
@@ -38,6 +42,7 @@ export function fakeXcrun(dir: string): FakeXcrun {
   );
   const fake: FakeXcrun = {
     bin,
+    searchPath: [bin, '/bin'].join(path.delimiter),
     set(simulators) {
       const devices = simulators.map(({ udid, name, state }) => ({
         udid,

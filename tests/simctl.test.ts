@@ -3,10 +3,10 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { DeviceRunningError } from '../src/devices/backend.ts';
+import { DeviceBackendError, DeviceRunningError } from '../src/devices/backend.ts';
 import { newestIphone, parseDeviceList, resolveSimSpec, simctlBackend } from '../src/devices/simctl.ts';
 import { UsageError } from '../src/registry/refusal.ts';
-import { fakeXcrun } from './support/fake-xcrun.ts';
+import { fakeXcrun, xcrunsOn } from './support/fake-xcrun.ts';
 import { CATALOG, tempDir } from './support/fakes.ts';
 import { isolatedEnv, withProcessEnv } from './support/isolated-env.ts';
 
@@ -97,8 +97,8 @@ test('a delete that must not stop the simulator deletes it only when simctl list
   const root = tempDir('simctl-refuse');
   try {
     const xcrun = fakeXcrun(path.join(root, 'xcrun'));
-    const env = { ...isolatedEnv(root), PATH: `${xcrun.bin}${path.delimiter}${process.env.PATH ?? ''}` };
-    await withProcessEnv(env, () => {
+    await withProcessEnv({ ...isolatedEnv(root), PATH: xcrun.searchPath }, () => {
+      assert.deepEqual(xcrunsOn(process.env.PATH ?? ''), [path.join(xcrun.bin, 'xcrun')]);
       for (const state of ['Booted', 'Booting', 'Shutting Down', 'Creating', 'A State simctl Adds Later']) {
         const udid = randomUUID().toUpperCase();
         xcrun.set([{ udid, name: 'agentlane-pool-aaaaaa', state }]);
@@ -116,6 +116,26 @@ test('a delete that must not stop the simulator deletes it only when simctl list
       simctlBackend.delete(udid, 'refuse');
       assert.deepEqual(xcrun.deleted(), [udid]);
     });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a fake xcrun that can't run fails the call instead of reaching any other xcrun", async () => {
+  const root = tempDir('simctl-broken-fake');
+  try {
+    const xcrun = fakeXcrun(path.join(root, 'xcrun'));
+    const fake = path.join(xcrun.bin, 'xcrun');
+    fs.chmodSync(fake, 0o644);
+    await withProcessEnv({ ...isolatedEnv(root), PATH: xcrun.searchPath }, () => {
+      assert.deepEqual(xcrunsOn(process.env.PATH ?? ''), [fake]);
+      assert.throws(() => simctlBackend.list(), DeviceBackendError);
+      assert.throws(() => {
+        simctlBackend.delete(randomUUID().toUpperCase(), 'refuse');
+      }, DeviceBackendError);
+    });
+    assert.deepEqual(xcrun.deleted(), []);
+    assert.equal(fs.existsSync(path.join(root, 'xcrun', 'calls')), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

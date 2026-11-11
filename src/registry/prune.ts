@@ -103,6 +103,8 @@ const NOUN: Readonly<Record<Platform, string>> = { ios: 'simulator', android: 'e
 
 const DELETING = '.deleting-';
 
+const REMOVING = '.removing-';
+
 const NOT_SHUT_DOWN = 'it is no longer shut down';
 
 export function requireHome(env: NodeJS.ProcessEnv): void {
@@ -334,7 +336,7 @@ function withAsideCopies(target: string): string[] {
     return [];
   }
   return names
-    .filter(name => name === base || name.startsWith(`${base}${DELETING}`))
+    .filter(name => name === base || name.startsWith(`${base}${DELETING}`) || name.startsWith(`${base}${REMOVING}`))
     .sort()
     .map(name => path.join(parent, name));
 }
@@ -475,27 +477,49 @@ function downloadsDir(env: NodeJS.ProcessEnv): string {
   return path.join(path.dirname(dataDir(env)), FORMER.tool);
 }
 
+interface AsideMark {
+  at: number;
+  mark: typeof DELETING | typeof REMOVING;
+}
+
+function markIn(name: string): AsideMark | null {
+  let first: AsideMark | null = null;
+  for (const mark of [DELETING, REMOVING] as const) {
+    const at = name.indexOf(mark);
+    if (at >= 0 && (first === null || at < first.at)) first = { at, mark };
+  }
+  return first;
+}
+
 function withoutAside(name: string): string {
-  const at = name.indexOf(DELETING);
-  return at < 0 ? name : name.slice(0, at);
+  const found = markIn(name);
+  return found === null ? name : name.slice(0, found.at);
 }
 
 function isAsideName(target: string): boolean {
-  return path.basename(target).includes(DELETING);
+  return markIn(path.basename(target)) !== null;
+}
+
+function isBeingRemoved(target: string): boolean {
+  return markIn(path.basename(target))?.mark === REMOVING;
 }
 
 function originalOf(aside: string): string {
   return path.join(path.dirname(aside), withoutAside(path.basename(aside)));
 }
 
-function asideName(target: string, now: number): string {
-  return `${target}${DELETING}${String(now)}-${randomBytes(3).toString('hex')}`;
+function asideName(target: string, mark: AsideMark['mark'], now: number): string {
+  return `${target}${mark}${String(now)}-${randomBytes(3).toString('hex')}`;
 }
+
+const STAMPED = /^(\d+)-[0-9a-f]{6}$/;
 
 function movedAsideAt(aside: string): number {
   const name = path.basename(aside);
-  const stamp = Number(name.slice(name.indexOf(DELETING) + DELETING.length).split('-')[0]);
-  return Number.isSafeInteger(stamp) ? stamp : 0;
+  const found = markIn(name);
+  const stamp = found === null ? null : STAMPED.exec(name.slice(found.at + found.mark.length));
+  const ms = stamp === null ? NaN : Number(stamp[1]);
+  return Number.isSafeInteger(ms) ? ms : -1;
 }
 
 function isMissing(target: string): boolean {
@@ -567,7 +591,7 @@ function moveAside(env: NodeJS.ProcessEnv, leftover: Leftover): LeftoverStep {
   if (!isLeftoverPath(env, leftover)) return done('failed', REFUSED);
   if (!fs.existsSync(leftover.path)) return done('gone', 'it no longer exists');
   if (isAsideName(leftover.path)) return { leftover, aside: leftover.path };
-  const aside = asideName(leftover.path, Date.now());
+  const aside = asideName(leftover.path, DELETING, Date.now());
   try {
     fs.renameSync(leftover.path, aside);
   } catch (error) {
@@ -621,33 +645,66 @@ function renameBack(env: NodeJS.ProcessEnv, { leftover, aside }: AsideLeftover):
   return null;
 }
 
+function movedByThisRun({ leftover, aside }: AsideLeftover): boolean {
+  return leftover.path !== aside;
+}
+
+function restoreFirst(a: AsideLeftover, b: AsideLeftover): number {
+  return Number(movedByThisRun(b)) - Number(movedByThisRun(a)) || movedAsideAt(b.aside) - movedAsideAt(a.aside);
+}
+
+function vanished(copy: AsideLeftover): LeftoverResult {
+  const { leftover, aside } = copy;
+  return { leftover, outcome: 'gone', detail: movedByThisRun(copy) ? `${aside} no longer exists` : 'it no longer exists' };
+}
+
 function putBack(env: NodeJS.ProcessEnv, steps: readonly LeftoverStep[], why: string): LeftoverResult[] {
-  const back = new Set<AsideLeftover>();
-  const failed = new Map<AsideLeftover, string>();
-  const newestFirst = steps.filter(isAside).sort((a, b) => movedAsideAt(b.aside) - movedAsideAt(a.aside));
-  for (const copy of newestFirst) {
-    if (!isMissing(originalOf(copy.aside))) continue;
-    const error = renameBack(env, copy);
-    if (error === null) back.add(copy);
-    else failed.set(copy, error);
+  const tried = new Map<AsideLeftover, string | null>();
+  const restorable = steps.filter(isAside).filter(copy => !isBeingRemoved(copy.aside));
+  for (const copy of restorable.sort(restoreFirst)) {
+    if (isMissing(copy.aside) || !isMissing(originalOf(copy.aside))) continue;
+    tried.set(copy, renameBack(env, copy));
   }
   return steps.map(step => {
     if (!isAside(step)) return step;
     const { leftover, aside } = step;
     const original = originalOf(aside);
     const kept = (detail: string): LeftoverResult => ({ leftover, outcome: 'kept', detail });
-    if (back.has(step)) return kept(leftover.path === original ? why : `${why}; put back at ${original}`);
-    const error = failed.get(step);
+    const error = tried.get(step);
+    if (error === null) return kept(movedByThisRun(step) ? why : `${why}; put back at ${original}`);
+    if (isMissing(aside)) return vanished(step);
     if (error !== undefined) return kept(`${why}; it stays at ${aside}: ${error}`);
+    if (isBeingRemoved(aside)) return kept(why);
     return kept(`${why}; ${original} exists again, so the old copy stays at ${aside}`);
   });
 }
 
-function remove({ leftover, aside }: AsideLeftover): LeftoverResult {
+interface Removal {
+  leftover: Leftover;
+  removing: string;
+}
+
+function takeForRemoval(env: NodeJS.ProcessEnv, copy: AsideLeftover): LeftoverResult | Removal {
+  const { leftover, aside } = copy;
+  if (isBeingRemoved(aside)) return { leftover, removing: aside };
+  if (!isLeftoverPath(env, { kind: leftover.kind, path: aside })) return { leftover, outcome: 'failed', detail: REFUSED };
+  const removing = asideName(originalOf(aside), REMOVING, Date.now());
   try {
-    fs.rmSync(aside, { recursive: true, force: true });
+    fs.renameSync(aside, removing);
   } catch (error) {
-    return { leftover, outcome: 'failed', detail: `${aside}: ${messageOf(error)}` };
+    return isMissing(aside) ? vanished(copy) : { leftover, outcome: 'failed', detail: `${aside}: ${messageOf(error)}` };
+  }
+  return { leftover, removing };
+}
+
+function remove(env: NodeJS.ProcessEnv, { leftover, removing }: Removal): LeftoverResult {
+  if (!isLeftoverPath(env, { kind: leftover.kind, path: removing })) {
+    return { leftover, outcome: 'failed', detail: `${removing}: ${REFUSED}` };
+  }
+  try {
+    fs.rmSync(removing, { recursive: true, force: true });
+  } catch (error) {
+    return { leftover, outcome: 'failed', detail: `${removing}: ${messageOf(error)}` };
   }
   if (leftover.kind === 'build-cache') removeIfEmpty(path.dirname(leftover.path));
   return { leftover, outcome: 'deleted', detail: null };
@@ -657,24 +714,30 @@ function isAside(step: LeftoverStep): step is AsideLeftover {
   return 'aside' in step;
 }
 
+function isRemoval(step: LeftoverResult | Removal): step is Removal {
+  return 'removing' in step;
+}
+
 export function finishLeftovers(ctx: PruneContext, steps: readonly LeftoverStep[]): LeftoverResult[] {
   requireHome(ctx.env);
   if (!steps.some(isAside)) return steps.filter((step): step is LeftoverResult => !isAside(step));
   let opened: OpenRegistry[] = [];
-  let restored: LeftoverResult[] | null;
+  let checked: (LeftoverResult | Removal)[];
   const restore = (why: string) => putBack(ctx.env, steps, why);
   try {
     opened = openFormerRegistries(ctx);
-    restored = underLocks(opened, () => {
+    checked = underLocks(opened, () => {
       const blocked = formerLanesIn(opened);
-      return blocked === null ? null : restore(`${blocked}, found after it was moved aside`);
+      return blocked === null
+        ? steps.map(step => (isAside(step) ? takeForRemoval(ctx.env, step) : step))
+        : restore(`${blocked}, found after it was moved aside`);
     });
   } catch (error) {
-    restored = restore(`could not check every registry 0.2.x may use: ${messageOf(error)}`);
+    checked = restore(`could not check every registry 0.2.x may use: ${messageOf(error)}`);
   } finally {
     closeAll(opened);
   }
-  return restored ?? steps.map(step => (isAside(step) ? remove(step) : step));
+  return checked.map(step => (isRemoval(step) ? remove(ctx.env, step) : step));
 }
 
 export function deleteLeftovers(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverResult[] {
@@ -684,7 +747,7 @@ export function deleteLeftovers(ctx: PruneContext, leftovers: readonly Leftover[
 export function putBackAsideCopies(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverResult[] {
   requireHome(ctx.env);
   const copies: AsideLeftover[] = leftovers
-    .filter(leftover => isAsideName(leftover.path))
+    .filter(leftover => isAsideName(leftover.path) && !isBeingRemoved(leftover.path))
     .map(leftover => ({ leftover, aside: leftover.path }));
   if (copies.length === 0) return [];
   let opened: OpenRegistry[] = [];

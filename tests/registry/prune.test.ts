@@ -10,6 +10,7 @@ import { simctlBackend } from '../../src/devices/simctl.ts';
 import { ownerKey, type Owner } from '../../src/registry/owner.ts';
 import { databasePath, stateDir } from '../../src/registry/paths.ts';
 import type {
+  Leftover,
   LeftoverResult,
   LeftoverStep,
   OrphanResult,
@@ -31,7 +32,7 @@ import { Refusal, UsageError } from '../../src/registry/refusal.ts';
 import type { Registry } from '../../src/registry/registry.ts';
 import { Store } from '../../src/registry/store.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
-import { fakeXcrun, type FakeSimulator } from '../support/fake-xcrun.ts';
+import { fakeXcrun, xcrunsOn, type FakeSimulator } from '../support/fake-xcrun.ts';
 import { FakeDevices, FakeProbe, FakeProcesses, tempDir } from '../support/fakes.ts';
 import { isolatedEnv, withProcessEnv } from '../support/isolated-env.ts';
 import { world, type World } from '../support/world.ts';
@@ -333,7 +334,6 @@ function fill(file: string, bytes: number): void {
   fs.writeFileSync(file, Buffer.alloc(bytes, 1));
 }
 
-/** Every folder prune reads or deletes in sits under a temporary home. */
 function cli(extraEnv: (root: string) => Record<string, string> = () => ({})): Cli {
   const root = fs.realpathSync(tempDir('prune-cli'));
   const env: NodeJS.ProcessEnv = { ...isolatedEnv(root), PATH: process.env.PATH, ...extraEnv(root) };
@@ -501,10 +501,6 @@ test('prune refuses before it opens or lists anything when HOME is not given, so
   }
 });
 
-/**
- * This version's registry with a lane holding a simulator, 0.2.x's registry with a free emulator and no lanes, two
- * orphans, a booted orphan, a device with no pool name, and what 0.2.x left in the data folder and two repositories.
- */
 function disked(c: Cli): { held: string; laneId: string; other: string; repo2: string } {
   const held = 'agentlane-pool-111111';
   formerDevice(c.own, 'ios', held, c.sims.addByHand(held, false));
@@ -987,8 +983,8 @@ test('a simulator no registry records is deleted only while simctl lists it as S
     const sim = (name: string, state: string): FakeSimulator => ({ udid: randomUUID().toUpperCase(), name, state });
     const busy = NOT_SHUT_DOWN.map((state, i) => sim(`agentlane-pool-0000a${String(i)}`, state));
     const idle = sim('agentlane-pool-0000b0', 'Shutdown');
-    const env = { ...isolatedEnv(c.root), PATH: `${xcrun.bin}${path.delimiter}${process.env.PATH ?? ''}` };
-    await withProcessEnv(env, async () => {
+    await withProcessEnv({ ...isolatedEnv(c.root), PATH: xcrun.searchPath }, async () => {
+      assert.deepEqual(xcrunsOn(process.env.PATH ?? ''), [path.join(xcrun.bin, 'xcrun')]);
       xcrun.set([...busy, idle]);
       const run = await c.runWith({ ios: simctlBackend }, '--yes', '--json');
       assert.equal(run.code, 0, run.stderr);
@@ -1190,5 +1186,180 @@ test('a copy is put back only where its real path is the one 0.2.x reads', () =>
     assert.ok(fs.existsSync(path.join(currentCopy, 'objects', 'keep')));
   } finally {
     c.close();
+  }
+});
+
+test("a device backend that doesn't say whether a device is shut down has it kept at the listing and under the locks", () => {
+  const c = cli();
+  try {
+    const name = 'agentlane-pool-0000e0';
+    const id = c.sims.addByHand(name, false);
+    const silent = over(c.sims, {
+      list: () =>
+        c.sims.list().map(d => ({ id: d.id, name: d.name, deviceType: d.deviceType, runtime: d.runtime, booted: d.booted })),
+    });
+    const listed = reportPrunable(listPrunable(null, c.own, { ios: silent }), c.ctx);
+    assert.deepEqual(listed.orphans, []);
+    assert.deepEqual(
+      listed.kept.map(d => [d.name, d.reason]),
+      [[name, 'no registry records it, but it is not shut down, so something may be using it']],
+    );
+
+    const [orphan] = c.report().orphans;
+    assert.ok(orphan);
+    assert.equal(orphan.id, id);
+    assert.deepEqual(deleteOrphan(c.ctx, silent, orphan), {
+      device: orphan,
+      outcome: 'kept',
+      detail: 'it is no longer shut down',
+    });
+    assert.deepEqual(names(c.sims.all()), [name]);
+    assert.deepEqual(c.sims.calls, []);
+  } finally {
+    c.close();
+  }
+});
+
+function lanesFound(dir: string, lane: string): string {
+  return `the registry in ${dir}, which 0.2.x may use, has lane ${lane}, which may be 0.2.x's; prune deletes what 0.2.x left once no such registry has lanes`;
+}
+
+function filesIn(dir: string): string[] {
+  return fs
+    .readdirSync(dir, { recursive: true, encoding: 'utf8' })
+    .filter(entry => fs.statSync(path.join(dir, entry)).isFile())
+    .sort();
+}
+
+function outcomes(results: readonly LeftoverResult[]): (string | null)[][] {
+  return results.map(r => [r.leftover.path, r.outcome, r.detail]);
+}
+
+test('a 0.2.x lane found after the move gets back the folder this prune moved, over a copy whose name carries a later time', () => {
+  const c = cli();
+  try {
+    const { share, downloads } = formerFolders(c);
+    const later = `${downloads}.deleting-9999999999999-ffffff`;
+    fill(path.join(later, 'maestro', 'stale'), 10);
+    fill(path.join(downloads, 'maestro', 'current'), 10);
+    const steps = moveLeftoversAside(c.ctx, c.report().leftovers);
+    const moved = asideOf(steps, downloads);
+    const lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+
+    const why = `${lanesFound(c.former, lane)}, found after it was moved aside`;
+    assert.deepEqual(outcomes(finishLeftovers(c.ctx, steps)), [
+      [downloads, 'kept', why],
+      [later, 'kept', `${why}; ${downloads} exists again, so the old copy stays at ${later}`],
+    ]);
+    assert.deepEqual(filesIn(downloads), [path.join('maestro', 'current')]);
+    assert.deepEqual(filesIn(later), [path.join('maestro', 'stale')]);
+    assert.equal(fs.existsSync(moved), false);
+    assert.deepEqual(fs.readdirSync(share).sort(), ['agent-env', path.basename(later)].sort());
+  } finally {
+    c.close();
+  }
+});
+
+test('of the copies earlier prunes left, the latest by a well-formed name goes back, and an earlier-format or malformed name counts as oldest', async () => {
+  const c = cli();
+  try {
+    const { downloads } = formerFolders(c);
+    const copy = (suffix: string) => `${downloads}.deleting-${suffix}`;
+    const latest = copy('1700000000000-cccccc');
+    const others = [
+      copy('1e0015'),
+      copy('1e15-aaaaaa'),
+      copy('0x1fffffffffffff-aaaaaa'),
+      copy('1800000000000-aaaaaa-x'),
+      copy('1000000000000-bbbbbb'),
+    ];
+    for (const aside of [latest, ...others]) fill(path.join(aside, 'maestro', path.basename(aside)), 10);
+    const lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+
+    const run = await c.run('--yes', '--json');
+    assert.equal(run.code, 0, run.stderr);
+    const done = JSON.parse(run.stdout) as { leftoverResults: LeftoverResult[] };
+    const why = lanesFound(c.former, lane);
+    assert.deepEqual(
+      outcomes(done.leftoverResults).sort(),
+      [
+        [latest, 'kept', `${why}; put back at ${downloads}`],
+        ...others.map(aside => [aside, 'kept', `${why}; ${downloads} exists again, so the old copy stays at ${aside}`]),
+      ].sort(),
+    );
+    assert.deepEqual(filesIn(downloads), [path.join('maestro', path.basename(latest))]);
+  } finally {
+    c.close();
+  }
+});
+
+const RACES = [
+  'lists while the first deletes',
+  'listed before the first took its copy for deletion',
+  'puts back before the first checks again',
+] as const;
+
+test('a prune that puts copies back never restores one another prune is deleting, and each prune reports what it did', t => {
+  const installed = path.join('maestro', '2.0.0', '.installed');
+  const library = path.join('maestro', '2.0.0', 'lib', 'a');
+  const files = [installed, library, path.join('maestro', '2.0.0', 'lib', 'b')].sort();
+  for (const race of RACES) {
+    const c = cli();
+    try {
+      const { share, downloads } = formerFolders(c);
+      for (const file of files) fill(path.join(downloads, file), 10);
+      const steps = moveLeftoversAside(c.ctx, c.report().leftovers);
+      const aside = asideOf(steps, downloads);
+      const listedMeanwhile = c.report().leftovers;
+      const second: { lane: string; results: LeftoverResult[] | null } = { lane: '', results: null };
+      const putBackNow = (leftovers: readonly Leftover[]) => {
+        second.lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+        second.results = putBackAsideCopies(c.ctx, leftovers);
+      };
+      if (race === 'puts back before the first checks again') putBackNow(c.report().leftovers);
+
+      const rm = fs.rmSync;
+      const rmSync = t.mock.method(fs, 'rmSync', (target: fs.PathLike, options?: fs.RmOptions) => {
+        if (second.results !== null || typeof target !== 'string' || path.dirname(target) !== share) {
+          rm(target, options);
+          return;
+        }
+        const { ino } = fs.statSync(target);
+        rm(path.join(target, library));
+        putBackNow(race === 'lists while the first deletes' ? c.report().leftovers : listedMeanwhile);
+        const sameFolder = fs
+          .readdirSync(share)
+          .map(name => path.join(share, name))
+          .find(entry => fs.lstatSync(entry).ino === ino);
+        if (sameFolder !== undefined) {
+          for (const entry of fs.readdirSync(sameFolder)) rm(path.join(sameFolder, entry), { recursive: true, force: true });
+        }
+        rm(target, options);
+      });
+      const first = finishLeftovers(c.ctx, steps);
+      rmSync.mock.restore();
+
+      assert.ok(second.results, `${race}: the second prune never ran`);
+      if (race === 'puts back before the first checks again') {
+        assert.deepEqual(outcomes(first), [[downloads, 'gone', `${aside} no longer exists`]], race);
+        assert.deepEqual(
+          outcomes(second.results),
+          [[aside, 'kept', `${lanesFound(c.former, second.lane)}; put back at ${downloads}`]],
+          race,
+        );
+        assert.deepEqual(filesIn(downloads), files, race);
+        assert.deepEqual(fs.readdirSync(share), ['agent-env'], race);
+      } else {
+        assert.deepEqual(outcomes(first), [[downloads, 'deleted', null]], race);
+        assert.deepEqual(
+          outcomes(second.results),
+          race === 'lists while the first deletes' ? [] : [[aside, 'gone', 'it no longer exists']],
+          race,
+        );
+        assert.deepEqual(fs.readdirSync(share), [], race);
+      }
+    } finally {
+      c.close();
+    }
   }
 });
