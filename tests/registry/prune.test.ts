@@ -10,7 +10,6 @@ import { simctlBackend } from '../../src/devices/simctl.ts';
 import { ownerKey, type Owner } from '../../src/registry/owner.ts';
 import { databasePath, stateDir } from '../../src/registry/paths.ts';
 import type {
-  Leftover,
   LeftoverResult,
   LeftoverStep,
   OrphanResult,
@@ -1294,9 +1293,11 @@ test('of the copies earlier prunes left, the latest by a well-formed name goes b
 });
 
 const RACES = [
+  'puts back before the first checks again',
   'lists while the first deletes',
   'listed before the first took its copy for deletion',
-  'puts back before the first checks again',
+  'finds the lane at its first check',
+  'finds the lane at its second check',
 ] as const;
 
 test('a prune that puts copies back never restores one another prune is deleting, and each prune reports what it did', t => {
@@ -1311,22 +1312,49 @@ test('a prune that puts copies back never restores one another prune is deleting
       const steps = moveLeftoversAside(c.ctx, c.report().leftovers);
       const aside = asideOf(steps, downloads);
       const listedMeanwhile = c.report().leftovers;
-      const second: { lane: string; results: LeftoverResult[] | null } = { lane: '', results: null };
-      const putBackNow = (leftovers: readonly Leftover[]) => {
-        second.lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
-        second.results = putBackAsideCopies(c.ctx, leftovers);
+      const second: { lane: string; deleting: string; results: LeftoverResult[] | null } = {
+        lane: '',
+        deleting: '',
+        results: null,
       };
-      if (race === 'puts back before the first checks again') putBackNow(c.report().leftovers);
+      const laneStarts = () => {
+        second.lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+      };
+      const secondPrune = (): LeftoverResult[] => {
+        switch (race) {
+          case 'puts back before the first checks again':
+          case 'lists while the first deletes':
+            laneStarts();
+            return putBackAsideCopies(c.ctx, c.report().leftovers);
+          case 'listed before the first took its copy for deletion':
+            laneStarts();
+            return putBackAsideCopies(c.ctx, listedMeanwhile);
+          case 'finds the lane at its first check': {
+            const listed = c.report().leftovers;
+            laneStarts();
+            return deleteLeftovers(c.ctx, listed);
+          }
+          case 'finds the lane at its second check': {
+            const movedBySecond = moveLeftoversAside(c.ctx, c.report().leftovers);
+            laneStarts();
+            return finishLeftovers(c.ctx, movedBySecond);
+          }
+        }
+      };
+      if (race === 'puts back before the first checks again') second.results = secondPrune();
 
       const rm = fs.rmSync;
+      let interleaved = false;
       const rmSync = t.mock.method(fs, 'rmSync', (target: fs.PathLike, options?: fs.RmOptions) => {
-        if (second.results !== null || typeof target !== 'string' || path.dirname(target) !== share) {
+        if (interleaved || typeof target !== 'string' || path.dirname(target) !== share) {
           rm(target, options);
           return;
         }
+        interleaved = true;
+        second.deleting = target;
         const { ino } = fs.statSync(target);
         rm(path.join(target, library));
-        putBackNow(race === 'lists while the first deletes' ? c.report().leftovers : listedMeanwhile);
+        second.results = secondPrune();
         const sameFolder = fs
           .readdirSync(share)
           .map(name => path.join(share, name))
@@ -1340,24 +1368,23 @@ test('a prune that puts copies back never restores one another prune is deleting
       rmSync.mock.restore();
 
       assert.ok(second.results, `${race}: the second prune never ran`);
+      const why = lanesFound(c.former, second.lane);
       if (race === 'puts back before the first checks again') {
         assert.deepEqual(outcomes(first), [[downloads, 'gone', `${aside} no longer exists`]], race);
-        assert.deepEqual(
-          outcomes(second.results),
-          [[aside, 'kept', `${lanesFound(c.former, second.lane)}; put back at ${downloads}`]],
-          race,
-        );
+        assert.deepEqual(outcomes(second.results), [[aside, 'kept', `${why}; put back at ${downloads}`]], race);
         assert.deepEqual(filesIn(downloads), files, race);
         assert.deepEqual(fs.readdirSync(share), ['agent-env'], race);
-      } else {
-        assert.deepEqual(outcomes(first), [[downloads, 'deleted', null]], race);
-        assert.deepEqual(
-          outcomes(second.results),
-          race === 'lists while the first deletes' ? [] : [[aside, 'gone', 'it no longer exists']],
-          race,
-        );
-        assert.deepEqual(fs.readdirSync(share), [], race);
+        continue;
       }
+      const reported = {
+        'lists while the first deletes': [],
+        'listed before the first took its copy for deletion': [[aside, 'gone', 'it no longer exists']],
+        'finds the lane at its first check': [[second.deleting, 'kept', why]],
+        'finds the lane at its second check': [[second.deleting, 'kept', `${why}, found after it was moved aside`]],
+      };
+      assert.deepEqual(outcomes(first), [[downloads, 'deleted', null]], race);
+      assert.deepEqual(outcomes(second.results), reported[race], race);
+      assert.deepEqual(fs.readdirSync(share), [], race);
     } finally {
       c.close();
     }
