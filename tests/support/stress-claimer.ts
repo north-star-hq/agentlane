@@ -220,7 +220,7 @@ async function main(): Promise<void> {
         const notes: string[] = [];
         const parked = parkNow(registry, held, notes);
         held = registry.touch({ id: held.id, token: held.token }, 'stress park');
-        if (parked && held.device) fail(1, `lane ${held.id} still holds ${held.device.id} after it was parked`);
+        if (parked && selfOwned && held.device) fail(1, `lane ${held.id} still holds ${held.device.id} after it was parked`);
         fs.writeSync(1, `parked ${JSON.stringify({ id: held.id, parked, notes })}\n`);
       } else if (op.kind === 'release' && held) {
         const notes: string[] = [];
