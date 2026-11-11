@@ -140,9 +140,13 @@ async function webLane(w: World) {
   return result.lane;
 }
 
-async function withDevice(platform: 'ios' | 'android', body: (w: DriverWorld, c: Cli) => Promise<void>): Promise<void> {
+async function withDevice(
+  platform: 'ios' | 'android',
+  body: (w: DriverWorld, c: Cli) => Promise<void>,
+  env: Record<string, string> = {},
+): Promise<void> {
   const home = tempDir('last-used-home');
-  const w = await driverWorld({ platform, env: homeless(home) });
+  const w = await driverWorld({ platform, env: { ...homeless(home), ...env } });
   try {
     assert.equal((await callEngine(w.target(), { op: 'look', args: {} })).ok, true, 'the engine did not start');
     await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's first touch");
@@ -310,3 +314,23 @@ test('a busy registry neither fails nor stalls a device lane call, and the engin
     }
     await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's retried touch");
   }));
+
+test('a run still in flight has already moved the last use, so a long run never looks idle', () =>
+  withDevice(
+    'ios',
+    async w => {
+      age(w.stateDir, w.lane.id);
+      let settled = false;
+      const running = callEngine(w.target(), {
+        op: 'run',
+        args: { yaml: '- assertVisible: General\n', appId: 'com.apple.Preferences' },
+      }).finally(() => {
+        settled = true;
+      });
+      await until(() => lastUse(w.stateDir, w.lane.id).at > AGED, 1000, 'the run to count before it ends');
+      assert.equal(settled, false, 'the run ended before its touch was seen');
+      assert.equal(lastUse(w.stateDir, w.lane.id).action, 'run');
+      assert.equal((await running).ok, true);
+    },
+    { FAKE_DELAY_MS: '1500' },
+  ));

@@ -356,7 +356,10 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
     clearTimeout(sampleTimer);
     const op = request.op;
     const tool = isToolCall(op);
-    if (tool) idle.begin();
+    if (tool) {
+      idle.begin();
+      touchSoon(ACTIONS[op]);
+    }
     const job = tail.then(() => (stopping === undefined ? perform(request) : refusal(request, stopping)));
     tail = job.catch(() => undefined);
     return job
