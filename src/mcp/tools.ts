@@ -12,6 +12,7 @@ import { CLI, TOOL } from '../name.ts';
 import type { ProcessTable } from '../processes.ts';
 import { resolveOwner, type Owner } from '../registry/owner.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
+import { LaneToucher } from '../registry/touch.ts';
 
 export interface ToolDefinition {
   name: string;
@@ -99,6 +100,7 @@ export interface ToolContext {
   cwd: string;
   processes: ProcessTable;
   browser?: BrowserTools;
+  touchRetryMs?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -241,6 +243,7 @@ function errorResult(text: string): ToolResult {
 /** The MCP tools' handler. It resolves the owner once, and the lane on every call, so a new lane is picked up. */
 export function createToolHandler(context: ToolContext): (name: string, args: Record<string, unknown>) => Promise<ToolResult> {
   let owner: Owner | undefined;
+  let toucher: LaneToucher | undefined;
   return async (name, args) => {
     try {
       owner ??= resolveOwner(context.env, context.processes);
@@ -255,6 +258,8 @@ export function createToolHandler(context: ToolContext): (name: string, args: Re
       };
       const { lane, stateDir } = resolveCallerLane(caller);
       if (screen && hasBrowser(lane) && (asked || lane.device === null)) {
+        toucher ??= new LaneToucher({ dir: stateDir, processes: context.processes }, context.touchRetryMs);
+        toucher.touch({ id: lane.id, token: lane.token }, `${name}: browser`);
         const browser: BrowserScreenTarget = { tools: context.browser ?? realBrowserTools, stateDir, lane, env: context.env };
         return name === 'look'
           ? await browserLook(browser, lookArgs(args))

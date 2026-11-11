@@ -64,7 +64,7 @@ const stopped = (pid: number) =>
     .startsWith('T');
 
 test('calls queued on the socket when the engine stops for an ended lane are each answered, none dropped', () =>
-  withWorld({ platform: 'android', tuning: { lanePollMs: 60_000 } }, async world => {
+  withWorld({ platform: 'android', tuning: { lanePollMs: 60_000, touchEveryMs: 60_000 } }, async world => {
     const first = await callEngine(world.target(), { op: 'look', args: {} });
     assert.equal(first.ok, true, first.error);
     await until(() => world.registry().find(world.lane.owner, world.worktree)?.lastAction === 'look', 3000, 'the touch');
