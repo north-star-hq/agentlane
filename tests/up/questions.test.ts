@@ -118,7 +118,7 @@ function stretches(events: readonly string[]): Record<string, number>[] {
 const DRIVEN = { ...CONFIG, driver: { flows: '.maestro' } };
 
 const ONE_LIST_PER_TRANSACTION =
-  "a new lane's claim lists devices once in each of its two registry transactions: a listing reused across the released write lock would hide other processes' changes";
+  "a new lane's claim lists devices once ahead of each of its two registry transactions, the second after it creates the device: a listing reused across the released write lock would hide other processes' changes and the device it created";
 
 test("one up on iOS asks each question of the system once, the simulator's state again after it boots it and for the closing doctor, and the device list once in each of the claim's two transactions", async t => {
   const w = world(t);
@@ -140,7 +140,11 @@ test("one up on iOS asks each question of the system once, the simulator's state
     events.filter(e => CHANGES.has(e)),
     ['create', 'boot'],
   );
-  assert.deepEqual(stretches(events), [{ 'device list': 2 }, { 'simulator state': 1 }, { 'simulator state': 2 }]);
+  assert.deepEqual(
+    stretches(events),
+    [{ 'device list': 1 }, { 'device list': 1, 'simulator state': 1 }, { 'simulator state': 2 }],
+    ONE_LIST_PER_TRANSACTION,
+  );
   assert.deepEqual(
     events.filter(e => e.startsWith('driver on ')),
     ['driver on /jdk17'],
@@ -216,7 +220,7 @@ test("one up on Android asks each question of the system once, and the device li
     events.filter(e => CHANGES.has(e)),
     ['create', 'boot'],
   );
-  assert.deepEqual(stretches(events), [{ 'device list': 2 }, {}, {}]);
+  assert.deepEqual(stretches(events), [{ 'device list': 1 }, { 'device list': 1 }, {}], ONE_LIST_PER_TRANSACTION);
 });
 
 test('an input the build changes is hashed again, so the build is stored under the key of what was built', async t => {
