@@ -182,6 +182,13 @@ const SPLIT_NAMES = [
   'xcrun sim\\\nctl boot booted',
   'a\\\ndb shell',
   `bash -c "a\\\ndb shell"`,
+  'a$"db" shell',
+  'xcrun sim$"ctl" boot booted',
+  `bash -c 'a$"db" shell'`,
+  'a{d,}b shell',
+  'a{d..d}b shell',
+  'xcrun sim{c,}tl boot booted',
+  'e{nv,mulator} -avd x',
 ];
 
 const PLAIN = [
@@ -189,6 +196,12 @@ const PLAIN = [
   `printf 'a\\nb\\n' | grep -c "$HOME"`,
   'cd src\ngit diff -- "it\'s.ts"',
   "echo $'tab\\there' \\\n  && ls",
+  'mkdir -p src/{api,web}',
+  "jq '{name,version}' package.json",
+  'cp app.json{,.bak}',
+  "awk '{print $1, $2}' list.txt",
+  'node -e "console.log({a: 1, b: 2})"',
+  'echo {1..3}',
 ];
 
 test('the guard hooks init writes start no node process for a command with no device or browser tool in it', async () => {
@@ -256,11 +269,20 @@ const GUARDED_COMMANDS: Record<(typeof GUARDED_WORDS)[number], (name: string) =>
 };
 
 function splitsOf(word: string): string[] {
-  const cuts = ["''", '""', "$''", '\\', '\\\n'];
+  const cuts = ["''", '""', "$''", '$""', '\\', '\\\n', '{,}'];
   const at = Array.from({ length: word.length }, (_, i) => i);
   const between = at.slice(1).flatMap(i => cuts.map(cut => word.slice(0, i) + cut + word.slice(i)));
-  const around = at.map(i => `${word.slice(0, i)}$'${word.slice(i, i + 1)}'${word.slice(i + 1)}`);
-  return [...between, ...around];
+  const around = at.flatMap(i => {
+    const [before, c, after] = [word.slice(0, i), word.slice(i, i + 1), word.slice(i + 1)];
+    return [
+      `${before}$'${c}'${after}`,
+      `${before}$"${c}"${after}`,
+      `${before}{${c},}${after}`,
+      ...(/[A-Za-z0-9]/.test(c) ? [`${before}{${c}..${c}}${after}`] : []),
+    ];
+  });
+  const firstOfTwo = at.slice(2).map(i => `{${word.slice(0, i)},}${word.slice(i)}`);
+  return [...between, ...around, ...firstOfTwo];
 }
 
 /** The `case` statement that decides whether a guard hook starts the toolkit, and the variable it reads the input from. */
@@ -281,7 +303,7 @@ function encodingOf(shape: HookInputShape, cwd: string): (command: string) => st
   return command => JSON.stringify(shape(command, cwd)).slice(before.length, -after.length || undefined);
 }
 
-test('every way of splitting a guarded tool name with quotes, backslashes or line continuations passes all seven guard filters, in every input shape the agents send, under /bin/sh and /bin/dash', async () => {
+test('every way of splitting a guarded tool name with quotes, backslashes, line continuations or brace expansion passes all seven guard filters, in every input shape the agents send, under /bin/sh and /bin/dash', async () => {
   const f = fixture('hooks-split-names');
   try {
     const bare = GUARDED_WORDS.flatMap(word => splitsOf(word).map(split => GUARDED_COMMANDS[word](split)));

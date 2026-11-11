@@ -3,7 +3,7 @@
 event=$1
 input=$(cat)
 if [ "$event" = pre-tool-use ]; then
-  case $(printf '%s' "$input" | sed -e h -e 's/\\\\//g' -e 's/\\n//g' -e x -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e G -e 's/\\//g' -e "s/[\$'\"]//g") in
+  case $(printf '%s' "$input" | sed -e h -e 's/\\\\//g' -e 's/\\n//g' -e x -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e G -e 's/\\//g' -e "s/[\$'\"]//g" -e p -e :x -e h -e 's/{\([-+0-9A-Za-z]*\)\.\.[-+0-9A-Za-z.]*}/\1/g' -e 's/{\([^{},]*\)\(,[^{},]*\)\{0,8\}}/\1/g' -e p -e g -e ty -e :y -e 's/{[^{},]*,\([^{},]*\(,[^{},]*\)\{0,7\}\)}/{\1}/g' -e tx -e d) in
     *simctl* | *adb* | *emulator* | *avdmanager* | *playwright-cli* | *@playwright/cli* | *agent-browser*) ;;
     *) exit 0 ;;
   esac
