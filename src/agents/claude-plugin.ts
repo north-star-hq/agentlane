@@ -46,6 +46,15 @@ function sessionPluginDir(env: NodeJS.ProcessEnv): string | null {
  * settings count under 0.2.x's plugin name too, because init renames it there.
  */
 export function claudePluginSources(root: string, env: NodeJS.ProcessEnv): PluginSource[] {
+  const enabled = enabledPlugins(root, env);
+  const order: PluginSource['kind'][] = ['project', 'local', 'user'];
+  const sources = [...new Set(enabled.map(e => e.source))].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+  const dir = sessionPluginDir(env);
+  if (dir !== null) sources.push({ kind: 'session', dir });
+  return sources;
+}
+
+function enabledPlugins(root: string, env: NodeJS.ProcessEnv): { source: PluginSource; key: string }[] {
   const scopes: { source: PluginSource; at: string; names: readonly string[] }[] = [
     { source: { kind: 'local', file: CLAUDE_LOCAL_SETTINGS }, at: path.join(root, CLAUDE_LOCAL_SETTINGS), names: [TOOL] },
     { source: { kind: 'project', file: CLAUDE_SETTINGS }, at: path.join(root, CLAUDE_SETTINGS), names: [TOOL, FORMER.tool] },
@@ -53,19 +62,53 @@ export function claudePluginSources(root: string, env: NodeJS.ProcessEnv): Plugi
   const user = path.join(claudeConfigDir(env), 'settings.json');
   scopes.push({ source: { kind: 'user', file: user }, at: user, names: [TOOL] });
   const decided = new Set<string>();
-  const enabledBy = new Set<PluginSource>();
+  const enabled: { source: PluginSource; key: string }[] = [];
   for (const { source, at, names } of scopes) {
     for (const [key, on] of toolkitEntries(jsonObjectAt(at), names)) {
       if (decided.has(key)) continue;
       decided.add(key);
-      if (on) enabledBy.add(source);
+      if (on) enabled.push({ source, key });
     }
   }
-  const order: PluginSource['kind'][] = ['project', 'local', 'user'];
-  const sources = [...enabledBy].sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
-  const dir = sessionPluginDir(env);
-  if (dir !== null) sources.push({ kind: 'session', dir });
-  return sources;
+  return enabled;
+}
+
+export type PluginInstall = { kind: 'loaded'; dir: string } | { kind: 'not-installed'; keys: string[] } | { kind: 'unknown' };
+
+function sameDir(a: unknown, b: string): boolean {
+  if (typeof a !== 'string') return false;
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
+
+/**
+ * Where Claude Code loads the enabled plugin from on this Mac. Claude Code records what it installed in
+ * `plugins/installed_plugins.json` under its config folder: format 2 maps `<plugin>@<marketplace>` to a list of
+ * installs, each with a `scope`, a `projectPath` for project and local scopes, and an `installPath`.
+ */
+export function claudePluginInstall(root: string, env: NodeJS.ProcessEnv): PluginInstall | null {
+  const session = sessionPluginDir(env);
+  if (session !== null) return { kind: 'loaded', dir: session };
+  const keys = enabledPlugins(root, env).map(e => e.key);
+  if (keys.length === 0) return null;
+  const file = path.join(claudeConfigDir(env), 'plugins', 'installed_plugins.json');
+  if (!fs.existsSync(file)) return { kind: 'not-installed', keys };
+  const plugins = jsonObjectAt(file)?.plugins;
+  if (typeof plugins !== 'object' || plugins === null) return { kind: 'unknown' };
+  for (const key of keys) {
+    const listed: unknown = (plugins as Record<string, unknown>)[key];
+    const installs = Array.isArray(listed) ? (listed as unknown[]) : listed === undefined ? [] : [listed];
+    for (const install of installs) {
+      if (typeof install !== 'object' || install === null) continue;
+      const { scope, projectPath, installPath } = install as Record<string, unknown>;
+      const here = scope === undefined || scope === 'user' || sameDir(projectPath, root);
+      if (here && typeof installPath === 'string') return { kind: 'loaded', dir: installPath };
+    }
+  }
+  return { kind: 'not-installed', keys };
 }
 
 export function claudePluginSource(root: string, env: NodeJS.ProcessEnv): PluginSource | null {

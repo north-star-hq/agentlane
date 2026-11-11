@@ -1,5 +1,6 @@
 import { setupFix } from '../agents/skills.ts';
-import { agentWiringChecks } from '../agents/wiring-check.ts';
+import { agentHookChecks } from '../agents/hook-check.ts';
+import { agentsSetUp, agentWiringChecks } from '../agents/wiring-check.ts';
 import { browserChecks, hasBrowser } from '../browser/lane-browser.ts';
 import { realBrowserTools, type BrowserTools } from '../browser/tools.ts';
 import { stateDir } from '../registry/paths.ts';
@@ -251,8 +252,10 @@ export function describeMaestroBuild(build: MaestroBuild): string {
 }
 
 function wiringChecks(config: ProjectConfig | null, folder: string, env: NodeJS.ProcessEnv): DoctorCheck[] {
-  const wired = agentWiringChecks(config?.dir ?? folder, env);
-  if (wired.length > 0 || !config) return wired;
+  const root = config?.dir ?? folder;
+  const wired = agentWiringChecks(root, env);
+  if (wired.length > 0) return [...wired, ...agentHookChecks(root, agentsSetUp(root), env)];
+  if (!config) return wired;
   return [
     {
       name: 'wiring',

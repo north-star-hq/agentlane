@@ -4,13 +4,13 @@ import { CLI, TOOL } from '../name.ts';
 import type { Agent } from '../registry/owner.ts';
 import { AGENTS } from '../registry/owner.ts';
 import type { PluginSource } from './claude-plugin.ts';
-import { CLAUDE_SETTINGS, describePluginSource, jsonObjectAt } from './claude-plugin.ts';
+import { CLAUDE_SETTINGS, claudePluginInstall, describePluginSource, jsonObjectAt } from './claude-plugin.ts';
 import type { FilePlan } from './init.ts';
 import { planInit } from './init.ts';
 import type { Skill } from './skills.ts';
 import { listSkills, SKILLS_DIR } from './skills.ts';
 import type { Edit, Json } from './wiring.ts';
-import { agentEdits, disablesOurServer, hasClaudeHooks, pluginEnabled } from './wiring.ts';
+import { agentEdits, disablesOurServer, pluginEnabled } from './wiring.ts';
 
 export interface WiringCheck {
   name: string;
@@ -73,7 +73,6 @@ function claudeCopies(root: string, claude: readonly FilePlan[]): string[] {
   const servers = jsonObjectAt(path.join(root, '.mcp.json'))?.mcpServers;
   if (typeof servers === 'object' && servers !== null && TOOL in servers && !(settings && disablesOurServer(settings)))
     copies.push('MCP server in .mcp.json');
-  if (settings !== null && hasClaudeHooks(settings)) copies.push(`hooks in ${CLAUDE_SETTINGS}`);
   const links = claude.filter(f => f.status === 'remove').length;
   if (links > 0) copies.push(`${String(links)} toolkit skill${links === 1 ? '' : 's'} in .claude/skills`);
   return copies;
@@ -117,7 +116,15 @@ export function agentWiringChecks(
       const fine = plugin ? `through the plugin: ${describePluginSource(plugin)}` : 'MCP server and hooks in place';
       const line = check(`wiring ${agent}`, mine, fine, `${CLI} init --agents ${agent}`);
       const copies = plugin ? claudeCopies(root, mine) : [];
+      const install = plugin ? claudePluginInstall(root, env) : null;
       if (plugin && copies.length > 0) checks.push({ ...line, detail: bothWired(plugin, copies) });
+      else if (plugin && install?.kind === 'not-installed')
+        checks.push({
+          ...line,
+          warning: true,
+          detail: `${describePluginSource(plugin)}, but Claude Code hasn't installed it on this Mac (${install.keys.join(', ')}), so its MCP server and skills don't load${line.warning ? `; and ${line.detail}` : ''}`,
+          fix: `in Claude Code, /plugin install ${install.keys[0] ?? TOOL} (add its marketplace with /plugin marketplace add first if /plugin doesn't list it)${line.warning ? `, then ${line.fix}` : ''}`,
+        });
       else if (agent === 'claude' && !plugin && line.warning && leftToAbsentPlugin(root))
         checks.push({
           ...line,

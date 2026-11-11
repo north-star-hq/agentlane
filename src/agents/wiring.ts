@@ -30,8 +30,6 @@ export type Edit =
 export const SKILLS = '.agents/skills';
 export const CLAUDE_SKILLS = '.claude/skills';
 
-const CLAUDE_HOOK_EVENTS = ['PreToolUse', 'SessionEnd'];
-
 function object(doc: Json, key: string): Json | string {
   const value = doc[key] ?? {};
   if (typeof value !== 'object' || Array.isArray(value)) return `its ${key} is not an object`;
@@ -142,6 +140,12 @@ function claudeEdits(): Edit[] {
       },
       present: () => false,
     },
+    ...claudeHookEdits(),
+  ];
+}
+
+function claudeHookEdits(): Edit[] {
+  return [
     hookEdit(CLAUDE_SETTINGS, 'claude', 'guard hook', 'PreToolUse', {
       matcher: 'Bash|Monitor',
       hooks: [command('claude', 'pre-tool-use', { timeout: 30 })],
@@ -151,15 +155,6 @@ function claudeEdits(): Edit[] {
       hooks: [command('claude', 'session-end', { timeout: 10 })],
     }),
   ];
-}
-
-export function hasClaudeHooks(doc: Json): boolean {
-  const hooks = doc.hooks;
-  if (typeof hooks !== 'object' || hooks === null) return false;
-  return CLAUDE_HOOK_EVENTS.some(event => {
-    const entries = (hooks as Json)[event];
-    return Array.isArray(entries) && entries.some(hasToolkitHook);
-  });
 }
 
 function claudePluginEdits(disableServer: boolean): Edit[] {
@@ -178,24 +173,6 @@ function claudePluginEdits(disableServer: boolean): Edit[] {
     },
     present: doc => pluginEnabled(doc) || disablesOurServer(doc),
   };
-  const removeHooks: Edit = {
-    kind: 'json',
-    file: CLAUDE_SETTINGS,
-    agent: 'claude',
-    part: 'plugin',
-    apply: doc => {
-      if (!hasClaudeHooks(doc)) return null;
-      const kept = Object.entries(doc.hooks as Json).flatMap(([event, entries]): [string, unknown][] => {
-        if (!CLAUDE_HOOK_EVENTS.includes(event) || !Array.isArray(entries)) return [[event, entries]];
-        const rest = entries.filter(entry => !hasToolkitHook(entry));
-        return rest.length > 0 ? [[event, rest]] : [];
-      });
-      if (kept.length > 0) doc.hooks = Object.fromEntries(kept);
-      else delete doc.hooks;
-      return null;
-    },
-    present: hasClaudeHooks,
-  };
   const rename: Edit = {
     kind: 'json',
     file: CLAUDE_SETTINGS,
@@ -207,7 +184,7 @@ function claudePluginEdits(disableServer: boolean): Edit[] {
     },
     present: doc => formerPluginKeys(doc).length > 0,
   };
-  return disableServer ? [rename, disable, removeHooks] : [rename, removeHooks];
+  return [rename, ...(disableServer ? [disable] : []), ...claudeHookEdits()];
 }
 
 export function pluginEnabled(settings: Json): boolean {

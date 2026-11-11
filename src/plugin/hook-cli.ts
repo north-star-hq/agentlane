@@ -11,10 +11,13 @@ import { readRegistryStatus } from '../registry/registry.ts';
 import type { CliDeps } from '../registry-cli.ts';
 import { releaseEveryLaneOf, resolveFolder } from '../registry-cli.ts';
 import { commandUsage, groupUsage, type UsageGroup } from '../usage.ts';
+import type { HookEvent } from '../agents/launcher.ts';
+import { toolVersion } from '../agents/package.ts';
 import { aimsOf } from './aims.ts';
 import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
 import { guard } from './guard.ts';
+import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
 import { claudeSessionName } from './session-name.ts';
 
 export const HOOK_COMMANDS = ['hook'] as const;
@@ -42,6 +45,8 @@ const OWNER_EXIT_POLL_MS = 250;
 export interface HookDeps extends CliDeps {
   stdin: string;
   startWorker: (env: NodeJS.ProcessEnv, log: string) => void;
+  /** The toolkit's entry point, recorded in the hook's mark. */
+  toolkit?: string;
 }
 
 function selfOwner(deps: HookDeps): Owner | null {
@@ -167,6 +172,32 @@ export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: strin
   };
 }
 
+const PROJECT_ENV: Partial<Record<Agent, string>> = { claude: 'CLAUDE_PROJECT_DIR', cursor: 'CURSOR_PROJECT_DIR' };
+
+function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
+  try {
+    let cwd: string | null = null;
+    try {
+      cwd = readHookInput(deps.stdin).cwd;
+    } catch {
+      cwd = null;
+    }
+    const named = PROJECT_ENV[agent];
+    const project = named ? deps.env[named] : undefined;
+    writeHookMark(stateDir(deps.env), {
+      agent,
+      event,
+      project: project !== undefined && project !== '' ? project : (cwd ?? deps.cwd),
+      at: (deps.clock ?? systemClock).now(),
+      toolkit: deps.toolkit ?? process.argv[1] ?? '',
+      version: toolVersion(),
+      probe: deps.env[HOOK_PROBE_ENV] ?? null,
+    });
+  } catch {
+    return;
+  }
+}
+
 async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promise<boolean> {
   const identity = owner.process;
   if (identity === null) return true;
@@ -224,9 +255,13 @@ export async function runHookCommand(args: string[], deps: HookDeps): Promise<nu
   if (event === 'session-end') {
     const owner = deps.env[SESSION_END_OWNER_ENV];
     if (owner) return releaseWorker(owner, deps);
+    leaveMark(agent, event, deps);
     return sessionEnd(readHookInput(deps.stdin), agent, deps);
   }
-  if (event === 'pre-tool-use') return preToolUse(deps.stdin, agent, deps);
+  if (event === 'pre-tool-use') {
+    leaveMark(agent, event, deps);
+    return preToolUse(deps.stdin, agent, deps);
+  }
   deps.stderr(`${TOOL} hook: '${event ?? ''}' is not a hook\n\n${HOOK_USAGE}`);
   return 2;
 }

@@ -12,17 +12,14 @@ import { tcpProbe } from '../../src/registry/ports.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { FakeDevices, tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { portBlock } from '../support/ports.ts';
 
 const PORTS = await portBlock();
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const CLI = path.join(ROOT, 'src', 'cli.ts');
-const SESSION_END_TIMEOUT_S = (
-  JSON.parse(fs.readFileSync(path.join(ROOT, 'plugin', 'hooks', 'claude.json'), 'utf8')) as {
-    hooks: { SessionEnd: [{ hooks: [{ timeout: number }] }] };
-  }
-).hooks.SessionEnd[0].hooks[0].timeout;
+const PLUGIN_SESSION_END_BUDGET_MS = 1_500;
 
 function sleeper(): ChildProcess {
   return spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
@@ -193,21 +190,27 @@ test('session-end --codex releases the ended thread’s lanes by the hook’s se
   }
 });
 
-test('session-end from the real CLI detaches a worker that outlives the hook and releases the lanes', async () => {
+test('the plugin’s session-end hook hands the release to a detached worker and returns within a second', async () => {
   const s = setup('hook-detached');
   const me = sleeper();
   try {
     const env = { AGENTLANE_OWNER_PID: String(me.pid) };
-    await lane(s, env, s.folder('x'), '--no-device');
+    const project = s.folder('x');
+    await lane(s, env, project, '--no-device');
+    const bin = path.join(project, 'node_modules', '.bin', 'agentlane');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${CLI}" "$@"\n`);
+    fs.chmodSync(bin, 0o755);
     const started = Date.now();
-    const result = spawnSync(process.execPath, [CLI, 'hook', 'session-end'], {
+    const result = spawnSync(path.join(ROOT, 'plugin', 'scripts', 'hook.sh'), ['session-end'], {
+      cwd: project,
       input: JSON.stringify({ hook_event_name: 'SessionEnd', reason: 'other' }),
       encoding: 'utf8',
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTLANE_STATE_DIR: s.stateDir, ...env },
+      env: hermeticEnv(s.root, { AGENTLANE_STATE_DIR: s.stateDir, CLAUDE_PROJECT_DIR: project, ...env }),
     });
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stderr, /releasing 1 lane\(s\)/);
     const hookMs = Date.now() - started;
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /releasing 1 lane\(s\) .* in the background/);
     const log = path.join(s.stateDir, 'session-end.log');
     const released = () => /released lane \w+ of process/.test(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '');
     const deadline = Date.now() + 10_000;
@@ -215,8 +218,8 @@ test('session-end from the real CLI detaches a worker that outlives the hook and
     assert.deepEqual(laneIds(s), []);
     assert.match(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '(no log)', /released lane \w+ of process/);
     assert.ok(
-      hookMs < (SESSION_END_TIMEOUT_S * 1000) / 2,
-      `the hook returned in ${String(hookMs)} ms, against the ${String(SESSION_END_TIMEOUT_S)} s timeout the plugin declares`,
+      hookMs < 1_000,
+      `the hook returned in ${String(hookMs)} ms; Claude Code gives a plugin's session-end hook ${String(PLUGIN_SESSION_END_BUDGET_MS)} ms`,
     );
   } finally {
     me.kill('SIGKILL');

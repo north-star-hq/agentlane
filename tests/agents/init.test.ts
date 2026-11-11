@@ -117,7 +117,11 @@ test('init --all on a copy of the example app writes every agent’s files, and 
     const settings = json(dir, '.claude/settings.json');
     assert.deepEqual(settings.enabledPlugins, { 'agentlane@agentlane': true }, 'the example’s own settings survive');
     assert.deepEqual(settings.disabledMcpjsonServers, ['agentlane']);
-    assert.equal(settings.hooks, undefined, 'the plugin already brings the Claude Code hooks');
+    assert.match(
+      JSON.stringify(settings.hooks),
+      /"PreToolUse".*--agent claude.*"SessionEnd".*--agent claude/,
+      'the hooks go in the settings beside the plugin',
+    );
     const ownSkills = fs.readdirSync(path.join(dir, '.agents/skills')).filter(name => !toolkitSkills.has(name));
     assert.ok(ownSkills.length > 0, 'the example has skills of its own');
     assert.deepEqual(
