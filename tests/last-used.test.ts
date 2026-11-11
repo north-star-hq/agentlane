@@ -52,7 +52,7 @@ interface LastUse {
 }
 
 function lastUse(state: string, id: string): LastUse {
-  const db = new DatabaseSync(databasePath(state), { readOnly: true });
+  const db = new DatabaseSync(databasePath(state), { readOnly: true, timeout: 5000 });
   try {
     const row = db.prepare('SELECT last_used_at AS at, last_action AS action FROM claims WHERE id = ?').get(id);
     assert.ok(row, `lane ${id} has no row`);
@@ -462,7 +462,7 @@ function execDeps(lane: OtherLane, over: Partial<EnvDeps> = {}): EnvDeps {
 
 function onlyLane(state: string): LaneRef | undefined {
   if (!fs.existsSync(databasePath(state))) return undefined;
-  const db = new DatabaseSync(databasePath(state), { readOnly: true });
+  const db = new DatabaseSync(databasePath(state), { readOnly: true, timeout: 5000 });
   try {
     const rows = db.prepare('SELECT id, token FROM claims').all();
     const [row] = rows;
