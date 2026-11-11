@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,6 +16,7 @@ import {
 } from '../../src/driver/install.ts';
 import { describeMaestroBuild } from '../../src/up/doctor.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from '../../src/driver/release.ts';
+import type { ProcessTable } from '../../src/processes.ts';
 import { tempDir } from '../support/fakes.ts';
 import { makeZip } from '../support/zip.ts';
 
@@ -32,17 +33,17 @@ function fakeJdk(root: string, spec = '17'): string {
   return home;
 }
 
-function build(root: string, printed = VERSION): { zip: Buffer; release: MaestroRelease; dir: string } {
+function build(root: string, printed?: string, version = VERSION): { zip: Buffer; release: MaestroRelease; dir: string } {
   const zip = makeZip([
-    { name: 'maestro/bin/maestro', data: `#!/bin/sh\necho "${printed}"\n`, mode: 0o100755 },
+    { name: 'maestro/bin/maestro', data: `#!/bin/sh\necho "${printed ?? version}"\n`, mode: 0o100755 },
     { name: 'maestro/lib/maestro.jar', data: 'jar' },
     { name: 'maestro/NOTICE', data: 'notice' },
   ]);
   const sha256 = crypto.createHash('sha256').update(zip).digest('hex');
   const release: MaestroRelease = {
     ...MAESTRO_RELEASE,
-    version: VERSION,
-    asset: `maestro-${VERSION}.zip`,
+    version,
+    asset: `maestro-${version}.zip`,
     size: zip.length,
     sha256,
   };
@@ -71,6 +72,9 @@ function world() {
     PATH: process.env.PATH,
     HOME: root,
     XDG_DATA_HOME: path.join(root, 'data'),
+    XDG_STATE_HOME: path.join(root, 'state'),
+    XDG_CONFIG_HOME: path.join(root, 'config'),
+    AGENTLANE_STATE_DIR: path.join(root, 'state', 'agentlane'),
     JAVA_HOME: fakeJdk(root),
   };
   return { root, env };
@@ -180,6 +184,126 @@ test('a build whose --version is not the pinned version is refused', async () =>
   const { release, dir } = build(root, '1.0.0');
   await assert.rejects(ensureMaestro({ env, release, download: serving(dir) }), /prints '1\.0\.0' for --version/);
   assert.equal(fs.existsSync(maestroHome(env, release)), false);
+});
+
+const OLDER = '9.9.8-agentenv.test';
+const NEWER = '9.10.0-agentenv.test';
+
+function nobodyRunning(): string[] {
+  return [];
+}
+
+test('installing and checking a newer build removes the older one, and the newer one runs', async () => {
+  const { root, env } = world();
+  const older = build(root, undefined, OLDER);
+  const a = await ensureMaestro({ env, release: older.release, download: serving(older.dir), commandLines: nobodyRunning });
+  const newer = build(root);
+  const lines: string[] = [];
+  const b = await ensureMaestro({
+    env,
+    release: newer.release,
+    download: serving(newer.dir),
+    commandLines: nobodyRunning,
+    log: line => lines.push(line),
+  });
+  assert.equal(fs.existsSync(a.home), false);
+  assert.deepEqual(fs.readdirSync(path.dirname(b.home)), [VERSION]);
+  assert.equal(execFileSync(b.binary, ['--version'], { encoding: 'utf8' }).trim(), VERSION);
+  assert.ok(lines.includes(`removed ${a.home}, which this version supersedes`), lines.join('\n'));
+  assert.equal(installedMaestro(env, older.release), undefined);
+});
+
+test('a failed install of a newer build leaves the older one installed', async () => {
+  const { root, env } = world();
+  const older = build(root, undefined, OLDER);
+  const a = await ensureMaestro({ env, release: older.release, download: serving(older.dir), commandLines: nobodyRunning });
+  const newer = build(root, '1.0.0');
+  await assert.rejects(
+    ensureMaestro({ env, release: newer.release, download: serving(newer.dir), commandLines: nobodyRunning }),
+    /prints '1\.0\.0' for --version/,
+  );
+  const corrupt = serving(newer.dir, zip => {
+    fs.appendFileSync(zip, '\0');
+  });
+  await assert.rejects(ensureMaestro({ env, release: newer.release, download: corrupt, commandLines: nobodyRunning }), /bytes/);
+  assert.equal(installedMaestro(env, older.release)?.binary, a.binary);
+  assert.equal(execFileSync(a.binary, ['--version'], { encoding: 'utf8' }).trim(), OLDER);
+});
+
+test('an install keeps the builds a running process uses, another process is installing, or that are newer', async () => {
+  const { root, env } = world();
+  const homes = new Map<string, string>();
+  for (const version of [NEWER, '9.9.6-agentenv.test', '9.9.7-agentenv.test', OLDER]) {
+    const served = build(path.join(root, version), undefined, version);
+    const installed = await ensureMaestro({
+      env,
+      release: served.release,
+      download: serving(served.dir),
+      commandLines: () => undefined,
+    });
+    homes.set(version, installed.home);
+  }
+  const base = path.join(root, 'data', 'agentlane', 'maestro');
+  assert.equal(fs.readdirSync(base).length, 4, 'a process table ps cannot read keeps every build');
+
+  const installer = { pid: 999_999, start: 'Mon Oct 12 00:00:00 2026' };
+  const processes: ProcessTable = {
+    startTimes: pids =>
+      new Map(
+        pids.flatMap(pid =>
+          pid === process.pid ? [[pid, 'me'] as const] : pid === installer.pid ? [[pid, installer.start] as const] : [],
+        ),
+      ),
+    info: () => undefined,
+    cwd: () => undefined,
+  };
+  const installing = path.join(base, '.9.9.7-agentenv.test.lock');
+  fs.writeFileSync(installing, JSON.stringify(installer));
+  const running = `java -classpath ${homes.get(OLDER) ?? ''}/maestro/lib/* maestro.cli.AppKt mcp --no-viewer`;
+  const current = build(root);
+  const lines: string[] = [];
+  await ensureMaestro({
+    env,
+    release: current.release,
+    download: serving(current.dir),
+    processes,
+    commandLines: () => [running],
+    log: line => lines.push(line),
+  });
+  assert.deepEqual(
+    fs
+      .readdirSync(base)
+      .filter(name => !name.startsWith('.'))
+      .sort(),
+    [NEWER, '9.9.7-agentenv.test', OLDER, VERSION].sort(),
+    lines.join('\n'),
+  );
+  assert.ok(lines.includes(`kept ${homes.get(OLDER) ?? ''}, which a running process uses`), lines.join('\n'));
+  assert.ok(
+    lines.includes(`kept ${homes.get('9.9.7-agentenv.test') ?? ''}, which another process is installing`),
+    lines.join('\n'),
+  );
+  assert.ok(lines.includes(`removed ${homes.get('9.9.6-agentenv.test') ?? ''}, which this version supersedes`), lines.join('\n'));
+  assert.deepEqual(JSON.parse(fs.readFileSync(installing, 'utf8')), installer, 'the other installer still holds its lock');
+});
+
+test('a build a real running process was started from is kept', async () => {
+  const { root, env } = world();
+  const older = build(root, undefined, OLDER);
+  const a = await ensureMaestro({ env, release: older.release, download: serving(older.dir) });
+  const child = spawn('/bin/sh', ['-c', 'sleep 30; :', a.binary], { stdio: 'ignore' });
+  try {
+    const current = build(root);
+    await ensureMaestro({ env, release: current.release, download: serving(current.dir) });
+    assert.equal(installedMaestro(env, older.release)?.binary, a.binary);
+  } finally {
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    child.kill();
+    await exited;
+  }
+  const again = build(path.join(root, 'again'), undefined, '9.9.10-agentenv.test');
+  await ensureMaestro({ env, release: again.release, download: serving(again.dir) });
+  assert.equal(fs.existsSync(a.home), false, 'once the process is gone the next install removes the build');
 });
 
 test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another version', async () => {

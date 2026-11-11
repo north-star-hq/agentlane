@@ -12,7 +12,7 @@ import {
   type BrowserInstallOptions,
   type Fetcher,
 } from '../../src/browser/install.ts';
-import type { AgentBrowserRelease, PlaywrightRelease } from '../../src/browser/release.ts';
+import type { AgentBrowserRelease, BrowserBuild, PlaywrightRelease } from '../../src/browser/release.ts';
 import { DriverError } from '../../src/driver/errors.ts';
 import { tempDir } from '../support/fakes.ts';
 import { makeZip } from '../support/zip.ts';
@@ -88,7 +88,15 @@ function served(): Served {
     },
     binaries: { [HOST]: 'bin/agent-browser-test-host' },
   };
-  const env = { HOME: path.join(root, 'home'), PATH: process.env.PATH };
+  const home = path.join(root, 'home');
+  const env = {
+    HOME: home,
+    XDG_DATA_HOME: path.join(home, '.local', 'share'),
+    XDG_STATE_HOME: path.join(home, '.local', 'state'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    AGENTLANE_STATE_DIR: path.join(home, '.local', 'state', 'agentlane'),
+    PATH: process.env.PATH,
+  };
   const fetched: string[] = [];
   const fetch: Fetcher = (url, file) => {
     fetched.push(path.basename(url));
@@ -259,4 +267,119 @@ test('a host with no pinned build is told to bring its own browsers', async () =
     ensureBrowserDriver('playwright', s.options({ host: 'plan9-mips' })),
     /pins no chromium build for plan9-mips/,
   );
+});
+
+function later(
+  s: Served,
+  version: string,
+  revision: string,
+): { playwright: PlaywrightRelease; agentBrowser: AgentBrowserRelease } {
+  const core = tgz(s.root, `playwright-core-${version}.tgz`, { 'lib/tools/cli-client/cli.js': 'console.log("cli")\n' });
+  const ab = tgz(s.root, `agent-browser-${version}.tgz`, { 'bin/agent-browser-test-host': '#!/bin/sh\n' });
+  const archive = (file: string, executable: string[]) => ({
+    url: `https://cdn.example/${path.basename(file)}`,
+    size: fs.statSync(file).size,
+    sha256: sha256(file),
+    executable,
+  });
+  const build = (name: BrowserBuild['name'], file: string, executable: string[]): BrowserBuild => ({
+    name,
+    revision,
+    archives: { [HOST]: archive(zip(s.root, file, executable.join('/')), executable) },
+  });
+  return {
+    playwright: {
+      version,
+      core: {
+        name: 'playwright-core',
+        version,
+        tarball: `https://registry.example/${path.basename(core)}`,
+        sha512: sha512(core),
+      },
+      browsers: [
+        build('chromium', `chrome-${revision}.zip`, ['chrome', 'chrome']),
+        build('chromium-headless-shell', `shell-${revision}.zip`, ['shell', 'shell']),
+        build('ffmpeg', `ffmpeg-${revision}.zip`, ['ffmpeg-mac']),
+      ],
+    },
+    agentBrowser: {
+      ...s.agentBrowser,
+      version,
+      package: { name: 'agent-browser', version, tarball: `https://registry.example/${path.basename(ab)}`, sha512: sha512(ab) },
+    },
+  };
+}
+
+const nobodyRunning = () => [];
+
+function folders(s: Served): string[] {
+  const data = path.join(s.env.HOME ?? '', '.local', 'share', 'agentlane');
+  return ['playwright', 'agent-browser', path.join('playwright', 'browsers')].flatMap(parent =>
+    fs
+      .readdirSync(path.join(data, parent))
+      .filter(name => !name.startsWith('.') && name !== 'browsers')
+      .map(name => path.join(parent, name)),
+  );
+}
+
+test('installing and checking newer pins removes the older driver packages and browsers, and the newer ones run', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const next = later(s, '9.10.0', '3');
+  const lines: string[] = [];
+  const b = await ensureBrowserDriver(
+    'agent-browser',
+    s.options({ ...next, commandLines: nobodyRunning, log: line => lines.push(line) }),
+  );
+  assert.deepEqual(folders(s).sort(), [
+    path.join('agent-browser', '9.10.0'),
+    path.join('playwright', '9.10.0'),
+    path.join('playwright', 'browsers', 'chromium-3'),
+    path.join('playwright', 'browsers', 'chromium_headless_shell-3'),
+    path.join('playwright', 'browsers', 'ffmpeg-3'),
+  ]);
+  assert.ok(lines.includes(`removed ${path.dirname(a.playwrightCore)}, which this version supersedes`), lines.join('\n'));
+  const links = fs.readdirSync(path.join(b.browsersPath, '.links'));
+  assert.deepEqual(
+    links.map(link => fs.readFileSync(path.join(b.browsersPath, '.links', link), 'utf8')),
+    [b.playwrightCore],
+  );
+  assert.equal(spawnSync(b.chrome, { encoding: 'utf8' }).stdout.trim(), 'browser');
+  assert.equal(installState(s.env, 'agent-browser', { ...next, host: HOST }).kind, 'installed');
+  assert.equal(installState(s.env, 'agent-browser', releases(s)).kind, 'missing');
+});
+
+test('a failed install of newer pins leaves the older driver and browsers installed', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const next = later(s, '9.10.0', '3');
+  const flipped: Fetcher = (url, file) => {
+    const data = fs.readFileSync(path.join(s.root, 'served', path.basename(url)));
+    if (url.endsWith('ffmpeg-3.zip')) data[data.length - 1] = (data[data.length - 1] ?? 0) ^ 0xff;
+    fs.writeFileSync(file, data);
+    return Promise.resolve();
+  };
+  await assert.rejects(
+    ensureBrowserDriver('agent-browser', s.options({ ...next, fetch: flipped, commandLines: nobodyRunning })),
+    /refusing to install ffmpeg 3/,
+  );
+  const state = installState(s.env, 'agent-browser', releases(s));
+  assert.deepEqual(state, { kind: 'installed', driver: a });
+  assert.equal(spawnSync(a.chrome, { encoding: 'utf8' }).stdout.trim(), 'browser');
+});
+
+test('newer pins keep a browser a running process uses, and folders the toolkit did not install', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+  const foreign = path.join(a.browsersPath, 'chromium-0');
+  fs.mkdirSync(foreign);
+  const next = later(s, '9.10.0', '3');
+  const running = `${a.chrome} --headless --user-data-dir=/tmp/profile`;
+  const lines: string[] = [];
+  await ensureBrowserDriver('playwright', s.options({ ...next, commandLines: () => [running], log: line => lines.push(line) }));
+  assert.ok(fs.existsSync(a.chrome), lines.join('\n'));
+  assert.ok(fs.existsSync(foreign));
+  assert.ok(lines.includes(`kept ${path.join(a.browsersPath, 'chromium-1')}, which a running process uses`), lines.join('\n'));
+  assert.equal(fs.existsSync(path.join(a.browsersPath, 'ffmpeg-2')), false);
+  assert.equal(fs.existsSync(path.dirname(a.playwrightCore)), false);
 });

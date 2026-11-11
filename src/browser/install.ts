@@ -6,8 +6,15 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { DriverError, messageOf } from '../driver/errors.ts';
 import { runCommand, tail } from '../driver/exec.ts';
-import { dataDir, sha256Of } from '../driver/install.ts';
+import { dataDir, namedDataDir, sha256Of } from '../driver/install.ts';
 import { tryLock, unlock } from '../driver/lock.ts';
+import {
+  compareVersions,
+  removeOlderVersions,
+  systemCommandLines,
+  type CommandLines,
+  type OlderVersion,
+} from '../driver/superseded.ts';
 import { CLI, envName, TOOL } from '../name.ts';
 import { identityOf, systemProcesses, type ProcessTable } from '../processes.ts';
 import type { BrowserDriverName } from './kinds.ts';
@@ -39,6 +46,7 @@ export interface BrowserInstallOptions {
   from?: string;
   fetch?: Fetcher;
   processes?: ProcessTable;
+  commandLines?: CommandLines;
   log?: (line: string) => void;
   lockWaitMs?: number;
 }
@@ -379,14 +387,44 @@ function replace(target: string, fresh: string, work: string): void {
   fs.renameSync(fresh, target);
 }
 
-/** Links our playwright-core into the browsers folder the way Playwright's own install does, so its cleanup keeps them. */
-function linkPlaywright(base: string, core: string): void {
-  const links = path.join(base, '.links');
-  fs.mkdirSync(links, { recursive: true });
-  fs.writeFileSync(path.join(links, crypto.createHash('sha1').update(core).digest('hex')), core);
+function installedFolders(parent: string): string[] {
+  try {
+    return fs.readdirSync(parent).filter(name => !name.startsWith('.') && readMarker(path.join(parent, name)) !== undefined);
+  } catch {
+    return [];
+  }
 }
 
-/** Installs what the driver needs that is missing or does not match its pin, under a lock held across processes. */
+function olderPackages(parent: string, version: string): OlderVersion[] {
+  return installedFolders(parent)
+    .filter(name => readMarker(path.join(parent, name))?.version === name && compareVersions(name, version) < 0)
+    .map(name => ({ dir: path.join(parent, name) }));
+}
+
+function olderBrowsers(base: string, builds: readonly BrowserBuild[]): OlderVersion[] {
+  return installedFolders(base)
+    .filter(name => {
+      const m = /^(.+)-(\d+)$/.exec(name);
+      const build = builds.find(b => browserFolder({ name: b.name, revision: '' }) === `${m?.[1] ?? ''}-`);
+      return m?.[2] !== undefined && build !== undefined && compareVersions(m[2], build.revision) < 0;
+    })
+    .map(name => ({ dir: path.join(base, name) }));
+}
+
+function linkOf(base: string, core: string): string {
+  return path.join(base, '.links', crypto.createHash('sha1').update(core).digest('hex'));
+}
+
+/** Links our playwright-core into the browsers folder the way Playwright's own install does, so its cleanup keeps them. */
+function linkPlaywright(base: string, core: string): void {
+  fs.mkdirSync(path.join(base, '.links'), { recursive: true });
+  fs.writeFileSync(linkOf(base, core), core);
+}
+
+/**
+ * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
+ * Then removes the older versions it installed that no running process uses.
+ */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
     playwright: options.playwright ?? PLAYWRIGHT_RELEASE,
@@ -445,6 +483,21 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
     }
     const after = installState(options.env, driver, releases);
     if (after.kind !== 'installed') throw new DriverError(describeInstallState(driver, after), `retry ${INSTALL_FIX}`);
+    const older = olderPackages(path.dirname(core), playwright.version);
+    if (options.env[BROWSERS_OVERRIDE_ENV] === undefined)
+      older.push(...olderBrowsers(browsersPath(options.env), playwright.browsers));
+    if (driver === 'agent-browser')
+      older.push(...olderPackages(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version));
+    const removed = removeOlderVersions(older, {
+      root: namedDataDir(options.env),
+      me,
+      processes,
+      commandLines: options.commandLines ?? systemCommandLines,
+      log: options.log ?? (() => undefined),
+    });
+    for (const dir of removed.filter(d => path.dirname(d) === path.dirname(core))) {
+      fs.rmSync(linkOf(browsersPath(options.env), path.join(dir, 'package')), { force: true });
+    }
     return after.driver;
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
