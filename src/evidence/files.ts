@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+const NEWLINE = 0x0a;
+
 export type EvidenceTarget = 'device' | 'browser';
 
 export function evidenceStamp(at: Date = new Date()): string {
@@ -81,19 +83,64 @@ export function clearInProgress(evidence: string, kind: 'video' | 'trace', targe
   fs.rmSync(stateFile(evidence, kind, target), { force: true });
 }
 
-/**
- * The bytes a file grew by since `from`, or all of it when it is shorter than that or is no longer the inode `ino`
- * (it was replaced).
- */
-export function readFrom(file: string, from: number, ino?: number): string {
+/** The bytes a file grew by since `from`, or all of it when it is shorter than that (it was replaced). */
+export function readFrom(file: string, from: number): string {
   let data: Buffer;
   try {
     data = fs.readFileSync(file);
   } catch {
     return '';
   }
-  const replaced = ino !== undefined && inodeOf(file) !== ino;
-  return data.subarray(!replaced && data.length >= from ? from : 0).toString('utf8');
+  return data.subarray(data.length >= from ? from : 0).toString('utf8');
+}
+
+/** Where a device trace began in the recorded steps: their size and inode then, and the trace's start time. */
+export interface StepsMark {
+  bytes: number;
+  ino?: number | undefined;
+  startedAt: number;
+}
+
+/**
+ * The recorded runs, one JSON line each, that were recorded since `mark`. While the file is the one the trace saw,
+ * those are the lines past its offset; once it was replaced (a cut, a clear), only the lines whose `at` is at or after
+ * the trace's start, since a cut keeps runs from before it.
+ */
+export function runsSince(file: string, mark: StepsMark): string {
+  let data: Buffer;
+  let ino: number;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      ino = fs.fstatSync(fd).ino;
+      data = fs.readFileSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+  const same =
+    (mark.ino === undefined || mark.ino === ino) &&
+    data.length >= mark.bytes &&
+    (mark.bytes === 0 || data[mark.bytes - 1] === NEWLINE);
+  if (same) return data.subarray(mark.bytes).toString('utf8');
+  return data
+    .toString('utf8')
+    .split('\n')
+    .slice(0, -1)
+    .filter(line => (recordedAt(line) ?? -Infinity) >= mark.startedAt)
+    .map(line => `${line}\n`)
+    .join('');
+}
+
+function recordedAt(line: string): number | undefined {
+  try {
+    const at = (JSON.parse(line) as { at?: unknown }).at;
+    return typeof at === 'number' ? at : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function inodeOf(file: string): number | undefined {

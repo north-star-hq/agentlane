@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { INIT_BACKUPS_KEPT, runAgentCommand } from '../../src/agents/cli.ts';
+import { backupProject } from '../../src/disk-limits.ts';
 import { hookCommand, mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills, stubOf } from '../../src/agents/skills.ts';
 import { tempDir } from '../support/fakes.ts';
@@ -278,7 +279,7 @@ model = "o4-mini"
     assert.equal(fs.readlinkSync(path.join(dir, '.claude/skills/device')), '../../.agents/skills/device');
     assert.match(fs.readFileSync(path.join(dir, '.claude/skills/device/SKILL.md'), 'utf8'), /agentlane skills get device/);
 
-    const backups = path.join(state, 'init-backups', '2026-10-12T09-00-00-000Z-app');
+    const backups = path.join(state, 'init-backups', `2026-10-12T09-00-00-000Z-${backupProject(dir)}`);
     assert.ok(run.stdout.includes(`Backed up the files it changed in ${backups}.`), run.stdout);
     assert.equal(fs.readFileSync(path.join(backups, '.codex/config.toml'), 'utf8'), toml);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(backups, '.codex/hooks.json'), 'utf8')), legacy);
@@ -297,8 +298,9 @@ test('init keeps the project’s newest backups, its own included, so the last i
   try {
     const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
     const backups = path.join(state, 'init-backups');
-    const earlier = Array.from({ length: 7 }, (_, i) => `2026-10-0${String(i + 1)}T09-00-00-000Z-app`);
-    for (const name of [...earlier, '2026-10-01T09-00-00-000Z-web']) fs.mkdirSync(path.join(backups, name), { recursive: true });
+    const earlier = Array.from({ length: 7 }, (_, i) => `2026-10-0${String(i + 1)}T09-00-00-000Z-${backupProject(dir)}`);
+    for (const name of [...earlier, '2026-10-01T09-00-00-000Z-web', '2026-10-01T09-00-00-000Z-app'])
+      fs.mkdirSync(path.join(backups, name), { recursive: true });
     const before = `${JSON.stringify({ mcpServers: { docs: { command: 'docs-mcp' } } }, null, 2)}\n`;
     write(dir, '.mcp.json', before);
     let stderr = '';
@@ -311,14 +313,73 @@ test('init keeps the project’s newest backups, its own included, so the last i
       now: () => Date.UTC(2026, 9, 12, 9, 0, 0),
     });
     assert.equal(code, 0, stderr);
-    const newest = '2026-10-12T09-00-00-000Z-app';
+    const newest = `2026-10-12T09-00-00-000Z-${backupProject(dir)}`;
     assert.deepEqual(fs.readdirSync(backups).sort(), [
+      '2026-10-01T09-00-00-000Z-app',
       '2026-10-01T09-00-00-000Z-web',
       ...earlier.slice(-(INIT_BACKUPS_KEPT - 1)),
       newest,
     ]);
     assert.equal(fs.readFileSync(path.join(backups, newest, '.mcp.json'), 'utf8'), before, 'the last init can be undone');
     assert.notEqual(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'), before);
+  } finally {
+    cleanup();
+  }
+});
+
+async function initAt(dir: string, env: NodeJS.ProcessEnv, day: number): Promise<void> {
+  write(dir, '.mcp.json', `${JSON.stringify({ mcpServers: { docs: { command: `docs-${String(day)}` } } }, null, 2)}\n`);
+  let stderr = '';
+  const code = await runAgentCommand('init', ['--agents', 'claude'], {
+    env,
+    cwd: dir,
+    install: recordingInstaller().install,
+    stdout: () => undefined,
+    stderr: text => (stderr += text),
+    now: () => Date.UTC(2026, 9, day, 9, 0, 0),
+  });
+  assert.equal(code, 0, stderr);
+}
+
+test('init in one project never removes the backups of another project with the same folder name', async () => {
+  const { dir: a, state, cleanup } = project();
+  try {
+    const b = path.join(path.dirname(a), 'b', 'app');
+    fs.mkdirSync(b, { recursive: true });
+    git(b, 'init', '-q');
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    await initAt(b, env, 1);
+    const [ofB, ...more] = fs.readdirSync(backups);
+    assert.ok(ofB !== undefined && more.length === 0);
+    for (let day = 2; day <= INIT_BACKUPS_KEPT + 3; day++) await initAt(a, env, day);
+    const names = fs.readdirSync(backups).sort();
+    assert.ok(names.includes(ofB), `the other project's backup stays: ${names.join(', ')}`);
+    assert.equal(names.filter(name => name.endsWith(backupProject(a))).length, INIT_BACKUPS_KEPT);
+    assert.equal(fs.readFileSync(path.join(backups, ofB, '.mcp.json'), 'utf8').includes('docs-1'), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test('init keeps the backup it just wrote even when older backups carry later stamps', async () => {
+  const { dir, state, cleanup } = project();
+  try {
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    const ahead = Array.from(
+      { length: INIT_BACKUPS_KEPT + 1 },
+      (_, i) => `2027-01-0${String(i + 1)}T09-00-00-000Z-${backupProject(dir)}`,
+    );
+    ahead.forEach((name, i) => {
+      fs.mkdirSync(path.join(backups, name), { recursive: true });
+      const at = new Date(Date.UTC(2026, 9, i + 1));
+      fs.utimesSync(path.join(backups, name), at, at);
+    });
+    await initAt(dir, env, 12);
+    const written = `2026-10-12T09-00-00-000Z-${backupProject(dir)}`;
+    assert.deepEqual(fs.readdirSync(backups).sort(), [...ahead.slice(-(INIT_BACKUPS_KEPT - 1)), written].sort());
+    assert.match(fs.readFileSync(path.join(backups, written, '.mcp.json'), 'utf8'), /docs-12/);
   } finally {
     cleanup();
   }
@@ -348,7 +409,7 @@ test('init refuses to replace a skill of the project’s own that shares a toolk
     const fixed = await init(dir, state, '--agents', 'claude');
     assert.equal(fixed.code, 0, fixed.stderr);
     assert.equal(fs.lstatSync(path.join(dir, '.claude/skills/dev-loop')).isSymbolicLink(), true);
-    const backups = path.join(state, 'init-backups', '2026-10-12T09-00-00-000Z-app');
+    const backups = path.join(state, 'init-backups', `2026-10-12T09-00-00-000Z-${backupProject(dir)}`);
     assert.equal(fs.readFileSync(path.join(backups, '.claude/skills/dev-loop/SKILL.md'), 'utf8'), stubOf(devLoop));
   } finally {
     cleanup();

@@ -149,10 +149,11 @@ test('recorded steps past their limit keep the newest runs, record save still wr
       assert.equal(ran.ok, true, ran.text);
       assert.ok(fs.statSync(paths.steps).size <= RECORDED_STEPS_LIMIT.keepBytes, String(fs.statSync(paths.steps).size));
       const lines = fs.readFileSync(paths.steps, 'utf8').split('\n').filter(Boolean);
-      const runs = lines.map(line => JSON.parse(line) as { yaml: string });
+      const runs = lines.map(line => JSON.parse(line) as { yaml: string; at?: number });
       assert.match(runs[0]?.yaml ?? '', /^appId: com\.apple\.Preferences\n---\n- assertVisible: Old \d+\n$/);
       assert.doesNotMatch(runs[0]?.yaml ?? '', /Old 0\n/, 'the oldest runs went');
       assert.match(runs.at(-1)?.yaml ?? '', /- assertVisible: General\n$/, 'the newest run stays');
+      assert.equal(typeof runs.at(-1)?.at, 'number', 'a recorded run carries when it was recorded, for a device trace');
 
       const shown = await callEngine(world.target(), { op: 'record', args: { action: 'show' } });
       assert.equal(shown.ok, true, shown.text);

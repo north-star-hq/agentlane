@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { keepNewestLines, type LineLimit } from '../disk-limits.ts';
+import { keepNewestLinesAsSoleWriter, type LineLimit } from '../disk-limits.ts';
 import { checkAbsent, readIn, treeBound } from './absence.ts';
 import { diffScreens, renderDiff, volatileBetween, type VolatileSet } from './diff.ts';
 import { messageOf } from './errors.ts';
@@ -396,8 +396,8 @@ export class DriverSession {
   private record(run: RecordedRun): void {
     if (run.passed === 0) return;
     fs.mkdirSync(path.dirname(this.stepsFile), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(this.stepsFile, `${JSON.stringify(run)}\n`);
-    keepNewestLines(this.stepsFile, RECORDED_STEPS_LIMIT);
+    fs.appendFileSync(this.stepsFile, `${JSON.stringify({ ...run, at: Date.now() })}\n`);
+    keepNewestLinesAsSoleWriter(this.stepsFile, RECORDED_STEPS_LIMIT);
   }
 
   async run(args: RunArgs): Promise<OpResult> {

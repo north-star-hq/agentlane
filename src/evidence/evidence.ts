@@ -21,6 +21,7 @@ import {
   newEvidenceFolder,
   readFrom,
   readInProgress,
+  runsSince,
   sizeOf,
   writeInProgress,
   type EvidenceTarget,
@@ -238,7 +239,10 @@ export async function stopTrace(ctx: EvidenceContext, target: EvidenceTarget): P
     kept.files.push(file);
   };
   write('driver.log', readFrom(files.log, started.driverLogBytes ?? 0));
-  write('flows.jsonl', readFrom(files.steps, started.stepsBytes ?? 0, started.stepsIno));
+  write(
+    'flows.jsonl',
+    runsSince(files.steps, { bytes: started.stepsBytes ?? 0, ino: started.stepsIno, startedAt: started.startedAt }),
+  );
   kept.files.push(...copyNewer(files.shots, path.join(dir, 'screenshots'), started.startedAt));
   try {
     const file = path.join(dir, 'device.log');

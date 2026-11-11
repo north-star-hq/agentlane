@@ -90,6 +90,8 @@ export interface RecordedRun {
   yaml: string;
   /** How many of the run's steps passed; every step when omitted. */
   passed?: number;
+  /** When the run was recorded, in ms since the epoch. */
+  at?: number;
 }
 
 export interface Recording {
