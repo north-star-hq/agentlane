@@ -62,6 +62,15 @@ function modified(file: string): number {
   }
 }
 
+function newestUnder(dir: string): number {
+  try {
+    const names = fs.readdirSync(dir, { recursive: true, encoding: 'utf8' });
+    return names.reduce((newest, name) => Math.max(newest, modified(path.join(dir, name))), modified(dir));
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
 function real(file: string): string | null {
   try {
     return fs.realpathSync(file);
@@ -73,7 +82,6 @@ function real(file: string): string | null {
 interface Toolkit {
   manifest: string;
   version: string;
-  /** The file the manifest's `bin` runs, resolved through links when it exists. */
   entry: string | null;
 }
 
@@ -110,6 +118,7 @@ function markHolds(mark: HookMark, bin: string, hookFile: string, now: number): 
     mark.version === toolkit.version &&
     mark.at >= modified(hookFile) &&
     [bin, toolkit.manifest, toolkit.entry].every(file => mark.at > modified(file)) &&
+    mark.at > newestUnder(path.dirname(toolkit.entry)) &&
     now - mark.at <= MARK_MAX_AGE_MS
   );
 }
@@ -273,8 +282,8 @@ function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv, now: numb
 
 /**
  * One line per agent: whether its hooks run. The mark the hook left for this project folder answers while it names the
- * file this project's toolkit runs, is newer than the hook, that file and the toolkit's manifest, names the toolkit's
- * version and is under a day old; otherwise doctor runs the guard hook on a command it allows.
+ * file this project's toolkit runs, is newer than the hook, the toolkit's manifest and everything in that file's folder,
+ * names the toolkit's version and is under a day old; otherwise doctor runs the guard hook on a command it allows.
  */
 export function agentHookChecks(
   root: string,

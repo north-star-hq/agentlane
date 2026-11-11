@@ -20,7 +20,6 @@ interface Claim {
   file: string;
 }
 
-/** Each claim on a key is an empty file `<key>.<n>`, dated by its mtime; only the highest `n` counts. */
 function claims(dir: string): Claim[] {
   return fs.readdirSync(dir).flatMap(name => {
     const match = /^([0-9a-f]{32})\.(\d{1,15})$/.exec(name);

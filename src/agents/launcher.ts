@@ -27,10 +27,10 @@ export const GUARDED_WORDS = [
 ] as const;
 
 /**
- * The hook's input arrives as JSON, which writes a backslash as `\\` and a newline as `\n`. Dropping those, then every
- * backslash, quote and `$` left, rejoins a tool name split by quotes, ANSI-C quotes, backslashes or line continuations.
+ * The hook's input arrives as JSON, which writes a backslash as `\\` and a newline as `\n`, and Copilot's `toolArgs` is
+ * JSON inside that JSON, which doubles each of those backslashes again.
  */
-export const UNSPLIT_SED = String.raw`sed -e 's/\\\\//g' -e 's/\\n//g' -e 's/\\//g' -e "s/[\$'\"]//g"`;
+export const UNSPLIT_SED = String.raw`sed -e h -e 's/\\\\//g' -e 's/\\n//g' -e x -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e G -e 's/\\//g' -e "s/[\$'\"]//g"`;
 
 const UNSPLIT_INPUT = `$(printf %s "$i" | ${UNSPLIT_SED})`;
 

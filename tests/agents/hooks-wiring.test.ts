@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import type { ChildProcess } from 'node:child_process';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import { promisify } from 'node:util';
 import { runAgentCommand } from '../../src/agents/cli.ts';
 import { agentHookChecks, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts';
 import { GUARDED_WORDS, hookCommand, UNSPLIT_SED } from '../../src/agents/launcher.ts';
 import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
+import { readHookInput } from '../../src/plugin/conventions.ts';
 import { runHookCommand } from '../../src/plugin/hook-cli.ts';
 import { writeHookMark } from '../../src/plugin/hook-mark.ts';
 import { systemProcesses } from '../../src/processes.ts';
@@ -19,9 +21,12 @@ import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { tempDir } from '../support/fakes.ts';
 import { hermeticEnv } from '../support/hermetic.ts';
+import type { HookInputShape } from '../support/hook-input.ts';
+import { DOCUMENTED_INPUT, formatsOf } from '../support/hook-input.ts';
 import { recordingInstaller } from '../support/installer.ts';
 import { toolkitEntry, writeToolkit } from '../support/toolkit.ts';
 
+const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const HOOK_SH = path.join(ROOT, 'plugin', 'scripts', 'hook.sh');
 const GIT_ENV = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
@@ -175,6 +180,7 @@ const SPLIT_NAMES = [
   "a$''db shell",
   "xcrun sim$'c'tl boot booted",
   'xcrun sim\\\nctl boot booted',
+  'a\\\ndb shell',
   `bash -c "a\\\ndb shell"`,
 ];
 
@@ -203,32 +209,35 @@ test('the guard hooks init writes start no node process for a command with no de
       CURSOR_PROJECT_DIR: dir,
     });
     for (const shell of SPLIT_NAMES) assert.notDeepEqual(aimsOf(shell, {}, dir), [], `the guard judges ${shell}`);
-    const input = (shell: string) => JSON.stringify({ cwd: dir, tool_input: { command: shell } });
     const routes = [
       ...AGENTS.map(agent => ({
         agent,
         command: hookCommandsOf(dir, agent, 'pre-tool-use')[0] ?? '',
         args: ` --agent ${agent}`,
+        formats: formatsOf(agent),
       })),
-      { agent: 'plugin', command: `"${HOOK_SH}" pre-tool-use`, args: '' },
+      { agent: 'plugin', command: `"${HOOK_SH}" pre-tool-use`, args: '', formats: formatsOf('claude') },
     ];
-    for (const { agent, command, args } of routes) {
+    for (const { agent, command, args, formats } of routes) {
       assert.ok(command, agent);
-      for (const plain of PLAIN) {
-        const quiet = sh(command, dir, env, input(plain));
-        assert.equal(quiet.status, 0, `${agent}: ${quiet.stderr}`);
-        assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
-        assert.deepEqual(calls(log), [], `${agent} started the toolkit or node for ${plain}`);
-      }
-      for (const shell of ['xcrun simctl boot booted', ...SPLIT_NAMES]) {
-        const device = sh(command, dir, env, input(shell));
-        assert.equal(device.status, 0, `${agent}: ${device.stderr}`);
-        assert.deepEqual(
-          calls(log),
-          [`toolkit hook pre-tool-use${args}`, `node hook pre-tool-use${args}`],
-          `${agent}: ${shell} reaches the guard`,
-        );
-        fs.rmSync(log);
+      for (const [format, shape] of formats) {
+        const input = (shell: string) => JSON.stringify(shape(shell, dir));
+        for (const plain of PLAIN) {
+          const quiet = sh(command, dir, env, input(plain));
+          assert.equal(quiet.status, 0, `${agent}, ${format}: ${quiet.stderr}`);
+          assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
+          assert.deepEqual(calls(log), [], `${agent}, ${format}: started the toolkit or node for ${plain}`);
+        }
+        for (const shell of ['xcrun simctl boot booted', ...SPLIT_NAMES]) {
+          const device = sh(command, dir, env, input(shell));
+          assert.equal(device.status, 0, `${agent}, ${format}: ${device.stderr}`);
+          assert.deepEqual(
+            calls(log),
+            [`toolkit hook pre-tool-use${args}`, `node hook pre-tool-use${args}`],
+            `${agent}, ${format}: ${shell} reaches the guard`,
+          );
+          fs.rmSync(log);
+        }
       }
     }
   } finally {
@@ -266,26 +275,84 @@ function filterOf(route: Agent | 'plugin'): { variable: string; filter: string }
   return { variable: 'i', filter: settings[1] };
 }
 
-test('every way of splitting a guarded tool name with quotes, backslashes or line continuations passes all seven guard filters', () => {
+function encodingOf(shape: HookInputShape, cwd: string): (command: string) => string {
+  const [before = '', after = '', ...rest] = JSON.stringify(shape('COMMAND', cwd)).split('COMMAND');
+  assert.deepEqual(rest, [], 'the shape names the command once');
+  return command => JSON.stringify(shape(command, cwd)).slice(before.length, -after.length || undefined);
+}
+
+test('every way of splitting a guarded tool name with quotes, backslashes or line continuations passes all seven guard filters, in every input shape the agents send, under /bin/sh and /bin/dash', async () => {
   const f = fixture('hooks-split-names');
   try {
     const bare = GUARDED_WORDS.flatMap(word => splitsOf(word).map(split => GUARDED_COMMANDS[word](split)));
     for (const command of bare) assert.notDeepEqual(aimsOf(command, {}, f.root), [], `the guard judges ${command}`);
     const cases = bare.flatMap(command => [command, `sh -c '${command}'`, `bash -c "${command}"`]);
-    const inputs = path.join(f.root, 'inputs');
-    fs.writeFileSync(
-      inputs,
-      cases.map(command => `${JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: f.root })}\n`).join(''),
-    );
-    const routes = [...AGENTS, 'plugin' as const].map(filterOf);
-    const distinct = new Map(routes.map(route => [`${route.variable}\0${route.filter}`, route]));
-    for (const { variable, filter } of distinct.values()) {
+    const runs = new Map<string, { variable: string; filter: string; format: string; shape: HookInputShape }>();
+    for (const route of [...AGENTS, 'plugin' as const]) {
+      const { variable, filter } = filterOf(route);
+      for (const [format, shape] of formatsOf(route === 'plugin' ? 'claude' : route)) {
+        for (const command of cases) assert.equal(readHookInput(JSON.stringify(shape(command, f.root))).command, command, format);
+        const encoded = cases.map(encodingOf(shape, f.root)).join('\n');
+        const key = `${variable}\0${filter}\0${encoded}`;
+        if (!runs.has(key)) runs.set(key, { variable, filter, format, shape });
+      }
+    }
+    assert.ok(runs.size >= 3, 'Copilot’s toolArgs and the plugin’s variable each make a run of their own');
+    const checks = [...runs.values()].flatMap(({ variable, filter, format, shape }, at) => {
+      const inputs = path.join(f.root, `inputs-${String(at)}`);
+      fs.writeFileSync(inputs, cases.map(command => `${JSON.stringify(shape(command, f.root))}\n`).join(''));
       const driver = `n=0; while IFS= read -r line; do n=$((n + 1)); ${variable}=$line; (\n${filter}\necho "$n"\n); done < "${inputs}"`;
-      const result = spawnSync('/bin/sh', ['-c', driver], { encoding: 'utf8', env: f.env() });
-      assert.equal(result.status, 0, result.stderr);
-      const passed = new Set(result.stdout.split('\n').filter(line => /^\d+$/.test(line)));
-      const skipped = cases.filter((_, at) => !passed.has(String(at + 1)));
-      assert.deepEqual(skipped, [], `the filter skips these:\n${filter}`);
+      return ['/bin/sh', '/bin/dash'].map(async shell => {
+        const { stdout } = await execFileAsync(shell, ['-c', driver], { encoding: 'utf8', env: f.env() });
+        const passed = new Set(stdout.split('\n').filter(line => /^\d+$/.test(line)));
+        const skipped = cases.filter((_, n) => !passed.has(String(n + 1)));
+        assert.deepEqual(skipped, [], `under ${shell}, in ${format}'s input, the filter skips these:\n${filter}`);
+      });
+    });
+    await Promise.all(checks);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('Copilot’s hook judges a tool name split by a line continuation inside its toolArgs', async () => {
+  const f = fixture('hooks-copilot-split');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'copilot');
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const unreadable = path.join(f.root, 'state-is-a-file');
+    fs.writeFileSync(unreadable, '');
+    const env = f.env({ AGENTLANE_STATE_DIR: unreadable });
+    const command = hookCommandsOf(dir, 'copilot', 'pre-tool-use')[0] ?? '';
+    const reply = sh(command, dir, env, JSON.stringify(DOCUMENTED_INPUT.copilot('a\\\ndb shell', dir)));
+    assert.equal(reply.status, 0, reply.stderr);
+    assert.deepEqual(calls(log), ['hook pre-tool-use --agent copilot']);
+    assert.match(reply.stderr, /the device guard failed, so this command runs unguarded/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('the one command the guard filters let through and the guard judges is a guarded command held whole in a variable of the agent host’s environment', () => {
+  const f = fixture('hooks-env-command');
+  try {
+    const host = { X: 'adb shell', Y: 'adb' };
+    const whole = ['sh -c "$X"', 'bash -c $X', 'sh -c "${X}"'];
+    for (const command of whole) assert.notDeepEqual(aimsOf(command, host, f.root), [], `the guard judges ${command}`);
+    for (const command of ['sh -c "$Y shell"', 'eval "$X"', 'sh -c "x$X"'])
+      assert.deepEqual(aimsOf(command, host, f.root), [], `the guard reads no part of a variable in ${command}`);
+    for (const route of [...AGENTS, 'plugin' as const]) {
+      const { variable, filter } = filterOf(route);
+      for (const command of whole) {
+        const input = JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: f.root });
+        const run = spawnSync('/bin/sh', ['-c', `${filter}\necho passed`], {
+          encoding: 'utf8',
+          env: { ...f.env(host), [variable]: input },
+        });
+        assert.equal(run.stdout.includes('passed'), false, `${route} lets ${command} through`);
+      }
     }
   } finally {
     f.cleanup();
@@ -693,6 +760,29 @@ test('under pnpm’s layout, doctor fails a hook once the file the shim runs bre
       gone.fix,
       `${entry}, the file ${path.join(store, 'package.json')} runs, is missing: install the project's dependencies again, or build the linked agentlane checkout, then node_modules/.bin/agentlane doctor`,
     );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('doctor fails a hook once a module the toolkit’s entry imports is removed after a good mark', async () => {
+  const f = fixture('hooks-entry-module');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    installToolkit(dir, path.join(f.root, 'calls.log'));
+    const entry = toolkitEntry(dir);
+    const module = path.join(path.dirname(entry), 'lib/dep.js');
+    write(module, 'export {};\n');
+    fs.writeFileSync(entry, `import './lib/dep.js';\n${fs.readFileSync(entry, 'utf8')}`);
+    const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+    assert.equal(check()?.ok, true, check()?.detail);
+    assert.match(check()?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /);
+
+    fs.rmSync(module);
+    const broken = check();
+    assert.equal(broken?.ok, false, broken?.detail);
+    assert.match(broken.detail, /never reached the toolkit: it exited 1: /);
   } finally {
     f.cleanup();
   }
