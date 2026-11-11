@@ -19,6 +19,7 @@ import {
 } from '../driver/superseded.ts';
 import { CLI, envName, TOOL } from '../name.ts';
 import { identityOf, systemProcesses, type ProcessTable } from '../processes.ts';
+import { EXECUTABLE_PATH_ENV } from './env.ts';
 import type { BrowserDriverName } from './kinds.ts';
 import {
   AGENT_BROWSER_RELEASE,
@@ -450,8 +451,9 @@ function linkPlaywright(base: string, core: string): void {
 /**
  * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
  * Then removes the older driver packages and browsers it installed that no running process, no file of a recorded
- * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses. Every older browser stays while a process or
- * lane runs agent-browser, of any version, without naming the browser it launches.
+ * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses. A running agent-browser keeps the browser its
+ * environment names, and every older browser stays while a process or a lane's file runs agent-browser, of any
+ * version, without naming the browser it launches.
  */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
@@ -534,7 +536,7 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
       laneTools: options.laneTools ?? laneToolsOf(options.env),
-      launchers: [{ dir: agentBrowsers, launches, needs: all }],
+      launchers: [{ dir: agentBrowsers, launches, variable: EXECUTABLE_PATH_ENV, needs: all }],
       log: options.log ?? (() => undefined),
     });
     for (const dir of removed.filter(d => path.dirname(d) === cores)) {

@@ -20,8 +20,9 @@ import { FORMER, TOOL } from '../../src/name.ts';
 import { lanesRoot } from '../../src/registry/paths.ts';
 import { Store } from '../../src/registry/store.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from '../../src/driver/release.ts';
+import type { RunningCommand } from '../../src/driver/superseded.ts';
 import type { ProcessTable } from '../../src/processes.ts';
-import { tempDir } from '../support/fakes.ts';
+import { runningCommands, tempDir } from '../support/fakes.ts';
 import { makeZip } from '../support/zip.ts';
 
 const VERSION = '9.9.9-agentenv.test';
@@ -195,7 +196,7 @@ test('a build whose --version is not the pinned version is refused', async () =>
 const OLDER = '9.9.8-agentenv.test';
 const NEWER = '9.10.0-agentenv.test';
 
-function nobodyRunning(): string[] {
+function nobodyRunning(): RunningCommand[] {
   return [];
 }
 
@@ -273,7 +274,7 @@ test('an install keeps the builds a running process uses, another process is ins
     release: current.release,
     download: serving(current.dir),
     processes,
-    commandLines: () => [running],
+    commandLines: runningCommands(running),
     log: line => lines.push(line),
   });
   assert.deepEqual(

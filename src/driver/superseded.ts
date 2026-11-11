@@ -4,24 +4,30 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { FORMER, TOOL } from '../name.ts';
-import type { ProcessIdentity, ProcessTable } from '../processes.ts';
+import { environmentOf, type ProcessIdentity, type ProcessTable } from '../processes.ts';
 import { databasePath, lanesRoot, STATE_DIR_ENV } from '../registry/paths.ts';
 import { bestEffort, tryLock, unlock } from './lock.ts';
 
-/** Every running process's command line, or undefined when they can't be read. */
-export type CommandLines = () => readonly string[] | undefined;
+export interface RunningCommand {
+  args: string;
+  /** The process's environment, where the OS shows it to its owner; undefined when it can't be read. */
+  environment: () => string | undefined;
+}
+
+/** Every running process, or undefined when they can't be read. */
+export type CommandLines = () => readonly RunningCommand[] | undefined;
 
 /**
- * The command lines in `ps -o pid=,args=` output; undefined unless it shows pid 1's arguments, so it can't see every
+ * The processes in `ps -o pid=,args=` output; undefined unless it shows pid 1's arguments, so it can't see every
  * process. macOS ps prints a process's name in parentheses in place of arguments it may not read.
  */
-export function commandLinesOf(output: string): readonly string[] | undefined {
+export function commandLinesOf(output: string): readonly { pid: number; args: string }[] | undefined {
   const rows = output
     .split('\n')
     .map(line => /^\s*(\d+)\s?(.*)$/.exec(line))
     .filter(row => row !== null);
   if (!rows.some(([, pid, args = '']) => pid === '1' && args.startsWith('/'))) return undefined;
-  return rows.map(([, , args = '']) => args).filter(args => args.trim() !== '');
+  return rows.map(([, pid = '', args = '']) => ({ pid: Number(pid), args })).filter(row => row.args.trim() !== '');
 }
 
 export const systemCommandLines: CommandLines = () => {
@@ -32,12 +38,13 @@ export const systemCommandLines: CommandLines = () => {
     maxBuffer: 64 * 1024 * 1024,
   });
   if (result.error || result.status !== 0) return undefined;
-  return commandLinesOf(result.stdout);
+  return commandLinesOf(result.stdout)?.map(({ pid, args }) => ({ args, environment: () => environmentOf(pid) }));
 };
 
 /**
- * What each lane recorded in a registry runs, one list a lane: the text, link target and real path of each file in its
- * `bin/`, and where its `browser/ffmpeg/ffmpeg` points; undefined when a registry or a lane's files can't be read.
+ * What the files of the lanes recorded in a registry run, one list a file: the text, link target and real path of each
+ * file in a lane's `bin/`, and where its `browser/ffmpeg/ffmpeg` points; undefined when a registry or a lane's files
+ * can't be read.
  */
 export type LaneTools = () => readonly (readonly string[])[] | undefined;
 
@@ -92,26 +99,25 @@ function targetsOf(file: string): string[] {
   return [linkTarget(file), realPath(file)].filter(target => target !== undefined);
 }
 
-function laneNames(lane: string): string[] {
-  const names: string[] = [];
+function laneFiles(lane: string): string[][] {
   const bin = path.join(lane, 'bin');
-  let files: string[] = [];
+  let names: string[] = [];
   try {
-    files = fs.readdirSync(bin);
+    names = fs.readdirSync(bin);
   } catch (error) {
     if (!absent(error)) throw error;
   }
-  for (const name of files) {
+  const files = names.map(name => {
     const file = path.join(bin, name);
-    names.push(...targetsOf(file));
+    const texts = targetsOf(file);
     try {
-      names.push(fs.readFileSync(file, 'utf8'));
+      texts.push(fs.readFileSync(file, 'utf8'));
     } catch (error) {
       if (!absent(error)) throw error;
     }
-  }
-  names.push(...targetsOf(path.join(lane, 'browser', 'ffmpeg', 'ffmpeg')));
-  return names;
+    return texts;
+  });
+  return [...files, targetsOf(path.join(lane, 'browser', 'ffmpeg', 'ffmpeg'))];
 }
 
 /**
@@ -120,19 +126,19 @@ function laneNames(lane: string): string[] {
  */
 export function laneToolsOf(env: NodeJS.ProcessEnv): LaneTools {
   return () => {
-    const lanes: string[][] = [];
+    const files: string[][] = [];
     for (const dir of registryDirs(env)) {
       const ids = recordedLaneIds(dir);
       if (ids === undefined) return undefined;
       for (const id of ids) {
         try {
-          lanes.push(laneNames(path.join(lanesRoot(dir), id)));
+          files.push(...laneFiles(path.join(lanesRoot(dir), id)));
         } catch {
           return undefined;
         }
       }
     }
-    return lanes;
+    return files;
   };
 }
 
@@ -209,14 +215,17 @@ export interface OlderVersion {
 
 /**
  * A tool whose versions find what they launch outside their command line and files, as agent-browser finds its browser
- * through a variable. A running process or recorded lane that names one of its versions and none of `launches` keeps
- * everything in `needs`.
+ * through a variable. A running process whose environment sets `variable` inside one of `launches` keeps that folder.
+ * A running process or a file of a recorded lane that names one of its versions and none of `launches`, and whose
+ * environment, if any, names none of them either, keeps everything in `needs`.
  */
 export interface Launcher {
   /** The folder the tool's versions are installed in. */
   dir: string;
   /** Folders the tool can launch; a user that names one of them has said what it runs. */
   launches: readonly string[];
+  /** The variable the tool's processes read what they launch from. */
+  variable: string;
   needs: readonly string[];
 }
 
@@ -233,12 +242,13 @@ export interface RemoveOptions {
 
 const REMOVING = '.removing-';
 
+/** The ways a file can spell a folder: as given, by its real path, and each as a single-quoted shell word quotes it. */
 function spellingsOf(dir: string): string[] {
-  const names = new Set([dir]);
+  const names = [dir];
   bestEffort(() => {
-    names.add(fs.realpathSync(dir));
+    names.push(fs.realpathSync(dir));
   });
-  return [...names];
+  return [...new Set(names.flatMap(name => [name, name.replaceAll("'", "'\\''")]))];
 }
 
 function mentions(spellings: readonly string[], texts: readonly string[]): boolean {
@@ -249,15 +259,36 @@ function inUse(dir: string, texts: readonly string[]): boolean {
   return mentions(spellingsOf(dir), texts);
 }
 
-/** What the launchers' users that don't name what they launch keep, with why. */
-function launched(launchers: readonly Launcher[], users: readonly (readonly string[])[]): Map<string, string> {
+/** Whether an environment, as ps or /proc shows it, sets a variable to a path inside one of a folder's spellings. */
+function setsInside(environment: string, variable: string, spellings: readonly string[]): boolean {
+  return spellings.some(name => ` ${environment}`.includes(` ${variable}=${name}${path.sep}`));
+}
+
+/**
+ * What the launchers' users keep, with why: what a running process's environment says it launches, and everything a
+ * launcher needs while a process or lane file runs it without naming what it launches. Each process and each file is
+ * judged on its own.
+ */
+function launched(
+  launchers: readonly Launcher[],
+  commands: readonly RunningCommand[],
+  files: readonly (readonly string[])[],
+): Map<string, string> {
   const needed = new Map<string, string>();
   for (const launcher of launchers) {
     const tool = spellingsOf(launcher.dir);
-    const launches = launcher.launches.map(spellingsOf);
-    if (users.some(user => mentions(tool, user) && !launches.some(dir => mentions(dir, user)))) {
-      for (const dir of launcher.needs) needed.set(dir, `which ${path.basename(launcher.dir)} may run`);
+    const launches = launcher.launches.map(dir => ({ dir, spellings: spellingsOf(dir) }));
+    const names = (texts: readonly string[]) => launches.some(launch => mentions(launch.spellings, texts));
+    let unnamed = files.some(file => mentions(tool, file) && !names(file));
+    for (const command of commands) {
+      if (!mentions(tool, [command.args]) || names([command.args])) continue;
+      const environment = command.environment();
+      const chosen =
+        environment === undefined ? [] : launches.filter(launch => setsInside(environment, launcher.variable, launch.spellings));
+      if (chosen.length === 0) unnamed = true;
+      for (const launch of chosen) needed.set(launch.dir, `which a running ${path.basename(launcher.dir)} launches`);
     }
+    if (unnamed) for (const dir of launcher.needs) needed.set(dir, `which ${path.basename(launcher.dir)} may run`);
   }
   return needed;
 }
@@ -329,7 +360,7 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
     options.log(`kept ${older.map(v => v.dir).join(', ')}: a registry could not say whether a lane uses them`);
     return [];
   }
-  const needed = launched(options.launchers ?? [], [...commands.map(command => [command]), ...lanes]);
+  const needed = launched(options.launchers ?? [], commands, lanes);
   const neededBy = (version: OlderVersion) => {
     for (const dir of version.needs ?? []) needed.set(dir, 'which a kept version runs');
   };
@@ -337,6 +368,7 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
     neededBy(version);
     options.log(`kept ${version.dir}, ${why}`);
   };
+  const commandTexts = commands.map(command => command.args);
   const laneTexts = lanes.flat();
   const removed: string[] = [];
   for (const version of [...older.filter(v => v.needs), ...older.filter(v => !v.needs)]) {
@@ -345,7 +377,7 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
       options.log(`kept ${version.dir}, ${why}`);
       continue;
     }
-    if (inUse(version.dir, commands)) {
+    if (inUse(version.dir, commandTexts)) {
       keep(version, 'which a running process uses');
       continue;
     }

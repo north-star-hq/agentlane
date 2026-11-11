@@ -87,6 +87,23 @@ export const systemProcesses: ProcessTable = {
   },
 };
 
+/** A process's environment, where the OS shows it to its owner; undefined when it can't be read. */
+export function environmentOf(pid: number): string | undefined {
+  if (process.platform === 'linux') {
+    try {
+      return fs.readFileSync(`/proc/${String(pid)}/environ`, 'utf8').replaceAll('\0', ' ');
+    } catch {
+      return undefined;
+    }
+  }
+  const result = spawnSync('ps', ['eww', '-o', 'command=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { PATH: `${process.env.PATH ?? ''}:/usr/bin:/bin`, LC_ALL: 'C' },
+    timeout: 10_000,
+  });
+  return result.status === 0 ? result.stdout : undefined;
+}
+
 export function identityOf(table: ProcessTable, pid: number): ProcessIdentity | undefined {
   const start = table.startTimes([pid])?.get(pid);
   return start === undefined ? undefined : { pid, start };

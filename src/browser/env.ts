@@ -12,7 +12,8 @@ export const BROWSER_SESSION_ENV = envName('BROWSER_SESSION');
 export const BROWSER_PROFILE_ENV = envName('BROWSER_PROFILE');
 export const BROWSER_CDP_ENV = envName('BROWSER_CDP');
 
-const EXECUTABLE_PATH_ENV = 'AGENT_BROWSER_EXECUTABLE_PATH';
+/** The variable agent-browser reads the browser it launches from. */
+export const EXECUTABLE_PATH_ENV = 'AGENT_BROWSER_EXECUTABLE_PATH';
 
 /** The lane's `bin/` file that names the browsers it was set up with, one executable a line. */
 const BROWSERS_RECORD = '.browsers';
