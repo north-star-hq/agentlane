@@ -18,7 +18,7 @@ export interface FreePoolDevice {
   id: string;
   deviceTypeName: string;
   runtimeName: string;
-  state: 'booted' | 'shutdown' | 'missing';
+  state: 'booted' | 'changing' | 'shutdown' | 'missing';
 }
 
 export interface KeptPoolDevice {
@@ -186,7 +186,7 @@ export function listPrunable(store: Store | null, dir: string, backends: Backend
           id,
           deviceTypeName: text(row, 'device_type_name'),
           runtimeName: text(row, 'runtime_name'),
-          state: device === undefined ? 'missing' : device.booted ? 'booted' : 'shutdown',
+          state: device === undefined ? 'missing' : device.booted ? 'booted' : device.stopped === true ? 'shutdown' : 'changing',
         });
       }
     }
@@ -228,7 +228,7 @@ export function deletePoolDevice(db: DatabaseSync, backend: DeviceBackend | unde
   if (present && present.name !== device.name) return result('kept', `${device.id} is named ${present.name} now`);
   if (present) {
     try {
-      if (present.booted) backend.shutdown(device.id);
+      if (present.stopped !== true) backend.shutdown(device.id);
       backend.delete(device.id);
     } catch (error) {
       return result('failed', messageOf(error));
@@ -631,6 +631,23 @@ function openFormerRegistries(ctx: PruneContext): OpenRegistry[] {
   return openRegistries(ctx.env, dirs, ctx.lockWaitMs);
 }
 
+function underFormerLocks<T extends object>(
+  ctx: PruneContext,
+  body: (opened: readonly OpenRegistry[]) => T,
+  failed: (error: unknown) => T,
+): T {
+  let opened: OpenRegistry[] = [];
+  const ran: { result?: T } = {};
+  try {
+    opened = openFormerRegistries(ctx);
+    return underLocks(opened, () => (ran.result = body(opened)));
+  } catch (error) {
+    return ran.result ?? failed(error);
+  } finally {
+    closeAll(opened);
+  }
+}
+
 const REFUSED = 'refused: it is not a folder 0.2.x leaves';
 
 function moveAside(env: NodeJS.ProcessEnv, leftover: Leftover): LeftoverStep {
@@ -654,12 +671,9 @@ function asFound(leftover: Leftover, why: string): LeftoverStep {
 export function moveLeftoversAside(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverStep[] {
   requireHome(ctx.env);
   if (leftovers.length === 0) return [];
-  const all = (outcome: SweepOutcome, detail: string): LeftoverResult[] =>
-    leftovers.map(leftover => ({ leftover, outcome, detail }));
-  let opened: OpenRegistry[] = [];
-  try {
-    opened = openFormerRegistries(ctx);
-    return underLocks(opened, (): LeftoverStep[] => {
+  return underFormerLocks(
+    ctx,
+    (opened): LeftoverStep[] => {
       const blocked = formerLanesIn(opened);
       return blocked === null
         ? leftovers.map(leftover => moveAside(ctx.env, leftover))
@@ -668,12 +682,9 @@ export function moveLeftoversAside(ctx: PruneContext, leftovers: readonly Leftov
             leftovers.map(leftover => asFound(leftover, blocked)),
             blocked,
           );
-    });
-  } catch (error) {
-    return all('failed', messageOf(error));
-  } finally {
-    closeAll(opened);
-  }
+    },
+    error => leftovers.map(leftover => ({ leftover, outcome: 'failed', detail: messageOf(error) })),
+  );
 }
 
 function renameBack(env: NodeJS.ProcessEnv, { leftover, aside }: AsideLeftover): string | null {
@@ -768,22 +779,17 @@ function isRemoval(step: LeftoverResult | Removal): step is Removal {
 export function finishLeftovers(ctx: PruneContext, steps: readonly LeftoverStep[]): LeftoverResult[] {
   requireHome(ctx.env);
   if (!steps.some(isAside)) return steps.filter((step): step is LeftoverResult => !isAside(step));
-  let opened: OpenRegistry[] = [];
-  let checked: (LeftoverResult | Removal)[];
   const restore = (why: string) => putBack(ctx.env, steps, why);
-  try {
-    opened = openFormerRegistries(ctx);
-    checked = underLocks(opened, () => {
+  const checked = underFormerLocks<(LeftoverResult | Removal)[]>(
+    ctx,
+    opened => {
       const blocked = formerLanesIn(opened);
       return blocked === null
         ? steps.map(step => (isAside(step) ? takeForRemoval(ctx.env, step) : step))
         : restore(`${blocked}, found after it was moved aside`);
-    });
-  } catch (error) {
-    checked = restore(`could not check every registry 0.2.x may use: ${messageOf(error)}`);
-  } finally {
-    closeAll(opened);
-  }
+    },
+    error => restore(`could not check every registry 0.2.x may use: ${messageOf(error)}`),
+  );
   return checked.map(step => (isRemoval(step) ? remove(ctx.env, step) : step));
 }
 
@@ -797,18 +803,14 @@ export function putBackAsideCopies(ctx: PruneContext, leftovers: readonly Leftov
     .filter(leftover => isAsideName(leftover.path) && !isBeingRemoved(leftover.path))
     .map(leftover => ({ leftover, aside: leftover.path }));
   if (copies.length === 0) return [];
-  let opened: OpenRegistry[] = [];
-  try {
-    opened = openFormerRegistries(ctx);
-    return underLocks(opened, () => {
+  return underFormerLocks(
+    ctx,
+    opened => {
       const blocked = formerLanesIn(opened);
       return blocked === null ? [] : putBack(ctx.env, copies, blocked);
-    });
-  } catch (error) {
-    return putBack(ctx.env, copies, `could not check every registry 0.2.x may use: ${messageOf(error)}`);
-  } finally {
-    closeAll(opened);
-  }
+    },
+    error => putBack(ctx.env, copies, `could not check every registry 0.2.x may use: ${messageOf(error)}`),
+  );
 }
 
 export function formatBytes(bytes: number | null): string {
@@ -829,6 +831,7 @@ function shownId(d: { name: string; id: string | null }): string {
 const STATE: Readonly<Record<FreePoolDevice['state'], string>> = {
   shutdown: 'shutdown',
   booted: 'booted, so it is shut down first',
+  changing: 'starting or stopping, so it is shut down first',
   missing: 'already deleted, so only its record goes',
 };
 
