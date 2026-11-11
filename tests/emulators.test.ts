@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { laneVariables } from '../src/hooks/env.ts';
-import { HOUR_MS, parseConfig, withProjectBlocks } from '../src/registry/config.ts';
+import { DEFAULT_CONFIG, HOUR_MS, parseConfig, withProjectBlocks } from '../src/registry/config.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { UsageError } from '../src/registry/refusal.ts';
 import type { LaneRequest } from '../src/registry/types.ts';
+import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
 import type { World } from './support/world.ts';
 import { world } from './support/world.ts';
 
@@ -273,4 +274,52 @@ test("the 'emulator' service name is reserved, and port blocks may not overlap t
   assert.deepEqual([base.emulatorPoolSize, base.memoryBudgetMb], [2, 12500]);
   assert.throws(() => parseConfig({ memoryBudgetGB: 2 }, 'config.json'), /at least 4/);
   assert.throws(() => withProjectBlocks(base, { admin: { first: 5500, last: 5560 } }, 'agentlane.json'), /emulator/);
+});
+
+test('an emulator still shutting down after its release keeps its console port pair, and its AVD, from the next Android lane', async () => {
+  const s = sharedRegistry({
+    ...DEFAULT_CONFIG,
+    blocks: { metro: { first: 47800, last: 47803 }, api: { first: 47900, last: 47903 } },
+  });
+  try {
+    const releaser = startClaimer(
+      s.plan(
+        [
+          {
+            kind: 'claim',
+            worktree: s.folder('releaser'),
+            platform: 'android',
+            device: 'pixel_8',
+            strict: false,
+            boot: true,
+            waitMs: 0,
+          },
+          { kind: 'release' },
+        ],
+        { gate: ['shutdown'] },
+      ),
+    );
+    const stopping = await s.reached('shutdown', releaser);
+    const serial = s.emulators.list().find(d => d.id === stopping)?.serial;
+    assert.ok(serial, 'the emulator is still running');
+
+    const next = await s.registry().claim({
+      owner: s.owner,
+      worktree: s.folder('next'),
+      projectRoot: s.folder('next'),
+      services: [{ name: 'metro', type: 'metro' }],
+      device: { platform: 'android' },
+      waitMs: 0,
+    });
+    assert.ok(next.lane.device?.serial);
+    assert.notEqual(next.lane.device.id, stopping);
+    assert.notEqual(next.lane.device.serial, serial);
+
+    s.open('shutdown');
+    const exit = await releaser.exited;
+    assert.equal(exit.code, 0, `${exit.stdout}${exit.stderr}`);
+    assert.equal(s.emulators.all().find(d => d.id === stopping)?.booted, false);
+  } finally {
+    s.close();
+  }
 });

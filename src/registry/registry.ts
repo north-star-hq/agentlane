@@ -10,6 +10,8 @@ import { identityOf } from '../processes.ts';
 import type { RegistryConfig } from './config.ts';
 import { DEVICE_MEMORY_MB, EMULATOR_PORTS, EMULATOR_SERVICE, emulatorSerial, loadConfig, poolCap } from './config.ts';
 import { formatAge, formatTime } from './format.ts';
+import type { DeviceLease, LeaseOutcome } from './leases.ts';
+import { allLeases, endLease, leaseDevice, leaseReservations, recoverLease } from './leases.ts';
 import type { Owner } from './owner.ts';
 import { describeOwner, describeState, isProven, judgeProcess, ownerKey, ownerState, worktreeState } from './owner.ts';
 import { configPath, diskNames } from './paths.ts';
@@ -56,6 +58,8 @@ export const STEPS = [
   'claim:inspected',
   'claim:locked',
   'claim:swept',
+  'claim:lease-committed',
+  'claim:stopped-device',
   'claim:ticketed',
   'claim:reserved',
   'claim:reserve-committed',
@@ -69,6 +73,7 @@ export const STEPS = [
   'release:locked',
   'release:ended',
   'release:committed',
+  'release:stopped-device',
   'touch:locked',
 ] as const;
 
@@ -91,8 +96,27 @@ interface Verdicts {
   table: ReadonlyMap<number, string> | undefined;
   lanes: ReadonlySet<string>;
   reservations: ReadonlySet<string>;
+  leases: ReadonlySet<string>;
   tickets: ReadonlySet<number>;
+  known: ReadonlyMap<string, string>;
 }
+
+type Listings = Map<Platform, BackendDevice[] | Error>;
+
+interface Recovery {
+  verdicts: Verdicts;
+  listings: Listings;
+}
+
+interface Creation {
+  kind: 'create';
+  backend: DeviceBackend;
+  name: string;
+  spec: DeviceSpec;
+  retire: DeviceLease | null;
+}
+
+type Settlement = { kind: 'created'; name: string; id: string } | { kind: 'lease'; lease: DeviceLease; outcome: LeaseOutcome };
 
 interface Caller {
   key: string;
@@ -115,9 +139,13 @@ interface Wait {
 }
 
 type AttemptResult =
-  { kind: 'done'; lane: Lane; created: boolean } | { kind: 'reserved' } | Wait | { kind: 'refused'; refusal: Refusal };
+  | { kind: 'done'; lane: Lane; created: boolean }
+  | Creation
+  | { kind: 'leased'; leases: DeviceLease[] }
+  | Wait
+  | { kind: 'refused'; refusal: Refusal };
 
-type DevicePlan = { kind: 'assign'; name: string } | { kind: 'reserved' } | Wait;
+type DevicePlan = { kind: 'assign'; name: string } | Creation | Wait;
 
 interface EmulatorPortPlan {
   add: number | null;
@@ -143,13 +171,14 @@ function gigabytes(mb: number): string {
   return `${String(Math.round(mb / 100) / 10)} GB`;
 }
 
-function listOrNothing(backend: DeviceBackend | undefined): BackendDevice[] {
-  try {
-    return backend?.list() ?? [];
-  } catch {
-    return [];
-  }
+function byId(devices: readonly BackendDevice[]): Map<string, BackendDevice> {
+  return new Map(devices.map(d => [d.id, d]));
 }
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 const DEFAULT_LOCK_WAIT_MS = 120_000;
 
 export class Registry {
@@ -222,16 +251,87 @@ export class Registry {
       if (pid !== null) pids.push(pid);
     }
     const reservations = new Set<string>();
-    for (const row of db.prepare('SELECT name, creator_pid FROM devices WHERE device_id IS NULL').all()) {
+    const known = new Map<string, string>();
+    for (const row of db.prepare('SELECT name, device_id, creator_pid FROM devices').all()) {
+      const id = optText(row, 'device_id');
+      if (id !== null) {
+        known.set(text(row, 'name'), id);
+        continue;
+      }
       reservations.add(text(row, 'name'));
       pids.push(int(row, 'creator_pid'));
+    }
+    const leases = new Set<string>();
+    for (const row of db.prepare('SELECT reservation, holder_pid FROM device_leases').all()) {
+      leases.add(text(row, 'reservation'));
+      pids.push(int(row, 'holder_pid'));
     }
     const tickets = new Set<number>();
     for (const row of db.prepare('SELECT ticket, waiter_pid FROM queue').all()) {
       tickets.add(int(row, 'ticket'));
       pids.push(int(row, 'waiter_pid'));
     }
-    return { table: pids.length === 0 ? new Map() : this.processes.startTimes(pids), lanes, reservations, tickets };
+    return {
+      table: pids.length === 0 ? new Map() : this.processes.startTimes(pids),
+      lanes,
+      reservations,
+      leases,
+      tickets,
+      known,
+    };
+  }
+
+  private hasDeviceRecords(platform: Platform): boolean {
+    const db = this.store.db;
+    return (
+      db.prepare('SELECT 1 FROM devices WHERE platform = ? LIMIT 1').get(platform) !== undefined ||
+      db.prepare('SELECT 1 FROM device_leases WHERE platform = ? LIMIT 1').get(platform) !== undefined
+    );
+  }
+
+  private listBeforeLock(wanted: DeviceBackend | null): Listings {
+    const listings: Listings = new Map();
+    for (const backend of Object.values(this.backends)) {
+      if (backend === wanted) {
+        listings.set(backend.platform, backend.list());
+        continue;
+      }
+      if (!this.hasDeviceRecords(backend.platform)) continue;
+      try {
+        listings.set(backend.platform, backend.list());
+      } catch (error) {
+        listings.set(backend.platform, asError(error));
+      }
+    }
+    return listings;
+  }
+
+  private recoveryBeforeLock(verdicts?: Verdicts): Recovery | null {
+    const db = this.store.db;
+    const holders = [
+      ...db.prepare('SELECT platform, creator_pid AS pid, creator_start AS start FROM devices WHERE device_id IS NULL').all(),
+      ...db.prepare('SELECT platform, holder_pid AS pid, holder_start AS start FROM device_leases').all(),
+    ];
+    if (holders.length === 0) return null;
+    const snapshot = verdicts ?? this.snapshotBeforeLock();
+    const platforms = new Set<Platform>();
+    for (const row of holders) {
+      if (isProven(judgeProcess({ pid: int(row, 'pid'), start: text(row, 'start') }, snapshot.table))) {
+        platforms.add(text(row, 'platform') as Platform);
+      }
+    }
+    if (platforms.size === 0) return null;
+    const listings: Listings = new Map();
+    for (const platform of platforms) {
+      const backend = this.backends[platform];
+      if (!backend) continue;
+      try {
+        listings.set(platform, backend.list());
+      } catch (error) {
+        listings.set(platform, asError(error));
+      }
+    }
+    return { verdicts: snapshot, listings };
   }
 
   private verdictFor(row: Row, verdicts: Verdicts) {
@@ -293,17 +393,29 @@ export class Registry {
     const me = this.self();
     const deadline = this.clock.now() + request.waitMs;
     const progress: Progress = { tookOver: [], freed: [], notes: [], replacedDriver: null };
+    const settling: Settlement[] = [];
+    const stopped = new Set<string>();
     try {
       for (;;) {
         const verdicts = this.snapshotBeforeLock();
+        const listings = this.listBeforeLock(backend);
         const listening = await this.probe.listening(
           this.candidatePorts([...request.services, ...browserServices(request)], request.device?.platform ?? null),
         );
         this.step('claim:inspected');
-        const result = this.store.write(() => this.attempt(request, caller, spec, backend, me, verdicts, listening, progress));
+        const result = this.store.write(() =>
+          this.attempt(request, caller, spec, backend, me, verdicts, listings, listening, settling, stopped, progress),
+        );
+        settling.length = 0;
         if (result.kind === 'refused') throw result.refusal;
-        if (result.kind === 'reserved') {
+        if (result.kind === 'leased') {
+          this.step('claim:lease-committed');
+          settling.push(...this.stopLeased(result.leases, progress.notes, 'claim:stopped-device', true));
+          continue;
+        }
+        if (result.kind === 'create') {
           this.step('claim:reserve-committed');
+          this.create(result, settling, progress.notes);
           continue;
         }
         if (result.kind === 'done') {
@@ -321,8 +433,77 @@ export class Registry {
         await this.clock.sleep(Math.min(this.pollMs, left));
       }
     } catch (error) {
-      this.abandon(me, backend);
+      this.abandon(me, settling);
       throw error;
+    }
+  }
+
+  private create(plan: Creation, settling: Settlement[], notes: string[]): void {
+    const { backend, retire, spec } = plan;
+    const noun = NOUN[backend.platform];
+    if (retire) {
+      try {
+        backend.delete(retire.id);
+      } catch (error) {
+        settling.push({ kind: 'lease', lease: retire, outcome: 'present' });
+        throw error;
+      }
+      settling.push({ kind: 'lease', lease: retire, outcome: 'gone' });
+      notes.push(
+        `replaced unclaimed pool ${noun} ${retire.name} (${retire.deviceTypeName}, ${retire.runtimeName}): the lane is strict and needs ${spec.deviceTypeName}, ${spec.runtimeName}`,
+      );
+      this.step('claim:retired-device');
+    }
+    const id = backend.create(plan.name, spec);
+    settling.push({ kind: 'created', name: plan.name, id });
+    this.step('claim:created-device');
+    notes.push(`created pool ${noun} ${plan.name} (${spec.deviceTypeName}, ${spec.runtimeName}, ${id})`);
+  }
+
+  private stopLeased(leases: readonly DeviceLease[], notes: string[], step: Step, unclaimed: boolean): Settlement[] {
+    return leases.map(lease => {
+      const noun = NOUN[lease.platform];
+      const what = unclaimed ? `unclaimed pool ${noun} ${lease.name}` : lease.name;
+      try {
+        this.backends[lease.platform]?.shutdown(lease.id);
+        if (unclaimed) notes.push(`shut down ${what}`);
+      } catch (error) {
+        notes.push(`could not shut down ${what}: ${asError(error).message}`);
+      }
+      this.step(step);
+      return { kind: 'lease', lease, outcome: 'present' };
+    });
+  }
+
+  private settle(settling: readonly Settlement[], me: ProcessIdentity, notes: string[]): void {
+    const db = this.store.db;
+    for (const s of settling) {
+      if (s.kind === 'lease') {
+        endLease(db, s.lease, s.outcome, me);
+        continue;
+      }
+      const settled = db
+        .prepare(
+          'UPDATE devices SET device_id = ?, creator_pid = NULL, creator_start = NULL WHERE name = ? AND device_id IS NULL AND creator_pid = ? AND creator_start = ?',
+        )
+        .run(s.id, s.name, me.pid, me.start);
+      if (settled.changes === 0 && !db.prepare('SELECT 1 FROM devices WHERE device_id = ?').get(s.id)) {
+        notes.push(`created ${s.name} (${s.id}), but its reservation had been dropped, so no pool record holds it`);
+      }
+    }
+  }
+
+  private settleNow(settling: readonly Settlement[], me: ProcessIdentity, notes: string[]): void {
+    if (settling.length === 0) return;
+    try {
+      this.store.write(() => {
+        this.settle(settling, me, notes);
+      });
+    } catch (error) {
+      const names = settling.map(s => (s.kind === 'lease' ? s.lease.name : s.name)).join(', ');
+      notes.push(
+        `could not return ${names} to the pool: ${asError(error).message}; the next claim or release after this process exits returns it`,
+      );
     }
   }
 
@@ -333,35 +514,55 @@ export class Registry {
       this.step('claim:booted');
     } catch (error) {
       if (created) {
-        this.store.write(() => {
+        const { leases } = this.store.write(() => {
           const row = this.store.db.prepare('SELECT * FROM claims WHERE id = ? AND token = ?').get(lane.id, lane.token);
-          if (row) this.endAndShutDown([row], 'released', caller, progress.notes);
+          return row ? this.endAndLease([row], 'released', caller) : { ended: [], leases: [] };
         });
+        this.finishRelease(leases, progress.notes);
       }
       throw error;
     }
   }
 
   cancelPending(): Error | null {
-    return this.abandon(this.self(), null);
+    return this.abandon(this.self(), []);
   }
 
-  private abandon(me: ProcessIdentity, backend: DeviceBackend | null): Error | null {
+  private abandon(me: ProcessIdentity, settling: readonly Settlement[]): Error | null {
     try {
-      this.store.write(() => {
-        const db = this.store.db;
-        db.prepare('DELETE FROM queue WHERE waiter_pid = ? AND waiter_start = ?').run(me.pid, me.start);
-        const rows = db
+      const db = this.store.db;
+      const settled = new Set(settling.map(s => (s.kind === 'lease' ? s.lease.reservation : s.name)));
+      const mine = (): Row[] =>
+        db
           .prepare('SELECT * FROM devices WHERE device_id IS NULL AND creator_pid = ? AND creator_start = ?')
-          .all(me.pid, me.start);
-        if (rows.length === 0) return;
-        for (const row of rows) {
-          this.settleReservation(row, listOrNothing(backend ?? this.backends[text(row, 'platform') as Platform]));
+          .all(me.pid, me.start)
+          .filter(row => !settled.has(text(row, 'name')));
+      const leftover = (): DeviceLease[] =>
+        allLeases(db).filter(l => l.holder.pid === me.pid && l.holder.start === me.start && !settled.has(l.reservation));
+      const platforms = new Set([...mine().map(r => text(r, 'platform') as Platform), ...leftover().map(l => l.platform)]);
+      const listings = new Map<Platform, BackendDevice[] | null>();
+      for (const platform of platforms) {
+        try {
+          listings.set(platform, this.backends[platform]?.list() ?? null);
+        } catch {
+          listings.set(platform, null);
+        }
+      }
+      this.store.write(() => {
+        db.prepare('DELETE FROM queue WHERE waiter_pid = ? AND waiter_start = ?').run(me.pid, me.start);
+        this.settle(settling, me, []);
+        for (const lease of leftover()) {
+          const listed = listings.get(lease.platform);
+          recoverLease(db, lease, listed ? byId(listed) : null);
+        }
+        const leased = leaseReservations(db);
+        for (const row of mine()) {
+          if (!leased.has(text(row, 'name'))) this.settleReservation(row, listings.get(text(row, 'platform') as Platform) ?? []);
         }
       });
       return null;
     } catch (cleanupError) {
-      return cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+      return asError(cleanupError);
     }
   }
 
@@ -372,15 +573,20 @@ export class Registry {
     backend: DeviceBackend | null,
     me: ProcessIdentity,
     verdicts: Verdicts,
+    listings: Listings,
     listening: ReadonlySet<number>,
+    settling: readonly Settlement[],
+    stopped: Set<string>,
     progress: Progress,
   ): AttemptResult {
     this.step('claim:locked');
     const db = this.store.db;
     const now = this.clock.now();
+    this.settle(settling, me, progress.notes);
     progress.freed.push(...this.sweep(verdicts, now, caller));
-    const listed = this.reconcileAll(verdicts, backend, progress.notes);
+    const { listed, leases } = this.reconcileAll(verdicts, backend, listings, me, now, stopped, progress.notes);
     this.step('claim:swept');
+    if (leases.length > 0) return { kind: 'leased', leases };
 
     const existing = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(caller.key, caller.worktree);
     const existingId = existing ? text(existing, 'id') : null;
@@ -389,7 +595,9 @@ export class Registry {
     if (existingId !== null) {
       held = db.prepare('SELECT * FROM devices WHERE claim_id = ?').get(existingId);
       const platform = held ? (text(held, 'platform') as Platform) : null;
-      if (held && platform === request.device?.platform && listed && !listed.has(text(held, 'device_id'))) {
+      const vanished =
+        held && verdicts.known.get(text(held, 'name')) === text(held, 'device_id') && !listed?.has(text(held, 'device_id'));
+      if (held && platform === request.device?.platform && listed && vanished) {
         db.prepare('DELETE FROM devices WHERE name = ?').run(text(held, 'name'));
         progress.notes.push(`your ${NOUN[platform]} ${text(held, 'name')} no longer exists; claiming another`);
         held = undefined;
@@ -530,7 +738,10 @@ export class Registry {
 
   private dropReservation(me: ProcessIdentity): void {
     this.store.db
-      .prepare('DELETE FROM devices WHERE device_id IS NULL AND creator_pid = ? AND creator_start = ?')
+      .prepare(
+        `DELETE FROM devices WHERE device_id IS NULL AND creator_pid = ? AND creator_start = ?
+           AND NOT EXISTS (SELECT 1 FROM device_leases l WHERE l.reservation = devices.name)`,
+      )
       .run(me.pid, me.start);
   }
 
@@ -551,56 +762,96 @@ export class Registry {
     return freed;
   }
 
-  private reconcileAll(verdicts: Verdicts, wanted: DeviceBackend | null, notes: string[]): Map<string, BackendDevice> | null {
-    let wantedList: Map<string, BackendDevice> | null = null;
-    for (const backend of Object.values(this.backends)) {
-      if (backend === wanted) {
-        wantedList = this.reconcile(backend, verdicts, notes);
+  private reconcileAll(
+    verdicts: Verdicts,
+    wanted: DeviceBackend | null,
+    listings: Listings,
+    me: ProcessIdentity,
+    now: number,
+    stopped: Set<string>,
+    notes: string[],
+  ): { listed: Map<string, BackendDevice> | null; leases: DeviceLease[] } {
+    let listed: Map<string, BackendDevice> | null = null;
+    const leases: DeviceLease[] = [];
+    for (const [platform, devices] of listings) {
+      if (devices instanceof Error) {
+        notes.push(`could not check the ${platform} pool: ${devices.message}`);
         continue;
       }
-      if (!this.store.db.prepare('SELECT 1 FROM devices WHERE platform = ? LIMIT 1').get(backend.platform)) continue;
-      try {
-        this.reconcile(backend, verdicts, notes);
-      } catch (error) {
-        notes.push(`could not check the ${backend.platform} pool: ${(error as Error).message}`);
+      const found = byId(devices);
+      this.recoverDead(platform, devices, found, verdicts, notes);
+      this.forgetMissing(platform, found, verdicts, notes);
+      if (platform === wanted?.platform) listed = found;
+      for (const row of this.store.db
+        .prepare('SELECT * FROM devices WHERE platform = ? AND device_id IS NOT NULL AND claim_id IS NULL ORDER BY name')
+        .all(platform)) {
+        const name = text(row, 'name');
+        if (stopped.has(name) || !found.get(text(row, 'device_id'))?.booted) continue;
+        const lease = leaseDevice(this.store.db, name, this.leaseName(name, 'shutdown', devices), 'shutdown', me, now);
+        if (!lease) continue;
+        stopped.add(name);
+        leases.push(lease);
       }
     }
-    return wantedList;
+    return { listed, leases };
   }
 
-  private reconcile(backend: DeviceBackend, verdicts: Verdicts, notes: string[]): Map<string, BackendDevice> {
+  private recoverDead(
+    platform: Platform,
+    devices: readonly BackendDevice[],
+    found: ReadonlyMap<string, BackendDevice>,
+    verdicts: Verdicts,
+    notes: string[],
+  ): void {
     const db = this.store.db;
-    const listed = backend.list();
-    const byId = new Map(listed.map(d => [d.id, d]));
-    for (const row of db.prepare('SELECT * FROM devices WHERE platform = ?').all(backend.platform)) {
-      const name = text(row, 'name');
-      const id = optText(row, 'device_id');
-      if (id === null) {
-        if (!verdicts.reservations.has(name)) continue;
-        const verdict = judgeProcess({ pid: int(row, 'creator_pid'), start: text(row, 'creator_start') }, verdicts.table);
-        if (isProven(verdict)) notes.push(this.settleReservation(row, listed));
-        continue;
-      }
-      const device = byId.get(id);
-      const claimed = optText(row, 'claim_id') !== null;
-      if (!device) {
-        if (!claimed) {
-          db.prepare('DELETE FROM devices WHERE name = ?').run(name);
-          notes.push(`forgot pool ${NOUN[backend.platform]} ${name}: it no longer exists`);
-        }
-        continue;
-      }
-      if (!claimed && device.booted) {
-        try {
-          backend.shutdown(id);
-          device.booted = false;
-          notes.push(`shut down unclaimed pool ${NOUN[backend.platform]} ${name}`);
-        } catch (error) {
-          notes.push(`could not shut down unclaimed pool ${NOUN[backend.platform]} ${name}: ${(error as Error).message}`);
-        }
-      }
+    for (const lease of allLeases(db)) {
+      if (lease.platform !== platform || !verdicts.leases.has(lease.reservation)) continue;
+      if (isProven(judgeProcess(lease.holder, verdicts.table))) notes.push(recoverLease(db, lease, found));
     }
-    return byId;
+    const leased = leaseReservations(db);
+    for (const row of db.prepare('SELECT * FROM devices WHERE platform = ? AND device_id IS NULL').all(platform)) {
+      const name = text(row, 'name');
+      if (leased.has(name) || !verdicts.reservations.has(name)) continue;
+      const verdict = judgeProcess({ pid: int(row, 'creator_pid'), start: text(row, 'creator_start') }, verdicts.table);
+      if (isProven(verdict)) notes.push(this.settleReservation(row, devices));
+    }
+  }
+
+  private forgetMissing(
+    platform: Platform,
+    found: ReadonlyMap<string, BackendDevice>,
+    verdicts: Verdicts,
+    notes: string[],
+  ): void {
+    const db = this.store.db;
+    for (const row of db.prepare('SELECT * FROM devices WHERE platform = ? AND device_id IS NOT NULL').all(platform)) {
+      const name = text(row, 'name');
+      const id = text(row, 'device_id');
+      if (found.has(id) || optText(row, 'claim_id') !== null || verdicts.known.get(name) !== id) continue;
+      db.prepare('DELETE FROM devices WHERE name = ?').run(name);
+      notes.push(`forgot pool ${NOUN[platform]} ${name}: it no longer exists`);
+    }
+  }
+
+  private recover(recovery: Recovery | null, notes: string[]): void {
+    if (!recovery) return;
+    for (const [platform, devices] of recovery.listings) {
+      if (devices instanceof Error) continue;
+      this.recoverDead(platform, devices, byId(devices), recovery.verdicts, notes);
+    }
+  }
+
+  private leaseName(name: string, work: DeviceLease['work'], listed: readonly BackendDevice[]): string {
+    const db = this.store.db;
+    const taken = new Set(listed.map(d => d.name));
+    let reservation: string;
+    do reservation = `${name}.${work}.${randomBytes(2).toString('hex')}`;
+    while (
+      taken.has(reservation) ||
+      db.prepare('SELECT 1 FROM devices WHERE name = ?').get(reservation) ||
+      db.prepare('SELECT 1 FROM device_leases WHERE reservation = ?').get(reservation)
+    );
+    return reservation;
   }
 
   private settleReservation(row: Row, listed: readonly BackendDevice[]): string {
@@ -731,10 +982,12 @@ export class Registry {
   }
 
   private memoryInUse(pool: readonly Row[], isMine: (row: Row) => boolean): number {
+    const leased = leaseReservations(this.store.db);
     let used = 0;
     for (const row of pool) {
       const busy = optText(row, 'claim_id') !== null || optText(row, 'device_id') === null;
-      if (busy && !isMine(row)) used += DEVICE_MEMORY_MB[text(row, 'platform') as Platform];
+      const deleting = leased.get(text(row, 'name')) === 'delete';
+      if (busy && !deleting && !isMine(row)) used += DEVICE_MEMORY_MB[text(row, 'platform') as Platform];
     }
     return used;
   }
@@ -777,13 +1030,18 @@ export class Registry {
     const aheadRow = db
       .prepare(
         `SELECT COUNT(*) AS ahead FROM queue q WHERE q.ticket < ? AND NOT EXISTS (
-           SELECT 1 FROM devices d WHERE d.device_id IS NULL AND d.creator_pid = q.waiter_pid AND d.creator_start = q.waiter_start)`,
+           SELECT 1 FROM devices d WHERE d.device_id IS NULL AND d.creator_pid = q.waiter_pid AND d.creator_start = q.waiter_start
+             AND NOT EXISTS (SELECT 1 FROM device_leases l WHERE l.reservation = d.name))`,
       )
       .get(ticket);
     const ahead = aheadRow ? int(aheadRow, 'ahead') : 0;
     const pool = db.prepare('SELECT * FROM devices ORDER BY created_at, name').all();
+    const leased = leaseReservations(db);
     const isMine = (r: Row) =>
-      optText(r, 'device_id') === null && optInt(r, 'creator_pid') === me.pid && optText(r, 'creator_start') === me.start;
+      optText(r, 'device_id') === null &&
+      optInt(r, 'creator_pid') === me.pid &&
+      optText(r, 'creator_start') === me.start &&
+      !leased.has(text(r, 'name'));
     const rows = pool.filter(r => text(r, 'platform') === platform);
     const mine = rows.find(isMine);
     const free = rows.filter(r => {
@@ -815,26 +1073,17 @@ export class Registry {
         );
         return { kind: 'assign', name: text(spare, 'name') };
       }
-      if (room > 0 || spare) {
-        if (!mine) return this.reserve(spec, backend, listed, me, now);
-        if (depth > 0) return { kind: 'reserved' };
-        if (room === 0 && spare) {
-          const retired = text(spare, 'device_id');
-          backend.delete(retired);
-          listed.delete(retired);
-          db.prepare('DELETE FROM devices WHERE name = ?').run(text(spare, 'name'));
-          progress.notes.push(
-            `replaced unclaimed pool ${noun} ${text(spare, 'name')} (${text(spare, 'device_type_name')}, ${text(spare, 'runtime_name')}): the lane is strict and needs ${spec.deviceTypeName}, ${spec.runtimeName}`,
-          );
-          this.step('claim:retired-device');
-        }
-        const name = text(mine, 'name');
-        const id = backend.create(name, spec);
-        this.step('claim:created-device');
-        db.prepare('UPDATE devices SET device_id = ?, creator_pid = NULL, creator_start = NULL WHERE name = ?').run(id, name);
-        listed.set(id, { id, name, deviceType: spec.deviceType, runtime: spec.runtime, booted: false });
-        progress.notes.push(`created pool ${noun} ${name} (${spec.deviceTypeName}, ${spec.runtimeName}, ${id})`);
-        return { kind: 'assign', name };
+      if (room > 0) return this.reserve(spec, backend, listed, me, now, mine, null);
+      if (spare) {
+        const retire = leaseDevice(
+          db,
+          text(spare, 'name'),
+          this.leaseName(text(spare, 'name'), 'delete', [...listed.values()]),
+          'delete',
+          me,
+          now,
+        );
+        if (retire) return this.reserve(spec, backend, listed, me, now, mine, retire);
       }
     }
     if (depth === 0) {
@@ -861,8 +1110,21 @@ export class Registry {
     listed: Map<string, BackendDevice>,
     me: ProcessIdentity,
     now: number,
-  ): DevicePlan {
+    mine: Row | undefined,
+    retire: DeviceLease | null,
+  ): Creation {
     const db = this.store.db;
+    if (mine) {
+      const name = text(mine, 'name');
+      db.prepare('UPDATE devices SET device_type = ?, device_type_name = ?, runtime = ?, runtime_name = ? WHERE name = ?').run(
+        spec.deviceType,
+        spec.deviceTypeName,
+        spec.runtime,
+        spec.runtimeName,
+        name,
+      );
+      return { kind: 'create', backend, name, spec, retire };
+    }
     const taken = new Set([...listed.values()].map(d => d.name));
     let name: string;
     do {
@@ -874,7 +1136,7 @@ export class Registry {
        VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, ?)`,
     ).run(name, backend.platform, spec.deviceType, spec.deviceTypeName, spec.runtime, spec.runtimeName, me.pid, me.start, now);
     this.step('claim:reserved');
-    return { kind: 'reserved' };
+    return { kind: 'create', backend, name, spec, retire };
   }
 
   private end(row: Row, reason: EndReason, by: Caller, now: number): EndedLane {
@@ -921,23 +1183,27 @@ export class Registry {
     return ended;
   }
 
-  private endAndShutDown(rows: readonly Row[], reason: EndReason, by: Caller, notes: string[]): EndedLane[] {
+  private endAndLease(rows: readonly Row[], reason: EndReason, by: Caller): { ended: EndedLane[]; leases: DeviceLease[] } {
     const db = this.store.db;
     const now = this.clock.now();
-    return rows.map(row => {
+    const leases: DeviceLease[] = [];
+    const ended = rows.map(row => {
       const device = db.prepare('SELECT * FROM devices WHERE claim_id = ?').get(text(row, 'id'));
-      const ended = this.end(row, reason, by, now);
+      const lane = this.end(row, reason, by, now);
       this.step('release:ended');
-      const backend = device ? this.backends[text(device, 'platform') as Platform] : undefined;
-      if (device && backend) {
-        try {
-          backend.shutdown(text(device, 'device_id'));
-        } catch (error) {
-          notes.push(`could not shut down ${text(device, 'name')}: ${(error as Error).message}`);
-        }
+      if (device && this.backends[text(device, 'platform') as Platform]) {
+        const name = text(device, 'name');
+        const lease = leaseDevice(db, name, this.leaseName(name, 'shutdown', []), 'shutdown', this.self(), now);
+        if (lease) leases.push(lease);
       }
-      return ended;
+      return lane;
     });
+    return { ended, leases };
+  }
+
+  private finishRelease(leases: readonly DeviceLease[], notes: string[]): void {
+    if (leases.length === 0) return;
+    this.settleNow(this.stopLeased(leases, notes, 'release:stopped-device', false), this.self(), notes);
   }
 
   private holderOf(row: Row, now: number): Holder {
@@ -1087,44 +1353,58 @@ export class Registry {
 
   release(ref: LaneRef, by: Owner, notes: string[] = []): EndedLane {
     const caller = this.caller(by, '');
-    const [ended] = this.store.write(() => {
+    const recovery = this.recoveryBeforeLock();
+    const {
+      ended: [ended],
+      leases,
+    } = this.store.write(() => {
       this.step('release:locked');
+      this.recover(recovery, notes);
       const row = this.requireLane(ref);
       caller.worktree = text(row, 'worktree');
-      return this.endAndShutDown([row], 'released', caller, notes);
+      return this.endAndLease([row], 'released', caller);
     });
     this.step('release:committed');
+    this.finishRelease(leases, notes);
     if (!ended) throw new Error(`releasing lane ${ref.id} ended nothing`);
     return ended;
   }
 
   releaseOwn(owner: Owner, worktree: string | null, notes: string[] = []): EndedLane[] {
     const caller = this.caller(owner, worktree ?? '');
-    const ended = this.store.write(() => {
+    const recovery = this.recoveryBeforeLock();
+    const { ended, leases } = this.store.write(() => {
       this.step('release:locked');
+      this.recover(recovery, notes);
       const db = this.store.db;
       const rows =
         worktree === null
           ? db.prepare('SELECT * FROM claims WHERE owner_key = ? ORDER BY created_at').all(caller.key)
           : db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').all(caller.key, worktree);
-      return this.endAndShutDown(rows, 'released', caller, notes);
+      return this.endAndLease(rows, 'released', caller);
     });
     this.step('release:committed');
+    this.finishRelease(leases, notes);
     return ended;
   }
 
   releaseById(id: string, by: Owner, force: boolean, notes: string[] = []): EndedLane {
     const caller = this.caller(by, '');
     const verdicts = this.snapshotBeforeLock();
-    const [ended] = this.store.write(() => {
+    const recovery = this.recoveryBeforeLock(verdicts);
+    const {
+      ended: [ended],
+      leases,
+    } = this.store.write(() => {
       this.step('release:locked');
+      this.recover(recovery, notes);
       const row = this.store.db.prepare('SELECT * FROM claims WHERE id = ?').get(id);
       if (!row) throw this.laneGone(id);
       caller.worktree = text(row, 'worktree');
-      if (text(row, 'owner_key') === caller.key) return this.endAndShutDown([row], 'released', caller, notes);
+      if (text(row, 'owner_key') === caller.key) return this.endAndLease([row], 'released', caller);
       const state = ownerState(this.verdictFor(row, verdicts), worktreeState(text(row, 'worktree')));
-      if (isProven(state)) return this.endAndShutDown([row], state, caller, notes);
-      if (force) return this.endAndShutDown([row], 'forced', caller, notes);
+      if (isProven(state)) return this.endAndLease([row], state, caller);
+      if (force) return this.endAndLease([row], 'forced', caller);
       const now = this.clock.now();
       const forced = `${CLI} release --lane ${id} --force`;
       if (state === 'cant-tell') {
@@ -1146,6 +1426,7 @@ export class Registry {
       );
     });
     this.step('release:committed');
+    this.finishRelease(leases, notes);
     if (!ended) throw new Error(`releasing lane ${id} ended nothing`);
     return ended;
   }
