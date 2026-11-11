@@ -1191,7 +1191,7 @@ export class Registry {
   /**
    * Records that a check at `at` found the lane's recorded process for `proc.service` running with `proc`'s pid and
    * start time. Only a later moment replaces an earlier one, and nothing is written unless the lane still records that
-   * very process; returns whether it was written.
+   * very process; returns whether the stored moment changed.
    */
   recordLeaderAlive(laneId: string, proc: ServiceProcess, at: number): boolean {
     return this.store.write(() => {
@@ -1199,11 +1199,8 @@ export class Registry {
         .prepare(
           `INSERT INTO process_alive (claim_id, service, pid, start, alive_at)
            SELECT claim_id, service, pid, start, ? FROM processes WHERE claim_id = ? AND service = ? AND pid = ? AND start = ?
-           ON CONFLICT (claim_id, service) DO UPDATE SET
-             alive_at = CASE WHEN pid = excluded.pid AND start = excluded.start THEN max(alive_at, excluded.alive_at)
-                        ELSE excluded.alive_at END,
-             pid = excluded.pid,
-             start = excluded.start`,
+           ON CONFLICT (claim_id, service) DO UPDATE SET pid = excluded.pid, start = excluded.start, alive_at = excluded.alive_at
+           WHERE NOT (pid = excluded.pid AND start = excluded.start AND alive_at >= excluded.alive_at)`,
         )
         .run(at, laneId, proc.service, proc.pid, proc.start);
       return Number(written.changes) > 0;

@@ -614,7 +614,8 @@ test("the moment a service's process was last seen running is kept for that proc
     w.registry().recordProcess(ref, metro);
     assert.equal(w.registry().recordLeaderAlive(ref.id, { ...metro, start: 'Mon Oct 12 09:00:01 2026' }, 1000), false);
     assert.equal(w.registry().recordLeaderAlive(ref.id, metro, 2000), true);
-    w.registry().recordLeaderAlive(ref.id, metro, 1500);
+    assert.equal(w.registry().recordLeaderAlive(ref.id, metro, 1500), false, 'recording an older moment reported a change');
+    assert.equal(w.registry().recordLeaderAlive(ref.id, metro, 2000), false);
     assert.deepEqual(seen(), [[4242, 2000]]);
 
     const db = new DatabaseSync(databasePath(w.dir));
@@ -639,6 +640,20 @@ test("the moment a service's process was last seen running is kept for that proc
       null,
     );
     assert.deepEqual(seen(), [[4242, 2000]]);
+    const restarted = { ...metro, pid: 4343, start: 'Mon Oct 12 10:00:00 2026' };
+    db.prepare('INSERT OR REPLACE INTO processes (claim_id, service, pid, start, cwd) VALUES (?, ?, ?, ?, ?)').run(
+      ref.id,
+      'metro',
+      restarted.pid,
+      restarted.start,
+      null,
+    );
+    assert.equal(
+      w.registry().recordLeaderAlive(ref.id, restarted, 500),
+      true,
+      "the old process's later moment blocked the new one's",
+    );
+    assert.deepEqual(seen(), [[4343, 500]]);
     w.registry().forgetProcess(ref, 'metro');
     w.registry().recordProcess(ref, metro);
     assert.deepEqual(seen(), [[4242, undefined]]);
