@@ -53,7 +53,7 @@ import type {
 import type { ServiceSystem } from './services/system.ts';
 import { realServiceSystem } from './services/system.ts';
 import type { Teardown } from './up/release.ts';
-import { pruneEndedLaneFiles } from './up/lane-files.ts';
+import { LANE_FILES_KEEP_MS, pruneEndedLaneFiles } from './up/lane-files.ts';
 import { tearDownLane } from './up/release.ts';
 import { tearDownEndedResources } from './up/resources.ts';
 import { runSweep, SWEEP_INTERVAL_MS } from './up/sweep.ts';
@@ -686,12 +686,7 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
         ];
         for (const t of stopped)
           for (const line of [...t.notes, ...t.problems]) deps.stderr(`${TOOL}: lane ${t.lane}: ${line}\n`);
-        pruneEndedLaneFiles(
-          state,
-          new Set([...registry.status().lanes.map(c => c.id), ...registry.pendingTeardowns().map(t => t.lane)]),
-          now(deps),
-          deps.env,
-        );
+        pruneEndedLaneFiles(state, registry.keptLaneIds(now(deps) - LANE_FILES_KEEP_MS), now(deps), deps.env);
         return 0;
       } finally {
         stop?.();

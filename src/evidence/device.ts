@@ -4,6 +4,7 @@ import type { Clock } from '../clock.ts';
 import { DriverError } from '../driver/errors.ts';
 import { isAlive, runCommand, tail, type Ran } from '../driver/exec.ts';
 import { TOOL } from '../name.ts';
+import { runningStartTimes } from '../processes.ts';
 import type { InProgress } from './files.ts';
 
 /** The commands device evidence runs, and the processes it starts and stops; tests replace it. */
@@ -13,6 +14,8 @@ export interface EvidenceSystem {
   start(command: string, args: readonly string[], log: string): number | undefined;
   /** The command line a process runs, or undefined when it doesn't. */
   commandOf(pid: number): string | undefined;
+  /** The start times of those of `pids` still running, by pid; undefined when ps can't read them. */
+  startTimes(pids: readonly number[]): ReadonlyMap<number, string> | undefined;
   signal(pid: number, signal: NodeJS.Signals): void;
 }
 
@@ -38,6 +41,7 @@ export const realEvidenceSystem: EvidenceSystem = {
     });
     return result.status === 0 && result.stdout.trim() !== '' ? result.stdout.trim() : undefined;
   },
+  startTimes: runningStartTimes,
   signal(pid, signal) {
     try {
       process.kill(pid, signal);
@@ -102,6 +106,7 @@ export async function startDeviceVideo(
       target.platform === 'ios' ? 'check that the simulator is booted' : 'check that the emulator is booted',
     );
   }
+  const start = system.startTimes([pid])?.get(pid);
   return {
     version: 1,
     target: 'device',
@@ -109,6 +114,7 @@ export async function startDeviceVideo(
     file,
     pid,
     command: running,
+    ...(start === undefined ? {} : { start }),
     platform: target.platform,
     device: target.device,
     ...(target.platform === 'android' ? { remote } : {}),

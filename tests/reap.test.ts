@@ -216,6 +216,10 @@ class Recorders implements EvidenceSystem {
     return this.running.get(pid);
   }
 
+  startTimes(pids: readonly number[]): ReadonlyMap<number, string> {
+    return new Map(pids.filter(pid => this.running.has(pid)).map(pid => [pid, `started #${String(pid)}`]));
+  }
+
   signal(pid: number): void {
     this.running.delete(pid);
   }

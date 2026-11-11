@@ -50,12 +50,12 @@ import { formatAge, shellQuote } from '../registry/format.ts';
 import { resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
-import { readRegistryStatus, Registry } from '../registry/registry.ts';
+import { Registry } from '../registry/registry.ts';
 import { keepTouching, recordCall } from '../registry/touch.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
-import { laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
+import { LANE_FILES_KEEP_MS, laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
 import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
 import { rememberAnswers } from './answers.ts';
 import type { EnvDeps } from './deps.ts';
@@ -687,17 +687,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
       pinned: previous?.pinned ?? false,
       updatedAt: deps.clock.now(),
     });
-    pruneEndedLaneFiles(
-      state,
-      new Set([
-        ...readRegistryStatus({ dir: state, processes: deps.processes, config: registryConfig, clock: deps.clock }).lanes.map(
-          c => c.id,
-        ),
-        ...registry.pendingTeardowns().map(t => t.lane),
-      ]),
-      deps.clock.now(),
-      deps.env,
-    );
+    pruneEndedLaneFiles(state, registry.keptLaneIds(deps.clock.now() - LANE_FILES_KEEP_MS), deps.clock.now(), deps.env);
     const ctx: Ctx = {
       deps,
       registry,
