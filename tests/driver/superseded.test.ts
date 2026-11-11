@@ -41,9 +41,10 @@ test('a prerelease orders before its release, and the toolkit’s own builds aft
   assert.ok(compareVersions('2.12.1-agentenv.1', '2.11.0-agentlane.9') > 0);
 });
 
-test('a process table that does not show pid 1 counts as unreadable', () => {
+test('a process table that does not show pid 1, or shows it without its arguments, counts as unreadable', () => {
   assert.equal(commandLinesOf('  412 /usr/bin/node cli.js\n  413 sleep 30\n'), undefined);
   assert.equal(commandLinesOf(''), undefined);
+  assert.equal(commandLinesOf('    1 (launchd)\n  412 /usr/bin/node cli.js\n'), undefined);
   assert.deepEqual(commandLinesOf('    1 /sbin/launchd\n  412 /usr/bin/node cli.js\n  999 \n'), [
     '/sbin/launchd',
     '/usr/bin/node cli.js',
@@ -58,7 +59,7 @@ function options(root: string | undefined, lines: string[]): RemoveOptions {
     me: { pid: process.pid, start: 'me' },
     processes: nobody,
     commandLines: () => [],
-    laneMaestros: () => [],
+    laneTools: () => [],
     log: line => lines.push(line),
   };
 }
@@ -122,7 +123,7 @@ test('a version kept for any reason keeps the folders it needs, and one removed 
       ...options(root, lines),
       processes: { startTimes: () => new Map([[999_999, 'other']]), info: () => undefined, cwd: () => undefined },
       commandLines: () => [`node ${used ?? ''}/package/cli.js daemon`],
-      laneMaestros: () => [`#!/bin/sh\nmaestro='${shim}/bin/tool'\n`],
+      laneTools: () => [`#!/bin/sh\nmaestro='${shim}/bin/tool'\n`],
     },
   );
   assert.deepEqual(removed.sort(), [unused, forUnused].sort(), lines.join('\n'));
@@ -134,7 +135,7 @@ test('a registry that cannot say whether a lane uses a version keeps every versi
   const root = fs.realpathSync(tempDir('superseded-registry'));
   const old = version(path.join(root, 'maestro'), '1.0.0');
   const lines: string[] = [];
-  assert.deepEqual(removeOlderVersions([{ dir: old }], { ...options(root, lines), laneMaestros: () => undefined }), []);
+  assert.deepEqual(removeOlderVersions([{ dir: old }], { ...options(root, lines), laneTools: () => undefined }), []);
   assert.equal(fs.existsSync(old), true);
   assert.match(lines.join('\n'), /a registry could not say whether a lane uses them/);
 });

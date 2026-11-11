@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import { writeDriverFiles } from '../../src/browser/env.ts';
 import {
   browsersPath,
   describeInstallState,
@@ -11,9 +12,13 @@ import {
   installState,
   type BrowserInstallOptions,
   type Fetcher,
+  type InstalledDriver,
 } from '../../src/browser/install.ts';
+import { browserPaths, type BrowserPaths } from '../../src/browser/paths.ts';
 import type { AgentBrowserRelease, BrowserBuild, PlaywrightRelease } from '../../src/browser/release.ts';
 import { DriverError } from '../../src/driver/errors.ts';
+import { FORMER } from '../../src/name.ts';
+import { Store } from '../../src/registry/store.ts';
 import { tempDir } from '../support/fakes.ts';
 import { makeZip } from '../support/zip.ts';
 
@@ -289,10 +294,11 @@ function later(
   s: Served,
   version: string,
   revision: string,
+  pins = browsersJson(revision, revision),
 ): { playwright: PlaywrightRelease; agentBrowser: AgentBrowserRelease } {
   const core = tgz(s.root, `playwright-core-${version}.tgz`, {
     'lib/tools/cli-client/cli.js': 'console.log("cli")\n',
-    'browsers.json': browsersJson(revision, revision),
+    'browsers.json': pins,
   });
   const ab = tgz(s.root, `agent-browser-${version}.tgz`, { 'bin/agent-browser-test-host': '#!/bin/sh\n' });
   const archive = (file: string, executable: string[]) => ({
@@ -426,10 +432,113 @@ test('an older playwright-core kept by a running daemon keeps the browsers it pi
 
 test('a newer playwright-core keeps the browsers it pins from an install of older pins', async () => {
   const s = served();
-  const next = later(s, '9.10.0', '3');
-  const b = await ensureBrowserDriver('playwright', s.options({ ...next, commandLines: nobodyRunning }));
-  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+  const first = await ensureBrowserDriver('playwright', s.options({ ...later(s, '9.8.0', '0'), commandLines: nobodyRunning }));
+  const pins = JSON.stringify({
+    browsers: [
+      { name: 'chromium', revision: '3', installByDefault: true, revisionOverrides: { 'mac-test': '0' } },
+      { name: 'chromium-headless-shell', revision: '3', installByDefault: true },
+      { name: 'ffmpeg', revision: '3', installByDefault: true },
+    ],
+  });
+  const next = later(s, '9.10.0', '3', pins);
+  const b = await ensureBrowserDriver('playwright', s.options({ ...next, commandLines: () => [`node ${first.cli[1] ?? ''}`] }));
+  assert.ok(fs.existsSync(first.chrome));
+  const lines: string[] = [];
+  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning, log: line => lines.push(line) }));
   assert.equal(installState(s.env, 'playwright', { ...next, host: HOST }).kind, 'installed');
   assert.ok(fs.existsSync(b.chrome));
   assert.ok(fs.existsSync(a.chrome));
+  assert.ok(fs.existsSync(first.chrome), lines.join('\n'));
+  assert.equal(fs.existsSync(first.headlessShell), false, lines.join('\n'));
+  assert.ok(
+    lines.includes(`removed ${path.dirname(path.dirname(first.headlessShell))}, which this version supersedes`),
+    lines.join('\n'),
+  );
+});
+
+/** A lane recorded in the registry in `dir` with the browser files `up` writes for `install`. */
+function laneUp(dir: string, id: string, driver: 'playwright' | 'agent-browser', install: InstalledDriver): BrowserPaths {
+  const store = Store.open(dir, 5000);
+  try {
+    store.write(() => {
+      store.db
+        .prepare(
+          `INSERT INTO claims (id, token, owner_key, owner_kind, owner_pid, owner_start, owner_session, owner_thread,
+             project_root, worktree, created_at, last_used_at, last_action)
+           VALUES (?, 'token', ?, 'session', NULL, NULL, 's', NULL, '/w', '/w', 0, 0, 'up')`,
+        )
+        .run(id, `owner-${id}`);
+    });
+  } finally {
+    store.close();
+  }
+  const browser = { driver, session: `lane-${id}`, debugPort: 9333, streamPort: null, createdAt: 0 };
+  const paths = browserPaths(dir, id, browser.session);
+  writeDriverFiles({ browser, paths, install, headed: false, url: null }, id);
+  return paths;
+}
+
+test('a lane recorded in a registry whose playwright-cli names an older core keeps it and its browsers, with nothing running', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+  const paths = laneUp(s.env.AGENTLANE_STATE_DIR ?? '', '0a1b2c3d', 'playwright', a);
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'playwright',
+    s.options({ ...later(s, '9.10.0', '3'), commandLines: nobodyRunning, log: line => lines.push(line) }),
+  );
+  assert.deepEqual(installState(s.env, 'playwright', releases(s)), { kind: 'installed', driver: a }, lines.join('\n'));
+  assert.ok(lines.includes(`kept ${path.dirname(a.playwrightCore)}, which a lane that is up runs`), lines.join('\n'));
+  const run = spawnSync(path.join(paths.bin, 'playwright-cli'), ['--version'], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout.trim(), 'cli');
+});
+
+test('a lane recorded in a registry whose agent-browser names an older build keeps it and its browsers, with nothing running', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const paths = laneUp(path.join(s.env.XDG_STATE_HOME ?? '', FORMER.tool), '0a1b2c3d', 'agent-browser', a);
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'playwright',
+    s.options({ ...later(s, '9.10.0', '3'), commandLines: nobodyRunning, log: line => lines.push(line) }),
+  );
+  for (const file of [a.cli[0] ?? '', a.chrome, a.headlessShell, a.ffmpeg]) {
+    assert.ok(fs.existsSync(file), `${file}\n${lines.join('\n')}`);
+  }
+  assert.ok(
+    lines.includes(`kept ${path.dirname(path.dirname(path.dirname(a.cli[0] ?? '')))}, which a lane that is up runs`),
+    lines.join('\n'),
+  );
+  const run = spawnSync(path.join(paths.bin, 'agent-browser'), ['--version'], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(spawnSync(a.headlessShell, { encoding: 'utf8' }).stdout.trim(), 'browser');
+});
+
+test('a lane recorded in a registry whose ffmpeg link points into an older ffmpeg keeps that ffmpeg', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const paths = laneUp(s.env.AGENTLANE_STATE_DIR ?? '', '0a1b2c3d', 'agent-browser', a);
+  fs.rmSync(paths.bin, { recursive: true });
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'agent-browser',
+    s.options({ ...later(s, '9.10.0', '3'), commandLines: nobodyRunning, log: line => lines.push(line) }),
+  );
+  assert.ok(fs.existsSync(a.ffmpeg), lines.join('\n'));
+  assert.equal(fs.existsSync(a.chrome), false, lines.join('\n'));
+  assert.equal(spawnSync(path.join(paths.dir, 'ffmpeg', 'ffmpeg'), { encoding: 'utf8' }).stdout.trim(), 'browser');
+});
+
+test('an older agent-browser a process runs keeps the browsers it needs through a Playwright install of newer pins', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const daemon = `${a.cli[0] ?? ''} --session lane`;
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'playwright',
+    s.options({ ...later(s, '9.10.0', '3'), commandLines: () => [daemon], log: line => lines.push(line) }),
+  );
+  assert.ok(fs.existsSync(a.cli[0] ?? ''), lines.join('\n'));
+  for (const file of [a.chrome, a.headlessShell, a.ffmpeg]) assert.ok(fs.existsSync(file), `${file}\n${lines.join('\n')}`);
 });

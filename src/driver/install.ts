@@ -13,11 +13,11 @@ import { tryLock, unlock } from './lock.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from './release.ts';
 import {
   compareVersions,
-  laneMaestrosOf,
+  laneToolsOf,
   removeOlderVersions,
   systemCommandLines,
   type CommandLines,
-  type LaneMaestros,
+  type LaneTools,
   type OlderVersion,
 } from './superseded.ts';
 
@@ -41,7 +41,7 @@ export interface InstallOptions {
   download?: Downloader;
   processes?: ProcessTable;
   commandLines?: CommandLines;
-  laneMaestros?: LaneMaestros;
+  laneTools?: LaneTools;
   log?: (line: string) => void;
   lockWaitMs?: number;
 }
@@ -323,7 +323,7 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
       me,
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
-      laneMaestros: options.laneMaestros ?? laneMaestrosOf(options.env),
+      laneTools: options.laneTools ?? laneToolsOf(options.env),
       log,
     });
     return { home, binary: binaryIn(home), version: release.version, installedNow: true, ms: Date.now() - started };

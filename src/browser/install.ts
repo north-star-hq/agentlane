@@ -10,11 +10,11 @@ import { dataDir, namedDataDir, sha256Of } from '../driver/install.ts';
 import { tryLock, unlock } from '../driver/lock.ts';
 import {
   compareVersions,
-  laneMaestrosOf,
+  laneToolsOf,
   removeOlderVersions,
   systemCommandLines,
   type CommandLines,
-  type LaneMaestros,
+  type LaneTools,
   type OlderVersion,
 } from '../driver/superseded.ts';
 import { CLI, envName, TOOL } from '../name.ts';
@@ -49,7 +49,7 @@ export interface BrowserInstallOptions {
   fetch?: Fetcher;
   processes?: ProcessTable;
   commandLines?: CommandLines;
-  laneMaestros?: LaneMaestros;
+  laneTools?: LaneTools;
   log?: (line: string) => void;
   lockWaitMs?: number;
 }
@@ -444,7 +444,8 @@ function linkPlaywright(base: string, core: string): void {
 
 /**
  * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
- * Then removes the older versions it installed that no running process, lane or kept version uses.
+ * Then removes the older driver packages and browsers it installed that no running process, no file of a recorded
+ * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses.
  */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
@@ -511,11 +512,9 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
     const newer = packagesBy(cores, playwright.version, order => order > 0).map(dir => pinnedBrowsers(dir, base) ?? all);
     const older: OlderVersion[] = [
       ...packagesBy(cores, playwright.version, order => order < 0).map(dir => ({ dir, needs: pinnedBrowsers(dir, base) ?? all })),
-      ...(driver === 'agent-browser'
-        ? packagesBy(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version, order => order < 0).map(
-            dir => ({ dir, needs: all }),
-          )
-        : []),
+      ...packagesBy(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version, order => order < 0).map(
+        dir => ({ dir, needs: all }),
+      ),
       ...browsers.filter(b => !newer.flat().includes(b.dir)),
     ];
     const removed = removeOlderVersions(older, {
@@ -523,7 +522,7 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
       me,
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
-      laneMaestros: options.laneMaestros ?? laneMaestrosOf(options.env),
+      laneTools: options.laneTools ?? laneToolsOf(options.env),
       log: options.log ?? (() => undefined),
     });
     for (const dir of removed.filter(d => path.dirname(d) === cores)) {

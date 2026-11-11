@@ -11,13 +11,16 @@ import { bestEffort, tryLock, unlock } from './lock.ts';
 /** Every running process's command line, or undefined when they can't be read. */
 export type CommandLines = () => readonly string[] | undefined;
 
-/** The command lines in `ps -o pid=,args=` output; undefined when it doesn't show pid 1, so it can't see every process. */
+/**
+ * The command lines in `ps -o pid=,args=` output; undefined unless it shows pid 1's arguments, so it can't see every
+ * process. macOS ps prints a process's name in parentheses in place of arguments it may not read.
+ */
 export function commandLinesOf(output: string): readonly string[] | undefined {
   const rows = output
     .split('\n')
     .map(line => /^\s*(\d+)\s?(.*)$/.exec(line))
     .filter(row => row !== null);
-  if (!rows.some(([, pid]) => pid === '1')) return undefined;
+  if (!rows.some(([, pid, args = '']) => pid === '1' && args.startsWith('/'))) return undefined;
   return rows.map(([, , args = '']) => args).filter(args => args.trim() !== '');
 }
 
@@ -32,8 +35,11 @@ export const systemCommandLines: CommandLines = () => {
   return commandLinesOf(result.stdout);
 };
 
-/** Every lane recorded in a registry: the text of its `bin/maestro`, or undefined when a registry can't be read. */
-export type LaneMaestros = () => readonly string[] | undefined;
+/**
+ * What every lane recorded in a registry runs: the text and link target of each file in its `bin/`, and where its
+ * `browser/ffmpeg/ffmpeg` points; undefined when a registry or a lane's files can't be read.
+ */
+export type LaneTools = () => readonly string[] | undefined;
 
 function registryDirs(env: NodeJS.ProcessEnv): string[] {
   const xdg = env.XDG_STATE_HOME;
@@ -59,29 +65,63 @@ function recordedLaneIds(dir: string): string[] | undefined {
   }
 }
 
-function readIfThere(file: string): string | null | undefined {
+function absent(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+function linkTarget(link: string): string | undefined {
   try {
-    return fs.readFileSync(file, 'utf8');
+    return path.resolve(path.dirname(link), fs.readlinkSync(link));
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code === 'ENOENT' || code === 'ENOTDIR' ? null : undefined;
+    if (absent(error) || (error as NodeJS.ErrnoException).code === 'EINVAL') return undefined;
+    throw error;
   }
 }
 
-/** The `bin/maestro` of every lane recorded in this version's registry or 0.2.x's, read without writing to either. */
-export function laneMaestrosOf(env: NodeJS.ProcessEnv): LaneMaestros {
+function laneNames(lane: string): string[] {
+  const names: string[] = [];
+  const bin = path.join(lane, 'bin');
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(bin);
+  } catch (error) {
+    if (!absent(error)) throw error;
+  }
+  for (const name of files) {
+    const file = path.join(bin, name);
+    const target = linkTarget(file);
+    if (target !== undefined) names.push(target);
+    try {
+      names.push(fs.readFileSync(file, 'utf8'));
+    } catch (error) {
+      if (!absent(error)) throw error;
+    }
+  }
+  const ffmpeg = linkTarget(path.join(lane, 'browser', 'ffmpeg', 'ffmpeg'));
+  if (ffmpeg !== undefined) names.push(ffmpeg);
+  return names;
+}
+
+/**
+ * What every lane recorded in this version's registry or 0.2.x's runs. Each registry is opened read-only, which never
+ * changes its data, though SQLite creates the database's `-shm` and `-wal` files beside it when they are missing.
+ */
+export function laneToolsOf(env: NodeJS.ProcessEnv): LaneTools {
   return () => {
-    const shims: string[] = [];
+    const names: string[] = [];
     for (const dir of registryDirs(env)) {
       const ids = recordedLaneIds(dir);
       if (ids === undefined) return undefined;
       for (const id of ids) {
-        const shim = readIfThere(path.join(lanesRoot(dir), id, 'bin', 'maestro'));
-        if (shim === undefined) return undefined;
-        if (shim !== null) shims.push(shim);
+        try {
+          names.push(...laneNames(path.join(lanesRoot(dir), id)));
+        } catch {
+          return undefined;
+        }
       }
     }
-    return shims;
+    return names;
   };
 }
 
@@ -162,7 +202,7 @@ export interface RemoveOptions {
   me: ProcessIdentity;
   processes: ProcessTable;
   commandLines: CommandLines;
-  laneMaestros: LaneMaestros;
+  laneTools: LaneTools;
   log: (line: string) => void;
 }
 
@@ -220,7 +260,7 @@ function inside(root: string, dir: string): boolean {
 }
 
 /**
- * Removes the older versions that no running process names on its command line, no recorded lane's `maestro` names,
+ * Removes the older versions that no running process names on its command line, no recorded lane's files name,
  * no other process is installing and no kept version needs. Returns the folders removed.
  */
 export function removeOlderVersions(candidates: readonly OlderVersion[], options: RemoveOptions): string[] {
@@ -238,8 +278,8 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
     options.log(`kept ${older.map(v => v.dir).join(', ')}: ps could not say whether a running process uses them`);
     return [];
   }
-  const shims = options.laneMaestros();
-  if (shims === undefined) {
+  const lanes = options.laneTools();
+  if (lanes === undefined) {
     options.log(`kept ${older.map(v => v.dir).join(', ')}: a registry could not say whether a lane uses them`);
     return [];
   }
@@ -258,7 +298,7 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
       keep(version, 'which a running process uses');
       continue;
     }
-    if (inUse(version.dir, shims)) {
+    if (inUse(version.dir, lanes)) {
       keep(version, 'which a lane that is up runs');
       continue;
     }
