@@ -7,9 +7,10 @@ import type { BackendDevice, DeviceBackend, DeviceDisk, Platform } from '../devi
 import { DeviceRunningError } from '../devices/backend.ts';
 import { dataDir } from '../driver/install.ts';
 import { CLI, FORMER, TOOL } from '../name.ts';
+import { allLeases } from './leases.ts';
 import { databasePath, isFormerRegistryDir, isPoolName, registryDirs } from './paths.ts';
 import { UsageError } from './refusal.ts';
-import { optText, Store, text } from './store.ts';
+import { optInt, optText, Store, text } from './store.ts';
 
 export interface FreePoolDevice {
   name: string;
@@ -123,6 +124,25 @@ function noTool(platform: Platform): string {
   return `this machine has no ${NOUN[platform]} tool to check it with`;
 }
 
+const DOING = new Map([
+  ['shutdown', 'shutting it down'],
+  ['delete', 'deleting it'],
+]);
+
+function leaseHolder(work: string, pid: number): string {
+  return `a process ${DOING.get(work) ?? 'working on it'} (pid ${String(pid)})`;
+}
+
+function readTogether<T>(db: DatabaseSync, read: () => T): T {
+  if (db.isTransaction) return read();
+  db.exec('BEGIN');
+  try {
+    return read();
+  } finally {
+    db.exec('COMMIT');
+  }
+}
+
 export function listPrunable(store: Store | null, dir: string, backends: Backends): PruneListing {
   const listing: PruneListing = { stateDir: dir, free: [], kept: [], unrecorded: [] };
   const listed = new Map<Platform, Map<string, BackendDevice> | Error>();
@@ -134,7 +154,13 @@ export function listPrunable(store: Store | null, dir: string, backends: Backend
     }
   }
   const recorded = new Set<string>();
-  const rows = store ? store.db.prepare('SELECT * FROM devices ORDER BY created_at, name').all() : [];
+  const { rows, leases } = store
+    ? readTogether(store.db, () => ({
+        rows: store.db.prepare('SELECT * FROM devices ORDER BY created_at, name').all(),
+        leases: allLeases(store.db),
+      }))
+    : { rows: [], leases: [] };
+  const standIns = new Set(leases.map(lease => lease.reservation));
   for (const row of rows) {
     const name = text(row, 'name');
     const platform = text(row, 'platform') as Platform;
@@ -142,6 +168,7 @@ export function listPrunable(store: Store | null, dir: string, backends: Backend
     const laneId = optText(row, 'claim_id');
     recorded.add(`${platform} ${name}`);
     if (id !== null) recorded.add(`${platform} ${id}`);
+    if (standIns.has(name)) continue;
     const keep = (reason: string) => listing.kept.push({ name, platform, id, laneId, registry: dir, reason });
     const devices = listed.get(platform);
     if (laneId !== null) keep(`held by lane ${laneId}`);
@@ -163,6 +190,11 @@ export function listPrunable(store: Store | null, dir: string, backends: Backend
         });
       }
     }
+  }
+  for (const { name, platform, id, work, holder } of leases) {
+    recorded.add(`${platform} ${name}`);
+    recorded.add(`${platform} ${id}`);
+    listing.kept.push({ name, platform, id, laneId: null, registry: dir, reason: `held by ${leaseHolder(work, holder.pid)}` });
   }
   for (const [platform, devices] of listed) {
     if (devices instanceof Error) continue;
@@ -283,11 +315,24 @@ function underLocks<T>(opened: readonly OpenRegistry[], body: () => T): T {
   return first ? first.store.write(() => underLocks(rest, body)) : body();
 }
 
-function recordOf(store: Store, name: string, id: string): { laneId: string | null } | null {
-  const row = store.db
-    .prepare('SELECT claim_id FROM devices WHERE name IN (?, ?) OR device_id IN (?, ?)')
-    .get(name, id, name, id);
-  return row ? { laneId: optText(row, 'claim_id') } : null;
+interface Recorded {
+  laneId: string | null;
+  holder: string | null;
+}
+
+const RECORDS_OF = `
+  SELECT claim_id AS lane, NULL AS work, NULL AS pid, CASE WHEN claim_id IS NULL THEN 2 ELSE 0 END AS rank
+    FROM devices WHERE name IN (?, ?) OR device_id IN (?, ?)
+  UNION ALL
+  SELECT NULL, work, holder_pid, 1 FROM device_leases WHERE name IN (?, ?) OR device_id IN (?, ?)
+  ORDER BY rank LIMIT 1`;
+
+function recordOf(store: Store, name: string, id: string): Recorded | null {
+  const row = store.db.prepare(RECORDS_OF).get(name, id, name, id, name, id, name, id);
+  if (!row) return null;
+  const work = optText(row, 'work');
+  const pid = optInt(row, 'pid');
+  return { laneId: optText(row, 'lane'), holder: work === null || pid === null ? null : leaseHolder(work, pid) };
 }
 
 const FOLDER_COLUMNS = [
@@ -404,11 +449,10 @@ export function reportPrunable(listing: PruneListing, ctx: PruneContext): PruneR
         .map(({ store }) => ({ dir: store.dir, record: recordOf(store, d.name, d.id) }))
         .find(found => found.record !== null);
       if (elsewhere?.record) {
-        const { laneId } = elsewhere.record;
+        const { laneId, holder } = elsewhere.record;
+        const by = laneId !== null ? `lane ${laneId}` : holder;
         keep(
-          laneId === null
-            ? `the registry in ${elsewhere.dir} records it`
-            : `held by lane ${laneId} in the registry in ${elsewhere.dir}`,
+          by === null ? `the registry in ${elsewhere.dir} records it` : `held by ${by} in the registry in ${elsewhere.dir}`,
           laneId,
           elsewhere.dir,
         );
@@ -445,7 +489,10 @@ export function deleteOrphan(ctx: PruneContext, backend: DeviceBackend | undefin
     opened = openRegistries(ctx.env, registryDirs(ctx.env), ctx.lockWaitMs);
     checked = underLocks(opened, (): OrphanResult | null => {
       for (const { store } of opened) {
-        if (recordOf(store, device.name, device.id)) return result('kept', `the registry in ${store.dir} records it now`);
+        const record = recordOf(store, device.name, device.id);
+        if (!record) continue;
+        const now = record.holder === null ? 'records it now' : `now records it as held by ${record.holder}`;
+        return result('kept', `the registry in ${store.dir} ${now}`);
       }
       let present: BackendDevice | undefined;
       try {
