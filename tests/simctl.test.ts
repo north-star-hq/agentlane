@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
+import { DeviceBackendError, DeviceRunningError } from '../src/devices/backend.ts';
 import { newestIphone, parseDeviceList, resolveSimSpec, simctlBackend } from '../src/devices/simctl.ts';
 import { UsageError } from '../src/registry/refusal.ts';
-import { CATALOG } from './support/fakes.ts';
+import { fakeXcrun, xcrunsOn } from './support/fake-xcrun.ts';
+import { CATALOG, tempDir } from './support/fakes.ts';
+import { isolatedEnv, withProcessEnv } from './support/isolated-env.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_SIMCTL === '1';
 
@@ -44,6 +50,8 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
           name: 'agentlane-pool-aaaaaa',
           state: 'Booted',
           deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
+          dataPath: '/Users/me/Library/Developer/CoreSimulator/Devices/U1/data',
+          dataPathSize: 3810119680,
         },
         {
           udid: 'U2',
@@ -51,6 +59,7 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
           state: 'Shutdown',
           deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-16',
         },
+        { udid: 'U3', name: 'agentlane-pool-bbbbbb', state: 'Shutting Down' },
       ],
       'com.apple.CoreSimulator.SimRuntime.watchOS-11-0': [{ udid: 'W1', name: 'watch', state: 'Booted' }],
     },
@@ -62,6 +71,8 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
       deviceType: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
       runtime: 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
       booted: true,
+      stopped: false,
+      disk: { paths: ['/Users/me/Library/Developer/CoreSimulator/Devices/U1'], bytes: 3810119680 },
     },
     {
       id: 'U2',
@@ -69,8 +80,65 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
       deviceType: 'com.apple.CoreSimulator.SimDeviceType.iPhone-16',
       runtime: 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
       booted: false,
+      stopped: true,
+    },
+    {
+      id: 'U3',
+      name: 'agentlane-pool-bbbbbb',
+      deviceType: '',
+      runtime: 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
+      booted: false,
+      stopped: false,
     },
   ]);
+});
+
+test('a delete that must not stop the simulator deletes it only when simctl lists it as Shutdown', async () => {
+  const root = tempDir('simctl-refuse');
+  try {
+    const xcrun = fakeXcrun(path.join(root, 'xcrun'));
+    await withProcessEnv({ ...isolatedEnv(root), PATH: xcrun.searchPath }, () => {
+      assert.deepEqual(xcrunsOn(process.env.PATH ?? ''), [path.join(xcrun.bin, 'xcrun')]);
+      for (const state of ['Booted', 'Booting', 'Shutting Down', 'Creating', 'A State simctl Adds Later']) {
+        const udid = randomUUID().toUpperCase();
+        xcrun.set([{ udid, name: 'agentlane-pool-aaaaaa', state }]);
+        assert.throws(
+          () => {
+            simctlBackend.delete(udid, 'refuse');
+          },
+          DeviceRunningError,
+          state,
+        );
+      }
+      assert.deepEqual(xcrun.deleted(), []);
+      const udid = randomUUID().toUpperCase();
+      xcrun.set([{ udid, name: 'agentlane-pool-aaaaaa', state: 'Shutdown' }]);
+      simctlBackend.delete(udid, 'refuse');
+      assert.deepEqual(xcrun.deleted(), [udid]);
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a fake xcrun that can't run fails the call instead of reaching any other xcrun", async () => {
+  const root = tempDir('simctl-broken-fake');
+  try {
+    const xcrun = fakeXcrun(path.join(root, 'xcrun'));
+    const fake = path.join(xcrun.bin, 'xcrun');
+    fs.chmodSync(fake, 0o644);
+    await withProcessEnv({ ...isolatedEnv(root), PATH: xcrun.searchPath }, () => {
+      assert.deepEqual(xcrunsOn(process.env.PATH ?? ''), [fake]);
+      assert.throws(() => simctlBackend.list(), DeviceBackendError);
+      assert.throws(() => {
+        simctlBackend.delete(randomUUID().toUpperCase(), 'refuse');
+      }, DeviceBackendError);
+    });
+    assert.deepEqual(xcrun.deleted(), []);
+    assert.equal(fs.existsSync(path.join(root, 'xcrun', 'calls')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test(

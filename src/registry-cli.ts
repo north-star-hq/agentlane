@@ -17,10 +17,21 @@ import { formatAge, formatTime, shellQuote } from './registry/format.ts';
 import type { Owner } from './registry/owner.ts';
 import { DEVICE_MEMORY_MB } from './registry/config.ts';
 import { describeOwner, describeState, isProven, ownerKey, resolveOwner } from './registry/owner.ts';
-import { databasePath, stateDir } from './registry/paths.ts';
+import { databasePath, FORMER_STATE_DIR_ENV, STATE_DIR_ENV, stateDir } from './registry/paths.ts';
 import type { PortProbe } from './registry/ports.ts';
-import type { PruneResult } from './registry/prune.ts';
-import { describePruneResult, listPrunable, renderPruneListing } from './registry/prune.ts';
+import type { LeftoverResult, OrphanResult, PruneContext, PruneResult } from './registry/prune.ts';
+import {
+  deleteLeftovers,
+  deleteOrphan,
+  describeLeftoverResult,
+  describeOrphanResult,
+  describePruneResult,
+  listPrunable,
+  putBackAsideCopies,
+  renderPruneReport,
+  reportPrunable,
+  requireHome,
+} from './registry/prune.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
 import { readRegistryStatus, Registry } from './registry/registry.ts';
 import type { Lane, LaneOutcome, LaneStatus, EndedLane, ServiceRequest, StatusReport } from './registry/types.ts';
@@ -90,10 +101,18 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
 `,
     touch: `  touch      Record activity on this session's lane (--action <text>).
 `,
-    prune: `  prune      List the pool simulators and emulators no lane holds, 0.2.x's included; --yes
-             deletes them to free their disk. Each deletion takes the registry's lock and checks
-             again that no lane holds the device, so one claimed meanwhile is kept. A device the
-             registry has no record of is never deleted, even one named like a pool device.
+    prune: `  prune      List what takes disk and nothing uses, each with its size; --yes deletes it:
+             the pool simulators and emulators no lane holds, 0.2.x's included; devices named
+             like pool devices that no registry prune reads records and that are shut down;
+             and, while no registry 0.2.x may use has a lane, the downloads 0.2.x left in
+             ~/.local/share/agent-env and its build cache in .git/agent-env of this repository
+             and of every folder a registry names. prune reads the registries in
+             ${STATE_DIR_ENV} and ${FORMER_STATE_DIR_ENV} when they are set, and in the
+             ${TOOL} and agent-env folders of $XDG_STATE_HOME and ~/.local/state. It
+             can't see a lane whose registry is in any other folder, so run prune with
+             the same variables that lane's ${TOOL} runs with. Each deletion locks those
+             registries and checks again, so a device a lane of either version claimed
+             meanwhile is kept.
                --yes                 delete them; without it, prune only lists
                --json                print the listing, and with --yes each result, as JSON
 `,
@@ -445,24 +464,46 @@ function releaseId(positionals: readonly string[], flag: string | undefined): st
   return bare ?? flag ?? null;
 }
 
+const PRUNE_LOCK_WAIT_MS = 30_000;
+
 function prune(deps: CliDeps, yes: boolean, json: boolean): number {
+  requireHome(deps.env);
   const dir = stateDir(deps.env);
+  const ctx: PruneContext = { env: deps.env, cwd: deps.cwd, lockWaitMs: PRUNE_LOCK_WAIT_MS };
   const registry = fs.existsSync(databasePath(dir)) ? open(deps) : null;
   try {
-    const listing = registry ? registry.prunable() : listPrunable(null, dir, deps.devices);
-    if (!json) deps.stdout(renderPruneListing(listing, yes));
+    const report = reportPrunable(registry ? registry.prunable() : listPrunable(null, dir, deps.devices), ctx);
+    if (!json) deps.stdout(renderPruneReport(report, yes));
+    const tell = (outcome: string, line: string) => {
+      if (json) return;
+      if (outcome === 'failed') deps.stderr(`${TOOL}: ${line}\n`);
+      else deps.stdout(`${line}\n`);
+    };
     const results: PruneResult[] = [];
-    if (yes && registry) {
-      for (const device of listing.free) {
-        const result = registry.pruneDevice(device);
-        results.push(result);
-        if (json) continue;
-        if (result.outcome === 'failed') deps.stderr(`${TOOL}: ${describePruneResult(result)}\n`);
-        else deps.stdout(`${describePruneResult(result)}\n`);
+    const orphanResults: OrphanResult[] = [];
+    let leftoverResults: LeftoverResult[] = [];
+    if (yes) {
+      if (registry) {
+        for (const device of report.free) {
+          const result = registry.pruneDevice(device);
+          results.push(result);
+          tell(result.outcome, describePruneResult(result));
+        }
       }
+      for (const device of report.orphans) {
+        const result = deleteOrphan(ctx, deps.devices[device.platform], device);
+        orphanResults.push(result);
+        tell(result.outcome, describeOrphanResult(result));
+      }
+      leftoverResults =
+        report.leftoversKept === null ? deleteLeftovers(ctx, report.leftovers) : putBackAsideCopies(ctx, report.leftovers);
+      for (const result of leftoverResults) tell(result.outcome, describeLeftoverResult(result));
     }
-    if (json) deps.stdout(`${JSON.stringify({ ...listing, ...(yes ? { results } : {}) }, null, 2)}\n`);
-    return results.some(r => r.outcome === 'failed') ? 1 : 0;
+    if (json) {
+      const done = yes ? { results, orphanResults, leftoverResults } : {};
+      deps.stdout(`${JSON.stringify({ ...report, ...done }, null, 2)}\n`);
+    }
+    return [...results, ...orphanResults, ...leftoverResults].some(r => r.outcome === 'failed') ? 1 : 0;
   } finally {
     registry?.close();
   }

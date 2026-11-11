@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { DeviceBackendError } from '../../src/devices/backend.ts';
+import { DeviceBackendError, DeviceRunningError } from '../../src/devices/backend.ts';
 import {
   createEmulatorBackend,
   EMULATOR_LOG_MAX_BYTES,
@@ -17,6 +19,7 @@ import {
 } from '../../src/devices/emulator.ts';
 import { UsageError } from '../../src/registry/refusal.ts';
 import { tempDir } from '../support/fakes.ts';
+import { isolatedEnv } from '../support/isolated-env.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_EMULATOR === '1';
 
@@ -87,8 +90,20 @@ test("the AVD list reads each AVD's device profile and system image from its fil
   assert.deepEqual(
     readAvds(home).sort((a, b) => a.name.localeCompare(b.name)),
     [
-      { name: 'agentlane-emu-0a1b2c', deviceType: 'pixel_8', runtime: 'system-images;android-36;google_apis;arm64-v8a' },
-      { name: 'my-pixel-api36', deviceType: 'pixel_7', runtime: '' },
+      {
+        name: 'agentlane-emu-0a1b2c',
+        deviceType: 'pixel_8',
+        runtime: 'system-images;android-36;google_apis;arm64-v8a',
+        ini: path.join(home, 'agentlane-emu-0a1b2c.ini'),
+        dir: `${home}/agentlane-emu-0a1b2c.avd`,
+      },
+      {
+        name: 'my-pixel-api36',
+        deviceType: 'pixel_7',
+        runtime: '',
+        ini: path.join(home, 'my-pixel-api36.ini'),
+        dir: path.join(home, 'my-pixel-api36.avd'),
+      },
     ],
   );
   assert.equal(
@@ -137,6 +152,42 @@ test('the emulator backend refuses to boot, stop or delete an AVD it did not cre
   }
   const missing = createEmulatorBackend({ env: { HOME: tempDir('nosdk') }, logDir: tempDir('emulator-logs'), sdk: null });
   assert.throws(() => missing.resolveSpec({}), UsageError);
+});
+
+test('deleting an AVD that is running, when the caller refuses to stop it, stops and deletes nothing', async () => {
+  const root = tempDir('emulator-refuse');
+  const env = { ...isolatedEnv(root), PATH: '/usr/bin:/bin', ANDROID_HOME: fakeSdk() };
+  const sdk = findAndroidSdk(env);
+  assert.ok(sdk);
+  const name = `agentlane-emu-${randomBytes(3).toString('hex')}`;
+  const seen = path.join(root, 'stand-in-env.json');
+  const emulator = spawn(
+    process.execPath,
+    [
+      '-e',
+      `require('fs').writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.env)); setTimeout(() => {}, 30_000)`,
+      '--',
+      '-avd',
+      name,
+    ],
+    { argv0: path.join(root, 'bin', 'emulator'), stdio: 'ignore', env },
+  );
+  try {
+    const listed = () =>
+      fs.existsSync(seen) &&
+      parseRunningEmulators(spawnSync('ps', ['-A', '-o', 'args='], { encoding: 'utf8', env }).stdout.split('\n')).has(name);
+    for (let tries = 0; !listed() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
+    assert.ok(listed(), 'the stand-in emulator never showed in ps');
+    const theirs = JSON.parse(fs.readFileSync(seen, 'utf8')) as Record<string, string>;
+    assert.deepEqual(Object.fromEntries(Object.keys(env).map(key => [key, theirs[key]])), env);
+    const backend = createEmulatorBackend({ env, logDir: path.join(root, 'emulator-logs'), sdk });
+    assert.throws(() => {
+      backend.delete(name, 'refuse');
+    }, DeviceRunningError);
+  } finally {
+    emulator.kill();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test(

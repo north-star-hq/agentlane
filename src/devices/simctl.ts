@@ -1,8 +1,9 @@
 import { execFile, execFileSync } from 'node:child_process';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { UsageError } from '../registry/refusal.ts';
 import type { BackendDevice, DeviceBackend, DeviceSpec, SpecRequest } from './backend.ts';
-import { DeviceBackendError } from './backend.ts';
+import { DeviceBackendError, DeviceRunningError } from './backend.ts';
 
 export interface SimDeviceType {
   identifier: string;
@@ -25,6 +26,8 @@ interface SimDevice {
   state: string;
   deviceTypeIdentifier?: string;
   isAvailable?: boolean;
+  dataPath?: string;
+  dataPathSize?: number;
 }
 
 const UDID = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/;
@@ -111,7 +114,15 @@ export function parseDeviceList(json: string): BackendDevice[] {
   for (const [runtime, list] of Object.entries(parsed.devices ?? {})) {
     if (!runtime.includes('SimRuntime.iOS-')) continue;
     for (const d of list) {
-      devices.push({ id: d.udid, name: d.name, deviceType: d.deviceTypeIdentifier ?? '', runtime, booted: d.state === 'Booted' });
+      devices.push({
+        id: d.udid,
+        name: d.name,
+        deviceType: d.deviceTypeIdentifier ?? '',
+        runtime,
+        booted: d.state === 'Booted',
+        stopped: d.state === 'Shutdown',
+        ...(d.dataPath ? { disk: { paths: [path.dirname(d.dataPath)], bytes: d.dataPathSize ?? null } } : {}),
+      });
     }
   }
   return devices;
@@ -135,7 +146,10 @@ export const simctlBackend: DeviceBackend = {
     return udid;
   },
 
-  delete(id) {
+  delete(id, whenRunning) {
+    if (whenRunning === 'refuse' && parseDeviceList(simctl(['list', '-j', 'devices'])).some(d => d.id === id && !d.stopped)) {
+      throw new DeviceRunningError(id);
+    }
     simctl(['delete', id], 120_000);
   },
 
