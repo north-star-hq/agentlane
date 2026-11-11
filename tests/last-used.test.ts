@@ -93,27 +93,28 @@ function breakConfig(state: string): () => void {
   };
 }
 
-async function counts(state: string, id: string, action: string, call: () => Promise<unknown>): Promise<void> {
-  age(state, id);
+async function counts(state: string, lane: LaneRef, action: string, call: () => Promise<unknown>): Promise<void> {
+  age(state, lane.id);
   const before = Date.now();
   await call();
   await until(
     () => {
-      const now = lastUse(state, id);
+      const now = lastUse(state, lane.id);
       return now.at >= before && now.action === action;
     },
     5000,
-    `'${action}' to move lane ${id}'s last use (it is ${JSON.stringify(lastUse(state, id))})`,
+    `'${action}' to move lane ${lane.id}'s last use (it is ${JSON.stringify(lastUse(state, lane.id))})`,
   );
+  await touchesLanded(state, lane);
 }
 
 /** Waits until the registry holds a touch at least as late as the last call the lane's folder records. */
-async function touchesLanded(w: DriverWorld): Promise<void> {
-  const called = laneLastCall(w.stateDir, { ...w.lane, lastUsedAt: 0 });
+async function touchesLanded(state: string, lane: LaneRef): Promise<void> {
+  const called = laneLastCall(state, { ...lane, lastUsedAt: 0 });
   await until(
-    () => lastUse(w.stateDir, w.lane.id).at >= called,
+    () => lastUse(state, lane.id).at >= called,
     5000,
-    `a touch of the call at ${String(called)} (the registry has ${JSON.stringify(lastUse(w.stateDir, w.lane.id))})`,
+    `a touch of the call at ${String(called)} (the registry has ${JSON.stringify(lastUse(state, lane.id))})`,
   );
 }
 
@@ -176,7 +177,7 @@ async function withDevice(
   const w = await driverWorld({ platform, env: { ...homeless(home), ...env } });
   try {
     assert.equal((await callEngine(w.target(), { op: 'look', args: {} })).ok, true, 'the engine did not start');
-    await touchesLanded(w);
+    await touchesLanded(w.stateDir, w.lane);
     assert.equal(lastUse(w.stateDir, w.lane.id).action, 'look');
     const env = { ...w.env, AGENTLANE_STATE_DIR: w.stateDir, AGENTLANE_OWNER_PID: String(w.owner.pid) };
     const adb = new FakeAdb(w.lane.device?.serial ?? '');
@@ -191,7 +192,7 @@ test('every call on a browser lane moves its last use: the CLI, the MCP tools, e
   const w = world(t);
   const lane = await webLane(w);
   const c = cli(webEnv(w), w.project, { browser: w.browser });
-  const moves = (action: string, call: () => Promise<unknown>) => counts(w.state, lane.id, action, call);
+  const moves = (action: string, call: () => Promise<unknown>) => counts(w.state, lane, action, call);
   const exits0 = async (run: Promise<{ code: number; err: string }>) => {
     const { code, err } = await run;
     assert.equal(code, 0, err);
@@ -252,7 +253,7 @@ test('status, lanes --json and evidence list leave the last use alone', async t 
 
 test('every call on a simulator lane moves its last use: look, run, screenshot, record, evidence and the driver, from the CLI and MCP', () =>
   withDevice('ios', async (w, c) => {
-    const moves = (action: string, call: () => Promise<unknown>) => counts(w.stateDir, w.lane.id, action, call);
+    const moves = (action: string, call: () => Promise<unknown>) => counts(w.stateDir, w.lane, action, call);
     const exits0 = async (run: Promise<{ code: number; err: string }>) => {
       const { code, err } = await run;
       assert.equal(code, 0, err);
@@ -283,7 +284,7 @@ test('every call on a simulator lane moves its last use: look, run, screenshot, 
 
 test("a device control on an emulator lane moves the lane's last use", () =>
   withDevice('android', async (w, c) => {
-    await counts(w.stateDir, w.lane.id, 'device appearance', async () => {
+    await counts(w.stateDir, w.lane, 'device appearance', async () => {
       const { code, err } = await c.drive('device', 'appearance', 'dark');
       assert.equal(code, 0, err);
     });
@@ -311,7 +312,7 @@ test('a busy registry neither fails nor stalls a browser lane call; MCP lands th
   assert.ok(tookMs < 5000, `the look waited ${String(tookMs)} ms on the registry`);
   free();
   leavesAlone(w.state, lane.id);
-  await counts(w.state, lane.id, 'look: browser', async () => {
+  await counts(w.state, lane, 'look: browser', async () => {
     assert.equal((await c.drive('look')).code, 0);
   });
 
@@ -347,7 +348,7 @@ test("a touch that can't open the registry leaves the warm engine running, and l
   withDevice('ios', async w => {
     const warm = await callEngine(w.target(), { op: 'look', args: {} });
     assert.equal(warm.ok, true);
-    await touchesLanded(w);
+    await touchesLanded(w.stateDir, w.lane);
     age(w.stateDir, w.lane.id);
     const fix = breakConfig(w.stateDir);
     try {
