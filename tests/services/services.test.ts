@@ -36,6 +36,16 @@ setTimeout(() => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
 setInterval(() => {}, 1e9);
 `;
 
+/** On SIGTERM, starts a long-lived helper in its process group and, given 'exit', exits 100 ms later. */
+const HELPER = `import { spawn } from 'node:child_process';
+process.on('SIGTERM', () => {
+  console.log('helper ' + String(spawn('sleep', ['30'], { stdio: 'ignore' }).pid));
+  if (process.argv[2] === 'exit') setTimeout(() => process.exit(0), 100);
+});
+console.log('handling SIGTERM');
+setInterval(() => {}, 1e9);
+`;
+
 const SERVER = `import { createServer } from 'node:http';
 createServer((req, res) => {
   res.end(req.url === '/status' ? 'packager-status:running' : 'ok');
@@ -74,6 +84,7 @@ function project(t: TestContext) {
   fs.writeFileSync(path.join(dir, 'server.mjs'), SERVER);
   fs.writeFileSync(path.join(dir, 'wrap.mjs'), WRAPPER);
   fs.writeFileSync(path.join(dir, 'forker.mjs'), FORKER);
+  fs.writeFileSync(path.join(dir, 'helper.mjs'), HELPER);
   const groups: number[] = [];
   const children: ChildProcess[] = [];
   t.after(() => {
@@ -330,38 +341,75 @@ test('when the leader has exited, a process that started after the leader was la
   assert.equal(alive(worker.pid), true, 'a process that failed the ownership check was signalled');
 });
 
-test('after the grace, SIGKILL goes only to the processes proven in the first check, not to one that joined the group since', async t => {
-  const p = project(t);
-  const proc = await orphaned(p, "(trap '' TERM; exec sleep 30) & exit 0", 0);
-  const [stubborn] = system.groupMembers(proc.pid) ?? [];
-  assert.ok(stubborn !== undefined);
-  const newcomer = spawn('sleep', ['30'], { stdio: 'ignore' });
-  t.after(() => newcomer.kill('SIGKILL'));
-  const joined = newcomer.pid ?? 0;
-  const sent: string[] = [];
-  let termed = false;
-  const watched: ServiceSystem = {
-    ...system,
-    groupMembers: pgid => {
-      const members = system.groupMembers(pgid);
-      return termed && members ? [...members, joined] : members;
-    },
-    signalGroup: (pgid, signal) => {
-      sent.push(`group ${String(pgid)} ${signal}`);
-      termed = true;
-      return system.signalGroup(pgid, signal);
-    },
-    signal: (pid, signal) => {
-      sent.push(`${String(pid)} ${signal}`);
-      return system.signal(pid, signal);
-    },
-  };
-  const outcome = await stopService(watched, proc, systemClock, 300, 50);
-  assert.deepEqual(sent, [`group ${String(proc.pid)} SIGTERM`, `${String(stubborn)} SIGKILL`]);
-  assert.equal(alive(stubborn), false);
-  assert.equal(alive(joined), true, 'a process outside the proven set was signalled');
-  assert.deepEqual(outcome, { kind: 'survived', members: [joined] });
-});
+for (const after of ['exit', 'stay']) {
+  test(`after the grace, SIGKILL ends a helper the leader started in its group on SIGTERM (leader ${after}s)`, async t => {
+    const p = project(t);
+    const proc = p.start(p.service(`exec node helper.mjs ${after}`), 0);
+    await until(() => fs.readFileSync(p.log, 'utf8').includes('handling SIGTERM'));
+    const outcome = await stopService(system, proc, systemClock, 1000, 50);
+    const helper = Number(/^helper (\d+)$/m.exec(fs.readFileSync(p.log, 'utf8'))?.[1]);
+    assert.ok(helper > 0, 'the leader started no helper');
+    assert.equal(alive(helper), false, `the helper pid ${String(helper)} outlived its service`);
+    assert.deepEqual(outcome, { kind: 'stopped', signal: 'SIGKILL' });
+  });
+}
+
+const listings: [string, number[] | undefined][] = [
+  ['seen empty', []],
+  ['unlisted', undefined],
+];
+for (const [seen, listing] of listings) {
+  test(`after the grace, a group ${seen} once since SIGTERM gets no SIGKILL, so a process that joined it since is left alone`, async t => {
+    const p = project(t);
+    const proc = await orphaned(p, "(trap '' TERM; exec sleep 30) & exit 0", 0);
+    const [stubborn] = system.groupMembers(proc.pid) ?? [];
+    assert.ok(stubborn !== undefined);
+    const stray = spawn(
+      process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); console.log('up'); setInterval(() => {}, 1e9)"],
+      { stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    t.after(() => stray.kill('SIGKILL'));
+    await new Promise(resolve => stray.stdout.once('data', resolve));
+    const strayPid = stray.pid ?? 0;
+    const strayGroup = system.groups([strayPid])?.get(strayPid) ?? 0;
+    assert.notEqual(strayGroup, proc.pid);
+    const newcomer = spawn('sleep', ['30'], { stdio: 'ignore' });
+    t.after(() => newcomer.kill('SIGKILL'));
+    const joined = newcomer.pid ?? 0;
+    const sent: string[] = [];
+    let polls = 0;
+    const watched: ServiceSystem = {
+      ...system,
+      descendants: pid => (pid === stubborn ? [{ pid: strayPid, pgid: strayGroup }] : system.descendants(pid)),
+      groupMembers: pgid => {
+        const members = system.groupMembers(pgid);
+        if (sent.length === 0 || !members) return members;
+        polls += 1;
+        return polls === 1 ? listing : [...members, joined];
+      },
+      signalGroup: (pgid, signal) => {
+        sent.push(`group ${String(pgid)} ${signal}`);
+        return system.signalGroup(pgid, signal);
+      },
+      signal: (pid, signal) => {
+        sent.push(`${String(pid)} ${signal}`);
+        return system.signal(pid, signal);
+      },
+    };
+    const outcome = await stopService(watched, proc, systemClock, 300, 50);
+    assert.ok(polls > 1, 'the group was not listed again after it was seen empty');
+    assert.deepEqual(sent, [
+      `group ${String(proc.pid)} SIGTERM`,
+      `${String(strayPid)} SIGTERM`,
+      `${String(stubborn)} SIGKILL`,
+      `${String(strayPid)} SIGKILL`,
+    ]);
+    assert.equal(alive(stubborn), false);
+    assert.equal(alive(joined), true, 'a process outside the proven set was signalled');
+    assert.deepEqual(outcome, { kind: 'survived', members: [joined] });
+  });
+}
 
 test('a start time is read only in the form ps prints it', () => {
   assert.equal(startMs('Mon Jan  1 00:00:00 2024'), Date.UTC(2024, 0, 1));

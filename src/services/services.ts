@@ -296,19 +296,26 @@ export async function stopService(
     const starts = system.processes.startTimes(processes.map(p => p.pid));
     return processes.filter(p => starts?.get(p.pid) === p.start).map(p => p.pid);
   };
-  const waitEmpty = async (ms: number): Promise<number[]> => {
+  const waitEmpty = async (ms: number): Promise<{ remaining: number[]; groupSeenEveryPoll: boolean }> => {
     const until = clock.now() + ms;
+    let groupSeenEveryPoll = true;
     for (;;) {
-      const members = [...(system.groupMembers(proc.pid) ?? []), ...left(strays)];
-      if (members.length === 0 || clock.now() >= until) return members;
+      const inGroup = system.groupMembers(proc.pid);
+      if (inGroup === undefined || inGroup.length === 0) groupSeenEveryPoll = false;
+      const remaining = [...(inGroup ?? []), ...left(strays)];
+      if (remaining.length === 0 || clock.now() >= until) return { remaining, groupSeenEveryPoll };
       await clock.sleep(pollMs);
     }
   };
   system.signalGroup(proc.pid, 'SIGTERM');
   for (const pid of left(strays)) system.signal(pid, 'SIGTERM');
-  if ((await waitEmpty(graceMs)).length === 0) return { kind: 'stopped', signal: 'SIGTERM' };
+  const grace = await waitEmpty(graceMs);
+  if (grace.remaining.length === 0) return { kind: 'stopped', signal: 'SIGTERM' };
+  // A pid can't name a new process group while a group of that id lives (XBD 4.14), so a group listed and non-empty
+  // at every poll since SIGTERM is still the service's.
+  if (grace.groupSeenEveryPoll) system.signalGroup(proc.pid, 'SIGKILL');
   for (const pid of left([...group, ...strays])) system.signal(pid, 'SIGKILL');
-  const survivors = await waitEmpty(2000);
+  const survivors = (await waitEmpty(2000)).remaining;
   return survivors.length === 0 ? { kind: 'stopped', signal: 'SIGKILL' } : { kind: 'survived', members: survivors };
 }
 
