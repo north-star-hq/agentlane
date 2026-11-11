@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { DeviceBackendError } from '../../src/devices/backend.ts';
+import { DeviceBackendError, DeviceRunningError } from '../../src/devices/backend.ts';
 import {
   createEmulatorBackend,
   deviceProfileName,
@@ -148,6 +150,29 @@ test('the emulator backend refuses to boot, stop or delete an AVD it did not cre
   }
   const missing = createEmulatorBackend({ env: { HOME: tempDir('nosdk') }, logDir: tempDir('emulator-logs'), sdk: null });
   assert.throws(() => missing.resolveSpec({}), UsageError);
+});
+
+test('deleting an AVD that is running, when the caller refuses to stop it, stops and deletes nothing', async () => {
+  const root = fakeSdk();
+  const sdk = findAndroidSdk({ ANDROID_HOME: root, HOME: tempDir('home') });
+  assert.ok(sdk);
+  const name = `agentlane-emu-${randomBytes(3).toString('hex')}`;
+  const emulator = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30_000)', '--', '-avd', name], {
+    argv0: path.join(tempDir('bin'), 'emulator'),
+    stdio: 'ignore',
+  });
+  try {
+    const listed = () =>
+      parseRunningEmulators(spawnSync('ps', ['-A', '-o', 'args='], { encoding: 'utf8' }).stdout.split('\n')).has(name);
+    for (let tries = 0; !listed() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
+    assert.ok(listed(), 'the stand-in emulator never showed in ps');
+    const backend = createEmulatorBackend({ env: {}, logDir: tempDir('emulator-logs'), sdk });
+    assert.throws(() => {
+      backend.delete(name, 'refuse');
+    }, DeviceRunningError);
+  } finally {
+    emulator.kill();
+  }
 });
 
 test(

@@ -17,7 +17,7 @@ import { formatAge, formatTime, shellQuote } from './registry/format.ts';
 import type { Owner } from './registry/owner.ts';
 import { DEVICE_MEMORY_MB } from './registry/config.ts';
 import { describeOwner, describeState, isProven, ownerKey, resolveOwner } from './registry/owner.ts';
-import { databasePath, stateDir } from './registry/paths.ts';
+import { databasePath, FORMER_STATE_DIR_ENV, STATE_DIR_ENV, stateDir } from './registry/paths.ts';
 import type { PortProbe } from './registry/ports.ts';
 import type { LeftoverResult, OrphanResult, PruneContext, PruneResult } from './registry/prune.ts';
 import {
@@ -102,12 +102,16 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
 `,
     prune: `  prune      List what takes disk and nothing uses, each with its size; --yes deletes it:
              the pool simulators and emulators no lane holds, 0.2.x's included; devices named
-             like pool devices that neither ~/.local/state/${TOOL} nor ~/.local/state/agent-env
-             records and that are not booted; and, while 0.2.x's registry has no lanes, the
-             downloads 0.2.x left in ~/.local/share/agent-env and its build cache in .git/agent-env
-             of this repository and of every folder a registry names. Each deletion locks every
-             registry and checks again, so a device a lane of either version claimed meanwhile
-             is kept.
+             like pool devices that no registry prune reads records and that are not booted;
+             and, while no registry 0.2.x may use has a lane, the downloads 0.2.x left in
+             ~/.local/share/agent-env and its build cache in .git/agent-env of this repository
+             and of every folder a registry names. prune reads the registries in
+             ${STATE_DIR_ENV} and ${FORMER_STATE_DIR_ENV} when they are set, and in the
+             ${TOOL} and agent-env folders of $XDG_STATE_HOME and ~/.local/state. It
+             can't see a lane whose registry is in any other folder, so run prune with
+             the same variables that lane's ${TOOL} runs with. Each deletion locks those
+             registries and checks again, so a device a lane of either version claimed
+             meanwhile is kept.
                --yes                 delete them; without it, prune only lists
                --json                print the listing, and with --yes each result, as JSON
 `,

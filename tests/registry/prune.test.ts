@@ -16,7 +16,14 @@ import type {
   PruneReport,
   PruneResult,
 } from '../../src/registry/prune.ts';
-import { deleteLeftovers, deleteOrphan, listPrunable, reportPrunable } from '../../src/registry/prune.ts';
+import {
+  deleteLeftovers,
+  deleteOrphan,
+  finishLeftovers,
+  listPrunable,
+  moveLeftoversAside,
+  reportPrunable,
+} from '../../src/registry/prune.ts';
 import { Refusal, UsageError } from '../../src/registry/refusal.ts';
 import type { Registry } from '../../src/registry/registry.ts';
 import { Store } from '../../src/registry/store.ts';
@@ -103,8 +110,8 @@ function over(inner: FakeDevices, changes: Partial<DeviceBackend>): DeviceBacken
     resolveSpec: request => inner.resolveSpec(request),
     list: () => inner.list(),
     create: (name, spec) => inner.create(name, spec),
-    delete: id => {
-      inner.delete(id);
+    delete: (id, whenRunning) => {
+      inner.delete(id, whenRunning);
     },
     shutdown: id => {
       inner.shutdown(id);
@@ -289,6 +296,8 @@ test('a pool device already gone loses only its record, a booted one is shut dow
 });
 
 interface Cli {
+  root: string;
+  env: NodeJS.ProcessEnv;
   home: string;
   repo: string;
   own: string;
@@ -316,7 +325,7 @@ function fill(file: string, bytes: number): void {
 }
 
 /** Every folder prune reads or deletes in sits under a temporary home. */
-function cli(): Cli {
+function cli(extraEnv: (root: string) => Record<string, string> = () => ({})): Cli {
   const root = fs.realpathSync(tempDir('prune-cli'));
   const home = path.join(root, 'home');
   const repo = path.join(root, 'repo');
@@ -344,9 +353,12 @@ function cli(): Cli {
     AGENTLANE_STATE_DIR: own,
     CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
     CODEX_HOME: path.join(home, '.codex'),
+    ...extraEnv(root),
   };
   const ctx: PruneContext = { env, cwd: repo, lockWaitMs: 5000 };
   return {
+    root,
+    env,
     home,
     repo,
     own,
@@ -559,11 +571,11 @@ test('prune lists the devices no registry records and what 0.2.x left, with size
       ],
     );
     assert.deepEqual(
-      json.kept.map(d => [d.name, d.laneId, d.reason]).sort(),
+      json.kept.map(d => [d.name, d.laneId, d.registry, d.reason]).sort(),
       [
-        [held, laneId, `held by lane ${laneId}`],
-        ['agentlane-pool-cccccc', null, 'no registry records it, but it is booted, so something may be using it'],
-        [other, null, `the registry in ${c.former} records it`],
+        [held, laneId, c.own, `held by lane ${laneId}`],
+        ['agentlane-pool-cccccc', null, null, 'no registry records it, but it is booted, so something may be using it'],
+        [other, null, c.former, `the registry in ${c.former} records it`],
       ].sort(),
     );
     assert.deepEqual(
@@ -610,7 +622,7 @@ test('prune lists the devices no registry records and what 0.2.x left, with size
   }
 });
 
-test('a device a registry records, or that is gone, by the deletion is kept, and every registry stays locked while one is deleted', () => {
+test('a device a registry records, or that is gone, by the deletion is kept: every registry is locked for the check and none for the delete', () => {
   const c = cli();
   try {
     formerDevice(c.own, 'ios', 'agentlane-pool-000000', c.sims.addByHand('agentlane-pool-000000', false));
@@ -639,19 +651,29 @@ test('a device a registry records, or that is gone, by the deletion is kept, and
     });
     c.sims.delete(vanished.id);
 
-    const locked: Record<string, boolean> = {};
-    const watched = over(c.sims, {
-      delete: id => {
-        for (const dir of [c.own, c.former]) {
-          try {
-            write(dir, () => undefined, 50);
-            locked[dir] = false;
-          } catch (error) {
-            assert.ok(error instanceof Refusal && error.code === 'registry-busy', String(error));
-            locked[dir] = true;
-          }
+    const lockedNow = (): Record<string, boolean> => {
+      const locked: Record<string, boolean> = {};
+      for (const dir of [c.own, c.former]) {
+        try {
+          write(dir, () => undefined, 50);
+          locked[dir] = false;
+        } catch (error) {
+          assert.ok(error instanceof Refusal && error.code === 'registry-busy', String(error));
+          locked[dir] = true;
         }
-        c.sims.delete(id);
+      }
+      return locked;
+    };
+    let atCheck: Record<string, boolean> = {};
+    let atDelete: Record<string, boolean> = {};
+    const watched = over(c.sims, {
+      list: () => {
+        atCheck = lockedNow();
+        return c.sims.list();
+      },
+      delete: (id, whenRunning) => {
+        atDelete = lockedNow();
+        c.sims.delete(id, whenRunning);
       },
     });
     const results = report.orphans.map(d => deleteOrphan(c.ctx, watched, d));
@@ -664,7 +686,8 @@ test('a device a registry records, or that is gone, by the deletion is kept, and
         [free.name, 'deleted', null],
       ],
     );
-    assert.deepEqual(locked, { [c.own]: true, [c.former]: true });
+    assert.deepEqual(atCheck, { [c.own]: true, [c.former]: true });
+    assert.deepEqual(atDelete, { [c.own]: false, [c.former]: false });
     assert.deepEqual(
       c.sims
         .all()
@@ -713,7 +736,7 @@ test("what 0.2.x left is listed but kept while 0.2.x's registry has a lane, incl
 
     const listed = await c.run('--yes');
     assert.equal(listed.code, 0, listed.stderr);
-    const reason = `the registry in ${c.former}, the one 0.2.x reads, has lane ${lane}, which may be 0.2.x's; prune deletes what 0.2.x left once that registry has no lanes`;
+    const reason = `the registry in ${c.former}, which 0.2.x may use, has lane ${lane}, which may be 0.2.x's; prune deletes what 0.2.x left once no such registry has lanes`;
     assert.match(listed.stdout, new RegExp(`^  kept: ${escaped(reason)}$`, 'm'));
     assert.doesNotMatch(listed.stdout, /^deleted/m);
     assert.ok(fs.existsSync(downloads));
@@ -780,6 +803,171 @@ test('deleteLeftovers refuses a path that is not a folder 0.2.x leaves', () => {
       decoys.map(() => ['failed', 'refused: it is not a folder 0.2.x leaves']),
     );
     for (const decoy of decoys) assert.ok(fs.existsSync(path.join(decoy, 'keep')), decoy);
+  } finally {
+    c.close();
+  }
+});
+
+test("a .git/agent-env that is a symlink to this version's folder is neither listed nor deleted", async () => {
+  const c = cli();
+  try {
+    const current = path.join(c.repo, '.git', 'agentlane');
+    fill(path.join(current, 'build-cache', 'objects', 'keep'), 1000);
+    fs.symlinkSync(current, path.join(c.repo, '.git', 'agent-env'));
+    const share = path.join(c.home, '.local', 'share');
+    fill(path.join(share, 'agentlane', 'maestro', 'keep'), 1000);
+    fs.symlinkSync(path.join(share, 'agentlane'), path.join(share, 'agent-env'));
+
+    const done = JSON.parse((await c.run('--yes', '--json')).stdout) as PruneReport & { leftoverResults: LeftoverResult[] };
+    assert.ok(fs.existsSync(path.join(current, 'build-cache', 'objects', 'keep')), JSON.stringify(done.leftoverResults));
+    assert.ok(fs.existsSync(path.join(share, 'agentlane', 'maestro', 'keep')));
+    assert.deepEqual(done.leftovers, []);
+    assert.deepEqual(done.leftoverResults, []);
+    const direct = deleteLeftovers(c.ctx, [
+      { kind: 'build-cache', path: path.join(c.repo, '.git', 'agent-env', 'build-cache'), repository: c.repo, bytes: 0 },
+      { kind: 'downloads', path: path.join(share, 'agent-env'), repository: null, bytes: 0 },
+    ]);
+    assert.deepEqual(
+      direct.map(r => [r.outcome, r.detail]),
+      [
+        ['failed', 'refused: it is not a folder 0.2.x leaves'],
+        ['failed', 'refused: it is not a folder 0.2.x leaves'],
+      ],
+    );
+    assert.ok(fs.existsSync(path.join(current, 'build-cache', 'objects', 'keep')));
+    assert.ok(fs.existsSync(path.join(share, 'agentlane', 'maestro', 'keep')));
+    assert.ok(fs.lstatSync(path.join(share, 'agent-env')).isSymbolicLink());
+  } finally {
+    c.close();
+  }
+});
+
+test('a 0.2.x lane in the registry AGENT_ENV_STATE_DIR names keeps its device and what 0.2.x left', async () => {
+  const c = cli(root => ({ AGENT_ENV_STATE_DIR: path.join(root, 'agent-env-override') }));
+  try {
+    const override = path.join(c.root, 'agent-env-override');
+    const theirs = 'agent-env-pool-abc123';
+    formerDevice(override, 'ios', theirs, c.sims.addByHand(theirs, false));
+    const lane = formerLane(override, new FakeProcesses().owner(), path.join(c.root, 'their-worktree'), theirs);
+    const downloads = path.join(c.home, '.local', 'share', 'agent-env');
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+
+    const done = JSON.parse((await c.run('--yes', '--json')).stdout) as PruneReport & { leftoverResults: LeftoverResult[] };
+    assert.ok(done.registries.includes(override), done.registries.join(', '));
+    assert.deepEqual(done.orphans, []);
+    assert.deepEqual(
+      done.kept.map(d => [d.name, d.laneId, d.registry]),
+      [[theirs, lane, override]],
+    );
+    assert.match(
+      done.leftoversKept ?? '',
+      new RegExp(`^the registry in ${escaped(override)}, which 0\\.2\\.x may use, has lane ${lane},`),
+    );
+    assert.deepEqual(done.leftoverResults, []);
+    assert.ok(fs.existsSync(path.join(downloads, 'maestro', 'x')));
+    assert.deepEqual(names(c.sims.all()), [theirs]);
+  } finally {
+    c.close();
+  }
+});
+
+test('with XDG_STATE_HOME elsewhere, prune still reads the registries in ~/.local/state', async () => {
+  const c = cli(root => ({ XDG_STATE_HOME: path.join(root, 'xdg'), AGENTLANE_STATE_DIR: path.join(root, 'xdg', 'agentlane') }));
+  try {
+    const held = 'agentlane-pool-0000c1';
+    formerDevice(c.own, 'ios', held, c.sims.addByHand(held, false));
+    const lane = formerLane(c.own, new FakeProcesses().owner(), path.join(c.root, 'mine'), held);
+    const theirs = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+    const downloads = path.join(c.home, '.local', 'share', 'agent-env');
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+
+    const done = JSON.parse((await c.run('--yes', '--json')).stdout) as PruneReport & { leftoverResults: LeftoverResult[] };
+    assert.ok(done.registries.includes(c.own) && done.registries.includes(c.former), done.registries.join(', '));
+    assert.deepEqual(done.orphans, []);
+    assert.deepEqual(
+      done.kept.map(d => [d.name, d.laneId, d.registry]),
+      [[held, lane, c.own]],
+    );
+    assert.match(
+      done.leftoversKept ?? '',
+      new RegExp(`^the registry in ${escaped(c.former)}, which 0\\.2\\.x may use, has lane ${theirs},`),
+    );
+    assert.ok(fs.existsSync(path.join(downloads, 'maestro', 'x')));
+    assert.deepEqual(names(c.sims.all()), [held]);
+  } finally {
+    c.close();
+  }
+});
+
+test('a registry 0.2.x may use that is created with a lane while the leftovers are aside gets them put back', () => {
+  const c = cli();
+  try {
+    const downloads = path.join(c.home, '.local', 'share', 'agent-env');
+    const cache = path.join(c.repo, '.git', 'agent-env', 'build-cache');
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+    fill(path.join(cache, 'objects', 'a'), 1000);
+    const report = c.report();
+    assert.equal(report.leftoversKept, null);
+    assert.equal(fs.existsSync(databasePath(c.former)), false);
+
+    const steps = moveLeftoversAside(c.ctx, report.leftovers);
+    assert.equal(fs.existsSync(downloads), false);
+    assert.equal(fs.existsSync(cache), false);
+    const lane = formerLane(c.former, new FakeProcesses().owner(), c.repo);
+    const results = finishLeftovers(c.ctx, steps);
+
+    assert.deepEqual(
+      results.map(r => [r.leftover.path, r.outcome]),
+      [
+        [downloads, 'kept'],
+        [cache, 'kept'],
+      ],
+    );
+    assert.match(results[0]?.detail ?? '', new RegExp(`has lane ${lane}, .*, found after it was moved aside$`));
+    assert.ok(fs.existsSync(path.join(downloads, 'maestro', 'x')));
+    assert.ok(fs.existsSync(path.join(cache, 'objects', 'a')));
+    assert.deepEqual(fs.readdirSync(path.dirname(downloads)), ['agent-env']);
+    assert.deepEqual(fs.readdirSync(path.dirname(cache)), ['build-cache']);
+  } finally {
+    c.close();
+  }
+});
+
+test('a registry reached through a symlinked AGENTLANE_STATE_DIR is opened and locked once', () => {
+  const c = cli(root => ({ AGENTLANE_STATE_DIR: path.join(root, 'linked-state') }));
+  try {
+    const linked = path.join(c.root, 'linked-state');
+    formerDevice(c.own, 'ios', 'agentlane-pool-000000', c.sims.addByHand('agentlane-pool-000000', false));
+    fs.symlinkSync(c.own, linked);
+    c.sims.addByHand('agent-env-pool-0000aa', false);
+
+    const report = c.report();
+    assert.deepEqual(report.registries, [linked, c.former]);
+    const [orphan] = report.orphans;
+    assert.ok(orphan);
+    const result = deleteOrphan({ ...c.ctx, lockWaitMs: 400 }, c.backend, orphan);
+    assert.deepEqual([result.outcome, result.detail], ['deleted', null]);
+    assert.deepEqual(names(c.sims.all()), ['agentlane-pool-000000']);
+  } finally {
+    c.close();
+  }
+});
+
+test('an orphan that is running when it is deleted is kept, not shut down', () => {
+  const c = cli();
+  try {
+    const name = 'agent-env-emu-0000d1';
+    c.emus.addByHand(name, true, undefined, 5584);
+    const looksStopped = over(c.emus, { list: () => c.emus.list().map(d => ({ ...d, booted: false })) });
+    const [orphan] = reportPrunable(listPrunable(null, c.own, { android: looksStopped }), c.ctx).orphans;
+    assert.ok(orphan);
+    assert.deepEqual(deleteOrphan(c.ctx, looksStopped, orphan), {
+      device: orphan,
+      outcome: 'kept',
+      detail: 'it was booted after the listing',
+    });
+    assert.deepEqual(names(c.emus.all()), [name]);
+    assert.deepEqual(c.emus.calls, []);
   } finally {
     c.close();
   }

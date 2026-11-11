@@ -9,7 +9,7 @@ import { emulatorSerial } from '../registry/config.ts';
 import { isPoolName } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
 import type { BackendDevice, DeviceBackend, DeviceSpec, SpecRequest } from './backend.ts';
-import { DeviceBackendError } from './backend.ts';
+import { DeviceBackendError, DeviceRunningError } from './backend.ts';
 
 export const MAESTRO_DRIVER_PACKAGE = 'dev.mobile.maestro';
 export const DEFAULT_DEVICE_PROFILE = 'pixel_8';
@@ -375,9 +375,10 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
       return name;
     },
 
-    delete(id) {
+    delete(id, whenRunning = 'shut-down') {
       assertPoolAvd(id);
-      backend.shutdown(id);
+      if (whenRunning === 'shut-down') backend.shutdown(id);
+      else if (!stopped(id)) throw new DeviceRunningError(id);
       const tool = sdk().avdmanager;
       const java = findJavaHome(options.env);
       if (!tool || !java) throw new DeviceBackendError(`deleting ${id} needs avdmanager and a JDK 17 or newer`);

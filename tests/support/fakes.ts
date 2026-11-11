@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Clock } from '../../src/clock.ts';
-import type { BackendDevice, DeviceBackend, DeviceSpec, Platform, SpecRequest } from '../../src/devices/backend.ts';
-import { DeviceBackendError } from '../../src/devices/backend.ts';
+import type { BackendDevice, DeviceBackend, DeviceSpec, Platform, SpecRequest, WhenRunning } from '../../src/devices/backend.ts';
+import { DeviceBackendError, DeviceRunningError } from '../../src/devices/backend.ts';
 import type { SystemImage } from '../../src/devices/emulator.ts';
 import { MAESTRO_DRIVER_PACKAGE, resolveAndroidSpec } from '../../src/devices/emulator.ts';
 import type { SimRuntime } from '../../src/devices/simctl.ts';
@@ -247,7 +247,8 @@ export class FakeDevices implements DeviceBackend {
     return id;
   }
 
-  delete(id: string): void {
+  delete(id: string, whenRunning?: WhenRunning): void {
+    if (whenRunning === 'refuse' && this.read(id)?.booted) throw new DeviceRunningError(id);
     this.record(`delete ${id}`);
     fs.rmSync(this.file(id), { force: true });
   }

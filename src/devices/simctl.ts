@@ -3,7 +3,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { UsageError } from '../registry/refusal.ts';
 import type { BackendDevice, DeviceBackend, DeviceSpec, SpecRequest } from './backend.ts';
-import { DeviceBackendError } from './backend.ts';
+import { DeviceBackendError, DeviceRunningError } from './backend.ts';
 
 export interface SimDeviceType {
   identifier: string;
@@ -145,7 +145,10 @@ export const simctlBackend: DeviceBackend = {
     return udid;
   },
 
-  delete(id) {
+  delete(id, whenRunning) {
+    if (whenRunning === 'refuse' && parseDeviceList(simctl(['list', '-j', 'devices'])).some(d => d.id === id && d.booted)) {
+      throw new DeviceRunningError(id);
+    }
     simctl(['delete', id], 120_000);
   },
 

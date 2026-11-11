@@ -4,9 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { BackendDevice, DeviceBackend, DeviceDisk, Platform } from '../devices/backend.ts';
+import { DeviceRunningError } from '../devices/backend.ts';
 import { dataDir } from '../driver/install.ts';
 import { CLI, FORMER, TOOL } from '../name.ts';
-import { formerStateDir, isPoolName, registryDirs } from './paths.ts';
+import { databasePath, isFormerRegistryDir, isPoolName, registryDirs } from './paths.ts';
 import { UsageError } from './refusal.ts';
 import { optText, Store, text } from './store.ts';
 
@@ -24,6 +25,7 @@ export interface KeptPoolDevice {
   platform: Platform;
   id: string | null;
   laneId: string | null;
+  registry: string | null;
   reason: string;
 }
 
@@ -136,7 +138,7 @@ export function listPrunable(store: Store | null, dir: string, backends: Backend
     const laneId = optText(row, 'claim_id');
     recorded.add(`${platform} ${name}`);
     if (id !== null) recorded.add(`${platform} ${id}`);
-    const keep = (reason: string) => listing.kept.push({ name, platform, id, laneId, reason });
+    const keep = (reason: string) => listing.kept.push({ name, platform, id, laneId, registry: dir, reason });
     const devices = listed.get(platform);
     if (laneId !== null) keep(`held by lane ${laneId}`);
     else if (id === null) keep('a claim is creating it');
@@ -200,7 +202,6 @@ export function deletePoolDevice(db: DatabaseSync, backend: DeviceBackend | unde
   return present ? result('deleted') : result('forgotten', 'it no longer exists');
 }
 
-/** The space the files take on disk, as `du` counts it. */
 export function diskBytes(paths: readonly string[]): number {
   let total = 0;
   const pending = [...paths];
@@ -222,23 +223,60 @@ export function diskBytes(paths: readonly string[]): number {
   return total;
 }
 
-function openRegistries(dirs: readonly string[], lockWaitMs: number): Store[] {
-  const stores: Store[] = [];
-  try {
-    for (const dir of [...dirs].sort()) {
-      const store = Store.openExisting(dir, lockWaitMs);
-      if (store) stores.push(store);
-    }
-  } catch (error) {
-    for (const store of stores) store.close();
-    throw error;
-  }
-  return stores;
+interface RegistryFolder {
+  dir: string;
+  former: boolean;
+  identity: string;
 }
 
-function underLocks<T>(stores: readonly Store[], body: () => T): T {
-  const [first, ...rest] = stores;
-  return first ? first.write(() => underLocks(rest, body)) : body();
+function fileIdentity(file: string): string | null {
+  try {
+    const stat = fs.statSync(file);
+    return `${String(stat.dev)}:${String(stat.ino)}`;
+  } catch {
+    return null;
+  }
+}
+
+function distinctRegistries(env: NodeJS.ProcessEnv, dirs: readonly string[]): RegistryFolder[] {
+  const byIdentity = new Map<string, RegistryFolder>();
+  for (const dir of dirs) {
+    const former = isFormerRegistryDir(env, dir);
+    const identity = fileIdentity(databasePath(dir)) ?? `absent ${dir}`;
+    const seen = byIdentity.get(identity);
+    if (seen) seen.former ||= former;
+    else byIdentity.set(identity, { dir, former, identity });
+  }
+  return [...byIdentity.values()];
+}
+
+interface OpenRegistry {
+  store: Store;
+  former: boolean;
+}
+
+function openRegistries(env: NodeJS.ProcessEnv, dirs: readonly string[], lockWaitMs: number): OpenRegistry[] {
+  const opened: OpenRegistry[] = [];
+  try {
+    const folders = distinctRegistries(env, dirs).sort((a, b) => a.identity.localeCompare(b.identity));
+    for (const { dir, former } of folders) {
+      const store = Store.openExisting(dir, lockWaitMs);
+      if (store) opened.push({ store, former });
+    }
+  } catch (error) {
+    closeAll(opened);
+    throw error;
+  }
+  return opened;
+}
+
+function closeAll(opened: readonly OpenRegistry[]): void {
+  for (const { store } of opened) store.close();
+}
+
+function underLocks<T>(opened: readonly OpenRegistry[], body: () => T): T {
+  const [first, ...rest] = opened;
+  return first ? first.store.write(() => underLocks(rest, body)) : body();
 }
 
 function recordOf(store: Store, name: string, id: string): { laneId: string | null } | null {
@@ -302,35 +340,37 @@ function repositoryOf(commonDir: string): string {
   return path.basename(commonDir) === '.git' ? path.dirname(commonDir) : commonDir;
 }
 
-/** What 0.2.x left: its downloads, and the build cache in the git folder of each repository named. */
 export function formerLeftovers(env: NodeJS.ProcessEnv, commonDirs: readonly string[]): Leftover[] {
-  const found: Leftover[] = [];
-  for (const target of withAsideCopies(downloadsDir(env))) {
-    found.push({ kind: 'downloads', path: target, repository: null, bytes: diskBytes([target]) });
-  }
+  const found: Omit<Leftover, 'bytes'>[] = [];
+  for (const target of withAsideCopies(downloadsDir(env))) found.push({ kind: 'downloads', path: target, repository: null });
   for (const common of [...new Set(commonDirs)].sort()) {
     for (const target of withAsideCopies(path.join(common, FORMER.tool, 'build-cache'))) {
-      found.push({ kind: 'build-cache', path: target, repository: repositoryOf(common), bytes: diskBytes([target]) });
+      found.push({ kind: 'build-cache', path: target, repository: repositoryOf(common) });
     }
   }
-  return found;
+  return found
+    .filter(leftover => isLeftoverPath(env, leftover))
+    .map(leftover => ({ ...leftover, bytes: diskBytes([leftover.path]) }));
 }
 
 function formerLanesReason(dir: string, lanes: readonly string[]): string {
-  return `the registry in ${dir}, the one 0.2.x reads, has ${lanes.join(', ')}, which may be 0.2.x's; prune deletes what 0.2.x left once that registry has no lanes`;
+  return `the registry in ${dir}, which 0.2.x may use, has ${lanes.join(', ')}, which may be 0.2.x's; prune deletes what 0.2.x left once no such registry has lanes`;
 }
 
-/**
- * Splits the devices the registry in use has no record of by what the other registries on this Mac say: one that no
- * registry records and that is not booted is an orphan to offer. Adds the folders 0.2.x left, from the repositories
- * that `cwd` and every registry's lanes are in.
- */
+function formerLanesIn(opened: readonly OpenRegistry[]): string | null {
+  for (const { store, former } of opened) {
+    const lanes = former ? lanesIn(store) : [];
+    if (lanes.length > 0) return formerLanesReason(store.dir, lanes);
+  }
+  return null;
+}
+
 export function reportPrunable(listing: PruneListing, ctx: PruneContext): PruneReport {
   requireHome(ctx.env);
   const dirs = registryDirs(ctx.env);
   const report: PruneReport = {
     stateDir: listing.stateDir,
-    registries: dirs,
+    registries: distinctRegistries(ctx.env, dirs).map(folder => folder.dir),
     free: listing.free,
     kept: [...listing.kept],
     orphans: [],
@@ -338,24 +378,25 @@ export function reportPrunable(listing: PruneListing, ctx: PruneContext): PruneR
     leftoversKept: null,
   };
   const folders = new Set<string>([ctx.cwd]);
-  let stores: Store[] = [];
+  let opened: OpenRegistry[] = [];
   let unreadable: string | null = null;
   try {
-    stores = openRegistries(dirs, ctx.lockWaitMs);
+    opened = openRegistries(ctx.env, dirs, ctx.lockWaitMs);
   } catch (error) {
     unreadable = messageOf(error);
   }
   try {
+    const inUse = fileIdentity(databasePath(listing.stateDir));
+    const others = opened.filter(({ store }) => inUse === null || fileIdentity(databasePath(store.dir)) !== inUse);
     for (const d of listing.unrecorded) {
-      const keep = (reason: string, laneId: string | null = null) =>
-        report.kept.push({ name: d.name, platform: d.platform, id: d.id, laneId, reason });
+      const keep = (reason: string, laneId: string | null = null, registry: string | null = null) =>
+        report.kept.push({ name: d.name, platform: d.platform, id: d.id, laneId, registry, reason });
       if (unreadable !== null) {
         keep(`could not read every registry on this Mac: ${unreadable}`);
         continue;
       }
-      const elsewhere = stores
-        .filter(s => s.dir !== listing.stateDir)
-        .map(s => ({ dir: s.dir, record: recordOf(s, d.name, d.id) }))
+      const elsewhere = others
+        .map(({ store }) => ({ dir: store.dir, record: recordOf(store, d.name, d.id) }))
         .find(found => found.record !== null);
       if (elsewhere?.record) {
         const { laneId } = elsewhere.record;
@@ -364,6 +405,7 @@ export function reportPrunable(listing: PruneListing, ctx: PruneContext): PruneR
             ? `the registry in ${elsewhere.dir} records it`
             : `held by lane ${laneId} in the registry in ${elsewhere.dir}`,
           laneId,
+          elsewhere.dir,
         );
       } else if (d.booted) keep('no registry records it, but it is booted, so something may be using it');
       else {
@@ -377,36 +419,27 @@ export function reportPrunable(listing: PruneListing, ctx: PruneContext): PruneR
         });
       }
     }
-    for (const store of stores) for (const folder of foldersOf(store)) folders.add(folder);
-    const former = stores.find(s => s.dir === formerStateDir(ctx.env));
-    const lanes = former ? lanesIn(former) : [];
-    if (unreadable !== null) report.leftoversKept = `could not read every registry on this Mac: ${unreadable}`;
-    else if (former && lanes.length > 0) report.leftoversKept = formerLanesReason(former.dir, lanes);
+    for (const { store } of opened) for (const folder of foldersOf(store)) folders.add(folder);
+    report.leftoversKept =
+      unreadable === null ? formerLanesIn(opened) : `could not read every registry on this Mac: ${unreadable}`;
   } finally {
-    for (const store of stores) store.close();
+    closeAll(opened);
   }
   const commonDirs = [...folders].map(gitCommonDir).filter((dir): dir is string => dir !== null);
   report.leftovers = formerLeftovers(ctx.env, commonDirs);
   return report;
 }
 
-/**
- * Deletes a device no registry records. Every registry on this Mac stays locked from the check to the deletion, so a
- * lane of either version that records it meanwhile keeps it.
- */
 export function deleteOrphan(ctx: PruneContext, backend: DeviceBackend | undefined, device: OrphanDevice): OrphanResult {
   requireHome(ctx.env);
   const result = (outcome: SweepOutcome, detail: string | null = null): OrphanResult => ({ device, outcome, detail });
   if (!backend) return result('kept', noTool(device.platform));
-  let stores: Store[];
+  let checked: OrphanResult | null;
+  let opened: OpenRegistry[] = [];
   try {
-    stores = openRegistries(registryDirs(ctx.env), ctx.lockWaitMs);
-  } catch (error) {
-    return result('failed', messageOf(error));
-  }
-  try {
-    return underLocks(stores, () => {
-      for (const store of stores) {
+    opened = openRegistries(ctx.env, registryDirs(ctx.env), ctx.lockWaitMs);
+    checked = underLocks(opened, (): OrphanResult | null => {
+      for (const { store } of opened) {
         if (recordOf(store, device.name, device.id)) return result('kept', `the registry in ${store.dir} records it now`);
       }
       let present: BackendDevice | undefined;
@@ -418,18 +451,21 @@ export function deleteOrphan(ctx: PruneContext, backend: DeviceBackend | undefin
       if (!present) return result('gone', 'it no longer exists');
       if (present.name !== device.name) return result('kept', `${device.id} is named ${present.name} now`);
       if (present.booted) return result('kept', 'it was booted after the listing');
-      try {
-        backend.delete(device.id);
-      } catch (error) {
-        return result('failed', messageOf(error));
-      }
-      return result('deleted');
+      return null;
     });
   } catch (error) {
     return result('failed', messageOf(error));
   } finally {
-    for (const store of stores) store.close();
+    closeAll(opened);
   }
+  if (checked) return checked;
+  try {
+    backend.delete(device.id, 'refuse');
+  } catch (error) {
+    if (error instanceof DeviceRunningError) return result('kept', 'it was booted after the listing');
+    return result('failed', messageOf(error));
+  }
+  return result('deleted');
 }
 
 function downloadsDir(env: NodeJS.ProcessEnv): string {
@@ -441,17 +477,36 @@ function withoutAside(name: string): string {
   return at < 0 ? name : name.slice(0, at);
 }
 
-function isLeftoverPath(env: NodeJS.ProcessEnv, leftover: Leftover): boolean {
+function resolvesLiterally(target: string, anchor: string): boolean {
+  try {
+    fs.lstatSync(target);
+  } catch {
+    return true;
+  }
+  try {
+    return fs.realpathSync(target) === path.join(fs.realpathSync(anchor), path.relative(anchor, target));
+  } catch {
+    return false;
+  }
+}
+
+function isLeftoverPath(env: NodeJS.ProcessEnv, leftover: Pick<Leftover, 'kind' | 'path'>): boolean {
   const { kind, path: target } = leftover;
   if (!path.isAbsolute(target) || path.normalize(target) !== target) return false;
   const parent = path.dirname(target);
-  if (kind === 'downloads')
-    return parent === path.dirname(downloadsDir(env)) && withoutAside(path.basename(target)) === FORMER.tool;
+  if (kind === 'downloads') {
+    return (
+      parent === path.dirname(downloadsDir(env)) &&
+      withoutAside(path.basename(target)) === FORMER.tool &&
+      resolvesLiterally(target, parent)
+    );
+  }
   const common = path.dirname(parent);
   return (
     withoutAside(path.basename(target)) === 'build-cache' &&
     path.basename(parent) === FORMER.tool &&
-    gitCommonDir(common) === common
+    gitCommonDir(common) === common &&
+    resolvesLiterally(target, common)
   );
 }
 
@@ -463,63 +518,100 @@ function removeIfEmpty(dir: string): void {
   }
 }
 
-/**
- * Deletes what 0.2.x left, unless 0.2.x's registry has a lane. Its lock is held while each folder is renamed aside, so
- * a 0.2.x lane can't start on a half-deleted folder; the renamed copies are deleted after the lock is let go.
- */
-export function deleteLeftovers(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverResult[] {
+export interface AsideLeftover {
+  leftover: Leftover;
+  aside: string;
+  movedFrom: string | null;
+}
+
+export type LeftoverStep = LeftoverResult | AsideLeftover;
+
+function openFormerRegistries(ctx: PruneContext): OpenRegistry[] {
+  const dirs = registryDirs(ctx.env).filter(dir => isFormerRegistryDir(ctx.env, dir));
+  return openRegistries(ctx.env, dirs, ctx.lockWaitMs);
+}
+
+function moveAside(env: NodeJS.ProcessEnv, leftover: Leftover): LeftoverStep {
+  const done = (outcome: SweepOutcome, detail: string): LeftoverResult => ({ leftover, outcome, detail });
+  if (!isLeftoverPath(env, leftover)) return done('failed', 'refused: it is not a folder 0.2.x leaves');
+  if (!fs.existsSync(leftover.path)) return done('gone', 'it no longer exists');
+  if (path.basename(leftover.path).includes(DELETING)) return { leftover, aside: leftover.path, movedFrom: null };
+  const aside = `${leftover.path}${DELETING}${randomBytes(3).toString('hex')}`;
+  try {
+    fs.renameSync(leftover.path, aside);
+  } catch (error) {
+    return done('failed', messageOf(error));
+  }
+  return { leftover, aside, movedFrom: leftover.path };
+}
+
+export function moveLeftoversAside(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverStep[] {
   requireHome(ctx.env);
   if (leftovers.length === 0) return [];
-  const dir = formerStateDir(ctx.env);
   const all = (outcome: SweepOutcome, detail: string): LeftoverResult[] =>
     leftovers.map(leftover => ({ leftover, outcome, detail }));
-  let store: Store | null;
+  let opened: OpenRegistry[] = [];
   try {
-    store = Store.openExisting(dir, ctx.lockWaitMs);
-  } catch (error) {
-    return all('failed', messageOf(error));
-  }
-  const moved: { leftover: Leftover; aside: string | null; problem: string | null }[] = [];
-  const moveAside = (): string | null => {
-    const lanes = store ? lanesIn(store) : [];
-    if (lanes.length > 0) return formerLanesReason(dir, lanes);
-    for (const leftover of leftovers) {
-      if (!isLeftoverPath(ctx.env, leftover)) {
-        moved.push({ leftover, aside: null, problem: 'refused: it is not a folder 0.2.x leaves' });
-      } else if (!fs.existsSync(leftover.path)) moved.push({ leftover, aside: null, problem: null });
-      else if (path.basename(leftover.path).includes(DELETING)) moved.push({ leftover, aside: leftover.path, problem: null });
-      else {
-        const aside = `${leftover.path}${DELETING}${randomBytes(3).toString('hex')}`;
-        try {
-          fs.renameSync(leftover.path, aside);
-          moved.push({ leftover, aside, problem: null });
-        } catch (error) {
-          moved.push({ leftover, aside: null, problem: messageOf(error) });
-        }
-      }
-    }
-    return null;
-  };
-  let blocked: string | null;
-  try {
-    blocked = store ? store.write(moveAside) : moveAside();
+    opened = openFormerRegistries(ctx);
+    return underLocks(opened, (): LeftoverStep[] => {
+      const blocked = formerLanesIn(opened);
+      return blocked === null ? leftovers.map(leftover => moveAside(ctx.env, leftover)) : all('kept', blocked);
+    });
   } catch (error) {
     return all('failed', messageOf(error));
   } finally {
-    store?.close();
+    closeAll(opened);
   }
-  if (blocked !== null) return all('kept', blocked);
-  return moved.map(({ leftover, aside, problem }): LeftoverResult => {
-    if (problem !== null) return { leftover, outcome: 'failed', detail: problem };
-    if (aside === null) return { leftover, outcome: 'gone', detail: 'it no longer exists' };
-    try {
-      fs.rmSync(aside, { recursive: true, force: true });
-    } catch (error) {
-      return { leftover, outcome: 'failed', detail: `${aside}: ${messageOf(error)}` };
-    }
-    if (leftover.kind === 'build-cache') removeIfEmpty(path.dirname(leftover.path));
-    return { leftover, outcome: 'deleted', detail: null };
-  });
+}
+
+function putBack({ leftover, aside, movedFrom }: AsideLeftover, why: string): LeftoverResult {
+  const kept = (detail: string): LeftoverResult => ({ leftover, outcome: 'kept', detail });
+  if (movedFrom === null) return kept(why);
+  if (fs.existsSync(movedFrom)) return kept(`${why}; ${movedFrom} exists again, so the old copy stays at ${aside}`);
+  try {
+    fs.renameSync(aside, movedFrom);
+  } catch (error) {
+    return kept(`${why}; it stays at ${aside}: ${messageOf(error)}`);
+  }
+  return kept(why);
+}
+
+function remove({ leftover, aside }: AsideLeftover): LeftoverResult {
+  try {
+    fs.rmSync(aside, { recursive: true, force: true });
+  } catch (error) {
+    return { leftover, outcome: 'failed', detail: `${aside}: ${messageOf(error)}` };
+  }
+  if (leftover.kind === 'build-cache') removeIfEmpty(path.dirname(leftover.path));
+  return { leftover, outcome: 'deleted', detail: null };
+}
+
+function isAside(step: LeftoverStep): step is AsideLeftover {
+  return 'aside' in step;
+}
+
+export function finishLeftovers(ctx: PruneContext, steps: readonly LeftoverStep[]): LeftoverResult[] {
+  requireHome(ctx.env);
+  if (!steps.some(isAside)) return steps.filter((step): step is LeftoverResult => !isAside(step));
+  let opened: OpenRegistry[] = [];
+  let restored: LeftoverResult[] | null;
+  const restore = (why: string) => steps.map(step => (isAside(step) ? putBack(step, why) : step));
+  try {
+    opened = openFormerRegistries(ctx);
+    restored = underLocks(opened, () => {
+      const blocked = formerLanesIn(opened);
+      return blocked === null ? null : restore(`${blocked}, found after it was moved aside`);
+    });
+  } catch (error) {
+    restored = restore(`could not check every registry 0.2.x may use: ${messageOf(error)}`);
+  } finally {
+    closeAll(opened);
+  }
+  return restored ?? steps.map(step => (isAside(step) ? remove(step) : step));
+}
+
+export function deleteLeftovers(ctx: PruneContext, leftovers: readonly Leftover[]): LeftoverResult[] {
+  return finishLeftovers(ctx, moveLeftoversAside(ctx, leftovers));
 }
 
 export function formatBytes(bytes: number | null): string {
