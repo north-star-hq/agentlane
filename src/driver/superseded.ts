@@ -211,6 +211,8 @@ export interface OlderVersion {
   lock?: string;
   /** Other candidates' folders this version runs, which stay while it does. */
   needs?: readonly string[];
+  /** Folders that keep this version while one of them stays; it is judged after the other candidates. */
+  heldBy?: readonly string[];
 }
 
 /**
@@ -227,6 +229,8 @@ export interface Launcher {
   /** The variable the tool's processes read what they launch from. */
   variable: string;
   needs: readonly string[];
+  /** Folders a running process whose environment names what it launches may still run from PATH. */
+  onPath?: readonly string[];
 }
 
 export interface RemoveOptions {
@@ -265,9 +269,9 @@ function setsInside(environment: string, variable: string, spellings: readonly s
 }
 
 /**
- * What the launchers' users keep, with why: what a running process's environment says it launches, and everything a
- * launcher needs while a process or lane file runs it without naming what it launches. Each process and each file is
- * judged on its own.
+ * What the launchers' users keep, with why: what a running process's environment says it launches and what the
+ * launcher puts on its PATH, and everything a launcher needs while a process or lane file runs it without naming what it
+ * launches. Each process and each file is judged on its own.
  */
 function launched(
   launchers: readonly Launcher[],
@@ -276,6 +280,7 @@ function launched(
 ): Map<string, string> {
   const needed = new Map<string, string>();
   for (const launcher of launchers) {
+    const name = path.basename(launcher.dir);
     const tool = spellingsOf(launcher.dir);
     const launches = launcher.launches.map(dir => ({ dir, spellings: spellingsOf(dir) }));
     const names = (texts: readonly string[]) => launches.some(launch => mentions(launch.spellings, texts));
@@ -286,9 +291,11 @@ function launched(
       const chosen =
         environment === undefined ? [] : launches.filter(launch => setsInside(environment, launcher.variable, launch.spellings));
       if (chosen.length === 0) unnamed = true;
-      for (const launch of chosen) needed.set(launch.dir, `which a running ${path.basename(launcher.dir)} launches`);
+      for (const launch of chosen) needed.set(launch.dir, `which a running ${name} launches`);
+      for (const dir of chosen.length > 0 ? (launcher.onPath ?? []) : [])
+        needed.set(dir, `which a running ${name} may run from PATH`);
     }
-    if (unnamed) for (const dir of launcher.needs) needed.set(dir, `which ${path.basename(launcher.dir)} may run`);
+    if (unnamed) for (const dir of launcher.needs) needed.set(dir, `which ${name} may run`);
   }
   return needed;
 }
@@ -318,7 +325,7 @@ function lockFor(lock: string, options: RemoveOptions): boolean {
   }
 }
 
-function realOrResolved(file: string): string {
+export function realOrResolved(file: string): string {
   try {
     return fs.realpathSync(file);
   } catch {
@@ -338,7 +345,8 @@ function inside(root: string, dir: string): boolean {
 
 /**
  * Removes the older versions that no running process names on its command line, no recorded lane's files name,
- * no other process is installing, no kept version needs and no launcher may run. Returns the folders removed.
+ * no other process is installing, no kept version needs, no launcher may run and no folder that stays holds. Returns the
+ * folders removed.
  */
 export function removeOlderVersions(candidates: readonly OlderVersion[], options: RemoveOptions): string[] {
   if (candidates.length === 0) return [];
@@ -371,6 +379,27 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
   const commandTexts = commands.map(command => command.args);
   const laneTexts = lanes.flat();
   const removed: string[] = [];
+  const remove = (version: OlderVersion) => {
+    if (version.lock !== undefined && !lockFor(version.lock, options)) {
+      keep(version, 'which another process is installing');
+      return;
+    }
+    const aside = path.join(path.dirname(version.dir), `${REMOVING}${path.basename(version.dir)}-${String(process.pid)}`);
+    const moved = bestEffort(() => {
+      fs.renameSync(version.dir, aside);
+    });
+    if (version.lock !== undefined) unlock(version.lock, options.me);
+    if (!moved) {
+      neededBy(version);
+      return;
+    }
+    bestEffort(() => {
+      fs.rmSync(aside, { recursive: true, force: true });
+    });
+    removed.push(version.dir);
+    options.log(`removed ${version.dir}, which this version supersedes`);
+  };
+  const held: OlderVersion[] = [];
   for (const version of [...older.filter(v => v.needs), ...older.filter(v => !v.needs)]) {
     const why = needed.get(version.dir);
     if (why !== undefined) {
@@ -385,24 +414,15 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
       keep(version, 'which a lane that is up runs');
       continue;
     }
-    if (version.lock !== undefined && !lockFor(version.lock, options)) {
-      keep(version, 'which another process is installing');
-      continue;
-    }
-    const aside = path.join(path.dirname(version.dir), `${REMOVING}${path.basename(version.dir)}-${String(process.pid)}`);
-    const moved = bestEffort(() => {
-      fs.renameSync(version.dir, aside);
-    });
-    if (version.lock !== undefined) unlock(version.lock, options.me);
-    if (!moved) {
-      neededBy(version);
-      continue;
-    }
-    bestEffort(() => {
-      fs.rmSync(aside, { recursive: true, force: true });
-    });
-    removed.push(version.dir);
-    options.log(`removed ${version.dir}, which this version supersedes`);
+    if ((version.heldBy ?? []).length > 0) held.push(version);
+    else remove(version);
+  }
+  for (const version of held) {
+    const why = needed.get(version.dir);
+    const holder = version.heldBy?.find(dir => fs.existsSync(dir));
+    if (why !== undefined) options.log(`kept ${version.dir}, ${why}`);
+    else if (holder !== undefined) options.log(`kept ${version.dir}, since ${holder} stays`);
+    else remove(version);
   }
   return removed;
 }

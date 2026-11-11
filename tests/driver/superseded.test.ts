@@ -225,3 +225,40 @@ test('a registry that cannot say whether a lane uses a version keeps every versi
   assert.equal(fs.existsSync(old), true);
   assert.match(lines.join('\n'), /a registry could not say whether a lane uses them/);
 });
+
+test('a version held by other folders stays while one of them does, without keeping what else it needs, and goes after them', () => {
+  const root = fs.realpathSync(tempDir('superseded-held'));
+  const [used = '', unused = ''] = ['chromium-1', 'ffmpeg-1'].map(name => version(path.join(root, 'browsers'), name));
+  const core = version(path.join(root, 'core'), '1.0.0');
+  const candidates = [{ dir: core, needs: [used, unused], heldBy: [used, unused] }, { dir: used }, { dir: unused }];
+  const lines: string[] = [];
+  const running = removeOlderVersions(candidates, {
+    ...options(root, lines),
+    commandLines: runningCommands(`${used}/bin/tool --headless`),
+  });
+  assert.deepEqual(running, [unused], lines.join('\n'));
+  assert.ok(lines.includes(`kept ${core}, since ${used} stays`), lines.join('\n'));
+  assert.deepEqual(removeOlderVersions(candidates, options(root, [])), [used, core]);
+});
+
+test('a running process whose environment names what a launcher launches also keeps what the launcher puts on its PATH', () => {
+  const root = fs.realpathSync(tempDir('superseded-path'));
+  const [launched = '', ffmpeg = ''] = ['shell-1', 'ffmpeg-1'].map(name => version(path.join(root, 'browsers'), name));
+  const tool = path.join(root, 'tool');
+  const binary = path.join(tool, '1.0.0', 'bin', 'tool');
+  const launcher = { dir: tool, launches: [launched], variable: 'EXECUTABLE', needs: [launched, ffmpeg], onPath: [ffmpeg] };
+  const lines: string[] = [];
+  const removed = removeOlderVersions([{ dir: launched }, { dir: ffmpeg }], {
+    ...options(root, lines),
+    commandLines: () => [{ args: `${binary} --session lane`, environment: () => `EXECUTABLE=${launched}/bin/tool` }],
+    launchers: [launcher],
+  });
+  assert.deepEqual(removed, [], lines.join('\n'));
+  assert.ok(lines.includes(`kept ${ffmpeg}, which a running tool may run from PATH`), lines.join('\n'));
+  const named = removeOlderVersions([{ dir: launched }, { dir: ffmpeg }], {
+    ...options(root, []),
+    laneTools: () => [[`exec ${binary}\nEXECUTABLE=${launched}/bin/tool`]],
+    launchers: [launcher],
+  });
+  assert.deepEqual(named, [ffmpeg], 'a lane file that names what it launches keeps no more than that');
+});

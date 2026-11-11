@@ -11,6 +11,7 @@ import { tryLock, unlock } from '../driver/lock.ts';
 import {
   compareVersions,
   laneToolsOf,
+  realOrResolved,
   removeOlderVersions,
   systemCommandLines,
   type CommandLines,
@@ -85,8 +86,13 @@ interface Marker {
 const MARKER = '.agentlane-installed';
 const LOCK_WAIT_MS = 15 * 60_000;
 
+/** The browsers folder the toolkit installs the pinned builds in and links its playwright-cores from. */
+function sharedBrowsersPath(env: NodeJS.ProcessEnv): string {
+  return path.join(dataDir(env), 'playwright', 'browsers');
+}
+
 export function browsersPath(env: NodeJS.ProcessEnv): string {
-  return env[BROWSERS_OVERRIDE_ENV] ?? path.join(dataDir(env), 'playwright', 'browsers');
+  return env[BROWSERS_OVERRIDE_ENV] ?? sharedBrowsersPath(env);
 }
 
 function playwrightHome(env: NodeJS.ProcessEnv, release: PlaywrightRelease): string {
@@ -405,11 +411,11 @@ function packagesBy(parent: string, version: string, order: (compared: number) =
     .map(name => path.join(parent, name));
 }
 
-/** The browser folders a playwright-core runs, by its `browsers.json`; undefined when that can't be read. */
-function pinnedBrowsers(core: string, base: string): string[] | undefined {
+/** The browser folders a playwright-core package runs, by its `browsers.json`; undefined when that can't be read. */
+function browsersNamedBy(pkg: string, base: string): string[] | undefined {
   try {
     const pins = (
-      JSON.parse(fs.readFileSync(path.join(core, 'package', 'browsers.json'), 'utf8')) as {
+      JSON.parse(fs.readFileSync(path.join(pkg, 'browsers.json'), 'utf8')) as {
         browsers: { name: string; revision: string; revisionOverrides?: Record<string, string> }[];
       }
     ).browsers;
@@ -423,6 +429,47 @@ function pinnedBrowsers(core: string, base: string): string[] | undefined {
   }
 }
 
+function pinnedBrowsers(core: string, base: string): string[] | undefined {
+  return browsersNamedBy(path.join(core, 'package'), base);
+}
+
+interface Link {
+  file: string;
+  /** The playwright-core package the link points at, as written. */
+  target: string;
+  /**
+   * That package's real path; undefined when the link's file can't be read or holds a relative path, which Playwright's
+   * `require` reads from Playwright's own folder.
+   */
+  real: string | undefined;
+  /** The browser folders the package's `browsers.json` names; undefined when Playwright's own cleanup can't read it. */
+  names: string[] | undefined;
+}
+
+/**
+ * The entries of a browsers folder's `.links`, read as Playwright's own cleanup reads them: each holds the path of a
+ * playwright-core package, whose `browsers.json` names the browser folders that cleanup keeps.
+ */
+function linksOf(base: string): Link[] {
+  let files: string[];
+  try {
+    files = fs.readdirSync(path.join(base, '.links'));
+  } catch {
+    return [];
+  }
+  return files.map(name => {
+    const file = path.join(base, '.links', name);
+    let target = '';
+    try {
+      target = fs.readFileSync(file, 'utf8');
+    } catch {
+      return { file, target, real: undefined, names: undefined };
+    }
+    if (!path.isAbsolute(target)) return { file, target, real: undefined, names: undefined };
+    return { file, target, real: realOrResolved(target), names: browsersNamedBy(target, base) };
+  });
+}
+
 /** The browser folders the toolkit installed, each with the pinned build it is a revision of. */
 function installedBuilds(base: string, builds: readonly BrowserBuild[]): { dir: string; pin: BrowserBuild; revision: string }[] {
   return installedFolders(base).flatMap(name => {
@@ -432,10 +479,8 @@ function installedBuilds(base: string, builds: readonly BrowserBuild[]): { dir: 
   });
 }
 
-function olderBrowsers(base: string, builds: readonly BrowserBuild[]): OlderVersion[] {
-  return installedBuilds(base, builds)
-    .filter(build => compareVersions(build.revision, build.pin.revision) < 0)
-    .map(build => ({ dir: build.dir }));
+function olderBrowsers(base: string, builds: readonly BrowserBuild[]): { dir: string; pin: BrowserBuild }[] {
+  return installedBuilds(base, builds).filter(build => compareVersions(build.revision, build.pin.revision) < 0);
 }
 
 function linkOf(base: string, core: string): string {
@@ -451,9 +496,11 @@ function linkPlaywright(base: string, core: string): void {
 /**
  * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
  * Then removes the older driver packages and browsers it installed that no running process, no file of a recorded
- * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses. A running agent-browser keeps the browser its
- * environment names, and every older browser stays while a process or a lane's file runs agent-browser, of any
- * version, without naming the browser it launches.
+ * lane's `bin/` or `browser/ffmpeg/ffmpeg`, no kept version and no readable link in the browsers folder's `.links` uses.
+ * A running agent-browser keeps the browser its environment names and every older ffmpeg, and every older browser stays
+ * while a process or a lane's file runs agent-browser, of any version, without naming the browser it launches. An older
+ * playwright-core stays, with its link, while an older browser it pins does: Playwright's own install deletes every
+ * browser folder that no link names, unless PLAYWRIGHT_SKIP_BROWSER_GC is set.
  */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
@@ -513,10 +560,12 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
     }
     const after = installState(options.env, driver, releases);
     if (after.kind !== 'installed') throw new DriverError(describeInstallState(driver, after), `retry ${INSTALL_FIX}`);
-    const base = browsersPath(options.env);
+    const log = options.log ?? (() => undefined);
+    const base = sharedBrowsersPath(options.env);
     const cores = path.dirname(core);
     const overridden = options.env[BROWSERS_OVERRIDE_ENV] !== undefined;
-    const browsers = overridden ? [] : olderBrowsers(base, playwright.browsers);
+    const olderInstalled = olderBrowsers(base, playwright.browsers);
+    const browsers = overridden ? [] : olderInstalled;
     const all = browsers.map(b => b.dir);
     const agentBrowsers = path.dirname(agentBrowserHome(options.env, agentBrowser));
     const launches = overridden
@@ -525,10 +574,31 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
           .filter(b => b.pin.name !== 'ffmpeg')
           .map(b => b.dir);
     const newer = packagesBy(cores, playwright.version, order => order > 0).map(dir => pinnedBrowsers(dir, base) ?? all);
+    const olderCores = packagesBy(cores, playwright.version, order => order < 0);
+    const links = linksOf(base);
+    const coreLinks = new Map(
+      olderCores.map(dir => {
+        const real = realOrResolved(path.join(dir, 'package'));
+        return [dir, links.filter(link => link.real === real)] as const;
+      }),
+    );
+    const ownLinks = new Set([...coreLinks.values()].flat());
+    const named = new Map(
+      links.filter(link => !ownLinks.has(link)).flatMap(link => (link.names ?? []).map(dir => [dir, link.target] as const)),
+    );
+    const candidates = browsers.filter(b => !newer.flat().includes(b.dir));
+    for (const b of candidates) {
+      const by = named.get(b.dir);
+      if (by !== undefined) log(`kept ${b.dir}, which ${by} names`);
+    }
+    const olderFolders = olderInstalled.map(b => b.dir);
     const older: OlderVersion[] = [
-      ...packagesBy(cores, playwright.version, order => order < 0).map(dir => ({ dir, needs: pinnedBrowsers(dir, base) ?? all })),
+      ...olderCores.map(dir => {
+        const pins = pinnedBrowsers(dir, base);
+        return { dir, needs: pins ?? all, heldBy: olderFolders.filter(folder => pins?.includes(folder)) };
+      }),
       ...packagesBy(agentBrowsers, agentBrowser.version, order => order < 0).map(dir => ({ dir, needs: all })),
-      ...browsers.filter(b => !newer.flat().includes(b.dir)),
+      ...candidates.filter(b => !named.has(b.dir)).map(b => ({ dir: b.dir })),
     ];
     const removed = removeOlderVersions(older, {
       root: namedDataDir(options.env),
@@ -536,11 +606,21 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
       laneTools: options.laneTools ?? laneToolsOf(options.env),
-      launchers: [{ dir: agentBrowsers, launches, variable: EXECUTABLE_PATH_ENV, needs: all }],
-      log: options.log ?? (() => undefined),
+      launchers: [
+        {
+          dir: agentBrowsers,
+          launches,
+          variable: EXECUTABLE_PATH_ENV,
+          needs: all,
+          onPath: browsers.filter(b => b.pin.name === 'ffmpeg').map(b => b.dir),
+        },
+      ],
+      log,
     });
     for (const dir of removed.filter(d => path.dirname(d) === cores)) {
-      fs.rmSync(linkOf(base, path.join(dir, 'package')), { force: true });
+      for (const file of [linkOf(base, path.join(dir, 'package')), ...(coreLinks.get(dir) ?? []).map(link => link.file)]) {
+        fs.rmSync(file, { force: true });
+      }
     }
     return after.driver;
   } finally {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { browserVariables, writeDriverFiles } from '../../src/browser/env.ts';
 import {
+  BROWSERS_OVERRIDE_ENV,
   browsersPath,
   describeInstallState,
   ensureBrowserDriver,
@@ -17,6 +18,7 @@ import {
 import { browserPaths, type BrowserPaths } from '../../src/browser/paths.ts';
 import type { AgentBrowserRelease, BrowserBuild, PlaywrightRelease } from '../../src/browser/release.ts';
 import { DriverError } from '../../src/driver/errors.ts';
+import { bestEffort } from '../../src/driver/lock.ts';
 import type { CommandLines } from '../../src/driver/superseded.ts';
 import { FORMER } from '../../src/name.ts';
 import { shellQuote } from '../../src/registry/format.ts';
@@ -411,7 +413,10 @@ test('newer pins keep a browser a running process uses, and folders the toolkit 
   assert.ok(fs.existsSync(foreign));
   assert.ok(lines.includes(`kept ${path.join(a.browsersPath, 'chromium-1')}, which a running process uses`), lines.join('\n'));
   assert.equal(fs.existsSync(path.join(a.browsersPath, 'ffmpeg-2')), false);
-  assert.equal(fs.existsSync(path.dirname(a.playwrightCore)), false);
+  assert.ok(
+    lines.includes(`kept ${path.dirname(a.playwrightCore)}, since ${path.join(a.browsersPath, 'chromium-1')} stays`),
+    lines.join('\n'),
+  );
 });
 
 test('an older playwright-core kept by a running daemon keeps the browsers it pins, and an older agent-browser keeps them too', async () => {
@@ -600,7 +605,7 @@ function agentBrowserLane(s: Served, layout: (typeof layouts)[number], install: 
   return lane;
 }
 
-test('an agent-browser lane keeps the browsers it was set up with through newer Playwright pins and the same agent-browser, with nothing running', async () => {
+test('an agent-browser lane keeps the browsers it was set up with, and the core that names them, through newer Playwright pins and the same agent-browser, with nothing running', async () => {
   for (const layout of layouts) {
     for (const installing of ['playwright', 'agent-browser'] as const) {
       const s = served();
@@ -617,7 +622,7 @@ test('an agent-browser lane keeps the browsers it was set up with through newer 
       assert.ok(fs.existsSync(shell), `${shell}\n${why}`);
       assert.equal(spawnSync(shell, { encoding: 'utf8' }).stdout.trim(), 'browser', why);
       for (const file of [a.chrome, a.ffmpeg]) assert.ok(fs.existsSync(file), `${file}\n${why}`);
-      assert.equal(fs.existsSync(path.dirname(a.playwrightCore)), false, why);
+      assert.ok(fs.existsSync(path.dirname(a.playwrightCore)), why);
     }
   }
 });
@@ -669,6 +674,7 @@ test('a lane this version writes names the browsers it was set up with in its bi
     folders(s).sort(),
     [
       path.join('agent-browser', '1.1.1'),
+      path.join('playwright', '9.9.9'),
       path.join('playwright', '9.10.0'),
       ...['chromium-1', 'chromium-3', 'chromium_headless_shell-1', 'chromium_headless_shell-3', 'ffmpeg-2', 'ffmpeg-3'].map(
         name => path.join(browsers, name),
@@ -805,7 +811,7 @@ function laneVariables(s: Served, install: InstalledDriver, recorded: boolean): 
   return browserVariables({ browser, paths, install, headed: false, url: null }, '/usr/bin:/bin');
 }
 
-test('a running agent-browser keeps the browser its environment names, and a newer install removes the older browsers nothing names', async () => {
+test('a running agent-browser keeps the browser its environment names and every older ffmpeg, and a newer install removes the older browsers nothing names', async () => {
   for (const recorded of [true, false]) {
     const s = served();
     const { b } = await twoRevisions(s);
@@ -821,18 +827,24 @@ test('a running agent-browser keeps the browser its environment names, and a new
       }),
     );
     const browsers = path.join('playwright', 'browsers');
-    const kept = recorded ? ['chromium-3', 'chromium_headless_shell-3', 'ffmpeg-3'] : ['chromium_headless_shell-3'];
+    const kept = recorded ? ['chromium-3', 'chromium_headless_shell-3'] : ['chromium_headless_shell-3'];
     assert.deepEqual(
       folders(s).sort(),
       [
         path.join('agent-browser', '1.1.1'),
-        path.join('playwright', '9.11.0'),
-        ...[...kept, 'chromium-4', 'chromium_headless_shell-4', 'ffmpeg-4'].map(name => path.join(browsers, name)),
+        ...['9.9.9', '9.10.0', '9.11.0'].map(version => path.join('playwright', version)),
+        ...[...kept, 'ffmpeg-2', 'ffmpeg-3', 'chromium-4', 'chromium_headless_shell-4', 'ffmpeg-4'].map(name =>
+          path.join(browsers, name),
+        ),
       ].sort(),
       `${recorded ? 'recorded' : 'unrecorded'} lane\n${lines.join('\n')}`,
     );
     assert.ok(
       lines.includes(`kept ${path.join(b.browsersPath, 'chromium_headless_shell-3')}, which a running agent-browser launches`),
+      lines.join('\n'),
+    );
+    assert.ok(
+      lines.includes(`kept ${path.join(b.browsersPath, 'ffmpeg-2')}, which a running agent-browser may run from PATH`),
       lines.join('\n'),
     );
   }
@@ -854,12 +866,24 @@ async function standInDaemon(install: InstalledDriver, environment: Record<strin
   });
   return () =>
     new Promise(resolve => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve();
+        return;
+      }
       child.once('exit', () => {
         resolve();
       });
       child.kill();
     });
 }
+
+test('the stand-in daemon stops at once when it has already exited', { timeout: 10_000 }, async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  const stop = await standInDaemon(a, { PATH: '/usr/bin:/bin' });
+  await stop();
+  await stop();
+});
 
 test('a running agent-browser keeps the browser its environment names, as ps shows that environment', async () => {
   for (const names of [true, false]) {
@@ -936,4 +960,229 @@ test("a newer install keeps the browser revisions a project's own Playwright dow
   assert.equal(fs.readFileSync(link, 'utf8'), project);
   for (const file of [a.chrome, a.headlessShell, a.ffmpeg])
     assert.equal(fs.existsSync(file), false, `${file}\n${lines.join('\n')}`);
+});
+
+const PLAYWRIGHT_BROWSER_NAMES = [
+  'android',
+  'chromium',
+  'firefox',
+  'webkit',
+  'ffmpeg',
+  'firefox-beta',
+  'chromium-tip-of-tree',
+  'chromium-headless-shell',
+  'chromium-tip-of-tree-headless-shell',
+  'winldd',
+];
+
+/**
+ * What Playwright 1.64.0's `install` does to its browsers folder once it has installed, unless PLAYWRIGHT_SKIP_BROWSER_GC
+ * is set: it deletes every browser folder that no readable link in `.links` names with an INSTALLATION_COMPLETE inside,
+ * then every link it can't read. A copy of `Registry._validateInstallationCache`, `readDescriptors` and
+ * `isBrowserDirectory` in its lib/coreBundle.js, except that a relative link, which its `require` reads from
+ * Playwright's own folder, counts as one it can't read. Returns the folders it deleted.
+ */
+function playwrightCleanup(registryDirectory: string, hostPlatform = 'mac15-arm64'): string[] {
+  const linksDir = path.join(registryDirectory, '.links');
+  const used = new Set<string>();
+  const broken: string[] = [];
+  for (const fileName of fs.readdirSync(linksDir)) {
+    const linkPath = path.join(linksDir, fileName);
+    try {
+      const linkTarget = fs.readFileSync(linkPath).toString();
+      if (!path.isAbsolute(linkTarget)) throw new Error(`require reads ${linkTarget} as a module name`);
+      const browsersJSON = JSON.parse(fs.readFileSync(path.join(linkTarget, 'browsers.json'), 'utf8')) as {
+        browsers: { name: string; revision: string; revisionOverrides?: Record<string, string> }[];
+      };
+      const descriptors = browsersJSON.browsers.map(obj => {
+        const override = obj.revisionOverrides?.[hostPlatform] ?? '';
+        const revision = override === '' ? obj.revision : override;
+        const prefix = override === '' ? obj.name : `${obj.name}_${hostPlatform}_special`;
+        return { name: obj.name, revision, dir: path.join(registryDirectory, `${prefix.replace(/-/g, '_')}-${revision}`) };
+      });
+      for (const browserName of PLAYWRIGHT_BROWSER_NAMES) {
+        const descriptor = descriptors.find(d => d.name === browserName);
+        if (!descriptor) continue;
+        const version = parseInt(descriptor.revision, 10);
+        const shouldHaveMarkerFile =
+          (browserName === 'chromium' && (version >= 786218 || version < 3e5)) ||
+          (browserName === 'firefox' && version >= 1128) ||
+          (browserName === 'webkit' && version >= 1307) ||
+          (browserName !== 'firefox' && browserName !== 'chromium' && browserName !== 'webkit');
+        if (!shouldHaveMarkerFile || fs.existsSync(path.join(descriptor.dir, 'INSTALLATION_COMPLETE'))) used.add(descriptor.dir);
+      }
+    } catch {
+      broken.push(linkPath);
+    }
+  }
+  const stale = fs
+    .readdirSync(registryDirectory)
+    .map(name => path.join(registryDirectory, name))
+    .filter(dir => PLAYWRIGHT_BROWSER_NAMES.some(name => path.basename(dir).startsWith(`${name.replace(/-/g, '_')}-`)))
+    .filter(dir => !used.has(dir));
+  for (const dir of stale) fs.rmSync(dir, { recursive: true, force: true });
+  for (const link of broken) {
+    bestEffort(() => {
+      fs.unlinkSync(link);
+    });
+  }
+  return stale.map(dir => path.basename(dir));
+}
+
+function linkName(pkg: string): string {
+  return crypto.createHash('sha1').update(pkg).digest('hex');
+}
+
+/** What a project's `npx playwright install` of its own Playwright does in a lane: its browsers, its link, the cleanup. */
+function projectInstall(s: Served, base: string): string[] {
+  const project = path.join(s.root, 'project', 'node_modules', 'playwright-core');
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(project, 'browsers.json'), browsersJson('7', '7'));
+  for (const name of ['chromium-7', 'chromium_headless_shell-7', 'ffmpeg-7']) {
+    fs.mkdirSync(path.join(base, name), { recursive: true });
+    fs.writeFileSync(path.join(base, name, 'INSTALLATION_COMPLETE'), '');
+  }
+  fs.writeFileSync(path.join(base, '.links', linkName(project)), project);
+  return playwrightCleanup(base);
+}
+
+function laneDown(dir: string, id: string): void {
+  const store = Store.open(dir, 5000);
+  try {
+    store.write(() => {
+      store.db.prepare('DELETE FROM claims WHERE id = ?').run(id);
+    });
+  } finally {
+    store.close();
+  }
+}
+
+test("the browsers a newer install keeps for an agent-browser lane of either version outlast a project's Playwright install, and go with their core once the lane does", async () => {
+  for (const layout of layouts) {
+    for (const installing of ['playwright', 'agent-browser'] as const) {
+      const s = served();
+      const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+      const lane =
+        layout === '0.4.1'
+          ? a
+          : await ensureBrowserDriver(
+              'agent-browser',
+              s.options({ playwright: later(s, '9.10.0', '3').playwright, commandLines: nobodyRunning }),
+            );
+      agentBrowserLane(s, layout, lane);
+      const newer = layout === '0.4.1' ? later(s, '9.10.0', '3') : later(s, '9.11.0', '4');
+      const lines: string[] = [];
+      await ensureBrowserDriver(
+        installing,
+        s.options({ playwright: newer.playwright, commandLines: nobodyRunning, log: line => lines.push(line) }),
+      );
+      const link = path.join(lane.browsersPath, '.links', linkName(lane.playwrightCore));
+      const why = `${layout} lane, ${installing} install\n${lines.join('\n')}`;
+      assert.equal(fs.readFileSync(link, 'utf8'), lane.playwrightCore, why);
+      const deleted = projectInstall(s, lane.browsersPath);
+      for (const file of [lane.headlessShell, lane.chrome, lane.ffmpeg]) {
+        assert.ok(fs.existsSync(file), `${file}\nPlaywright deleted ${deleted.join(', ')}\n${why}`);
+      }
+      assert.equal(spawnSync(lane.headlessShell, { encoding: 'utf8' }).stdout.trim(), 'browser', why);
+
+      laneDown(
+        layout === '0.4.1' ? path.join(s.env.XDG_STATE_HOME ?? '', FORMER.tool) : (s.env.AGENTLANE_STATE_DIR ?? ''),
+        '0a1b2c3d',
+      );
+      const after: string[] = [];
+      const latest = await ensureBrowserDriver(
+        installing,
+        s.options({ playwright: later(s, '9.12.0', '5').playwright, commandLines: nobodyRunning, log: line => after.push(line) }),
+      );
+      const browsers = path.join('playwright', 'browsers');
+      assert.deepEqual(
+        folders(s).sort(),
+        [
+          path.join('agent-browser', '1.1.1'),
+          path.join('playwright', '9.12.0'),
+          ...['chromium-5', 'chromium_headless_shell-5', 'ffmpeg-5', 'chromium-7', 'chromium_headless_shell-7', 'ffmpeg-7'].map(
+            name => path.join(browsers, name),
+          ),
+        ].sort(),
+        `${layout} lane, ${installing} install\n${after.join('\n')}`,
+      );
+      assert.deepEqual(
+        fs
+          .readdirSync(path.join(latest.browsersPath, '.links'))
+          .map(name => fs.readFileSync(path.join(latest.browsersPath, '.links', name), 'utf8'))
+          .sort(),
+        [latest.playwrightCore, path.join(s.root, 'project', 'node_modules', 'playwright-core')].sort(),
+      );
+    }
+  }
+});
+
+test("a newer install keeps the older revisions a project's own Playwright link names, and removes them when Playwright can't read that link", async () => {
+  for (const link of ['readable', 'no browsers.json', 'not JSON', 'no package']) {
+    const s = served();
+    const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+    const project = path.join(s.root, 'project', 'node_modules', 'playwright-core');
+    if (link !== 'no package') fs.mkdirSync(project, { recursive: true });
+    if (link === 'readable' || link === 'not JSON') {
+      fs.writeFileSync(path.join(project, 'browsers.json'), link === 'readable' ? browsersJson('1', '2') : '{"browsers": [');
+    }
+    const file = path.join(a.browsersPath, '.links', linkName(project));
+    fs.writeFileSync(file, project);
+    const lines: string[] = [];
+    await ensureBrowserDriver(
+      'playwright',
+      s.options({ ...later(s, '9.10.0', '3'), commandLines: nobodyRunning, log: line => lines.push(line) }),
+    );
+    const why = `${link} link\n${lines.join('\n')}`;
+    for (const browser of [a.chrome, a.headlessShell, a.ffmpeg]) {
+      assert.equal(fs.existsSync(browser), link === 'readable', `${browser}\n${why}`);
+    }
+    if (link === 'readable') {
+      assert.ok(lines.includes(`kept ${path.join(a.browsersPath, 'chromium-1')}, which ${project} names`), why);
+    }
+    assert.equal(fs.readFileSync(file, 'utf8'), project, why);
+  }
+});
+
+test('a link to an older core by another spelling of its path counts as that core’s, and goes with it', async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+  const alias = path.join(s.root, 'alias');
+  fs.symlinkSync(path.join(s.env.HOME ?? '', '.local', 'share'), alias);
+  const spelled = path.join(alias, path.relative(path.join(s.env.HOME ?? '', '.local', 'share'), a.playwrightCore));
+  assert.ok(fs.existsSync(path.join(spelled, 'browsers.json')), spelled);
+  const other = path.join(a.browsersPath, '.links', linkName(spelled));
+  fs.writeFileSync(other, spelled);
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'playwright',
+    s.options({ ...later(s, '9.10.0', '3'), commandLines: nobodyRunning, log: line => lines.push(line) }),
+  );
+  for (const file of [a.chrome, a.headlessShell, a.ffmpeg, path.dirname(a.playwrightCore), other]) {
+    assert.equal(fs.existsSync(file), false, `${file}\n${lines.join('\n')}`);
+  }
+});
+
+test("an install into another browsers folder keeps an older core, and its link, while the toolkit's folder holds the older browsers it pins", async () => {
+  const s = served();
+  const a = await ensureBrowserDriver('agent-browser', s.options({ commandLines: nobodyRunning }));
+  agentBrowserLane(s, '0.4.1', a);
+  const own = path.join(s.root, 'own-browsers');
+  fs.mkdirSync(own);
+  const lines: string[] = [];
+  await ensureBrowserDriver(
+    'playwright',
+    s.options({
+      env: { ...s.env, [BROWSERS_OVERRIDE_ENV]: own },
+      ...later(s, '9.10.0', '3'),
+      commandLines: nobodyRunning,
+      log: line => lines.push(line),
+    }),
+  );
+  const why = lines.join('\n');
+  assert.equal(fs.readFileSync(path.join(a.browsersPath, '.links', linkName(a.playwrightCore)), 'utf8'), a.playwrightCore, why);
+  const deleted = projectInstall(s, a.browsersPath);
+  for (const file of [a.headlessShell, a.chrome, a.ffmpeg]) {
+    assert.ok(fs.existsSync(file), `${file}\nPlaywright deleted ${deleted.join(', ')}\n${why}`);
+  }
 });
