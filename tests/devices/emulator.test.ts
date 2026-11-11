@@ -86,8 +86,20 @@ test("the AVD list reads each AVD's device profile and system image from its fil
   assert.deepEqual(
     readAvds(home).sort((a, b) => a.name.localeCompare(b.name)),
     [
-      { name: 'agentlane-emu-0a1b2c', deviceType: 'pixel_8', runtime: 'system-images;android-36;google_apis;arm64-v8a' },
-      { name: 'my-pixel-api36', deviceType: 'pixel_7', runtime: '' },
+      {
+        name: 'agentlane-emu-0a1b2c',
+        deviceType: 'pixel_8',
+        runtime: 'system-images;android-36;google_apis;arm64-v8a',
+        ini: path.join(home, 'agentlane-emu-0a1b2c.ini'),
+        dir: `${home}/agentlane-emu-0a1b2c.avd`,
+      },
+      {
+        name: 'my-pixel-api36',
+        deviceType: 'pixel_7',
+        runtime: '',
+        ini: path.join(home, 'my-pixel-api36.ini'),
+        dir: path.join(home, 'my-pixel-api36.avd'),
+      },
     ],
   );
   assert.equal(

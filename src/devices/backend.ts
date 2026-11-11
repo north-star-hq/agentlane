@@ -21,6 +21,12 @@ export interface BackendDevice {
   runtime: string;
   booted: boolean;
   serial?: string;
+  disk?: DeviceDisk;
+}
+
+export interface DeviceDisk {
+  paths: string[];
+  bytes: number | null;
 }
 
 export interface DeviceBackend {

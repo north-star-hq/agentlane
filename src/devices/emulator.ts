@@ -39,6 +39,8 @@ export interface Avd {
   name: string;
   deviceType: string;
   runtime: string;
+  ini: string;
+  dir: string;
 }
 
 function isFile(file: string): boolean {
@@ -197,13 +199,15 @@ export function readAvds(home: string): Avd[] {
   }
   return files.map(file => {
     const name = file.slice(0, -'.ini'.length);
-    const pointer = readProperties(path.join(home, file));
-    const dir = pointer.get('path') ?? path.join(home, `${name}.avd`);
+    const ini = path.join(home, file);
+    const dir = readProperties(ini).get('path') ?? path.join(home, `${name}.avd`);
     const config = readProperties(path.join(dir, 'config.ini'));
     return {
       name,
       deviceType: config.get('hw.device.name') ?? '',
       runtime: sysdirToImage(config.get('image.sysdir.1') ?? ''),
+      ini,
+      dir,
     };
   });
 }
@@ -342,6 +346,7 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
           deviceType: avd.deviceType,
           runtime: avd.runtime,
           booted: live.has(avd.name),
+          disk: { paths: [avd.ini, avd.dir], bytes: null },
           ...(serial ? { serial } : {}),
         };
       });

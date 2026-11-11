@@ -13,11 +13,25 @@ export const STATE_DIR_ENV = envName('STATE_DIR');
 export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[STATE_DIR_ENV];
   if (override) return path.resolve(override);
-  const xdg = env.XDG_STATE_HOME;
-  const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.local', 'state');
-  const own = path.join(base, TOOL);
-  const former = path.join(base, FORMER.tool);
+  const own = path.join(stateBase(env), TOOL);
+  const former = formerStateDir(env);
   return !fs.existsSync(databasePath(own)) && fs.existsSync(databasePath(former)) ? former : own;
+}
+
+function stateBase(env: NodeJS.ProcessEnv): string {
+  const xdg = env.XDG_STATE_HOME;
+  if (xdg && path.isAbsolute(xdg)) return xdg;
+  return path.join(env.HOME && path.isAbsolute(env.HOME) ? env.HOME : os.homedir(), '.local', 'state');
+}
+
+/** The only state folder 0.2.x reads, so the one whose registry holds every 0.2.x lane. */
+export function formerStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(stateBase(env), FORMER.tool);
+}
+
+/** Every state folder whose registry may record a device on this Mac: the one in use, this version's and 0.2.x's. */
+export function registryDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [...new Set([stateDir(env), path.join(stateBase(env), TOOL), formerStateDir(env)])];
 }
 
 export interface DiskNames {

@@ -44,6 +44,8 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
           name: 'agentlane-pool-aaaaaa',
           state: 'Booted',
           deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
+          dataPath: '/Users/me/Library/Developer/CoreSimulator/Devices/U1/data',
+          dataPathSize: 3810119680,
         },
         {
           udid: 'U2',
@@ -62,6 +64,7 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
       deviceType: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
       runtime: 'com.apple.CoreSimulator.SimRuntime.iOS-26-5',
       booted: true,
+      disk: { paths: ['/Users/me/Library/Developer/CoreSimulator/Devices/U1'], bytes: 3810119680 },
     },
     {
       id: 'U2',
