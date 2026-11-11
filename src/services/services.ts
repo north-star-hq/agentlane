@@ -7,7 +7,7 @@ import { CLI } from '../name.ts';
 import type { ReadyCheck, ServiceConfig } from '../project/config.ts';
 import type { ServiceProcess } from '../registry/types.ts';
 import type { ServiceSystem } from './system.ts';
-import { describeStart, type ProcessIdentity } from '../processes.ts';
+import { describeStart, startMs, type ProcessIdentity } from '../processes.ts';
 
 export type LeaderState = 'alive' | 'gone' | 'pid-reused' | 'moved' | 'cant-tell';
 
@@ -261,16 +261,23 @@ export async function stopService(
   const leader = judgeLeader(system, proc);
   if (leader === 'pid-reused' || leader === 'moved') return { kind: 'not-ours', reason: describeLeader(leader, proc) };
   if (leader === 'cant-tell') return { kind: 'cant-tell', reason: describeLeader(leader, proc) };
+  let roots = [proc.pid];
   if (leader === 'gone') {
     const members = system.groupMembers(proc.pid);
     if (members === undefined) return { kind: 'cant-tell', reason: 'ps could not list the process group' };
     if (members.length === 0) return { kind: 'already-gone' };
-    return {
-      kind: 'cant-tell',
-      reason: `its leader pid ${String(proc.pid)} exited but processes ${members.join(', ')} remain in its group, so they can't be proven ours; stop them with kill ${members.join(' ')}`,
-    };
+    const anchored = startedWithLeader(system, proc, members);
+    if (anchored === undefined)
+      return { kind: 'cant-tell', reason: `ps could not read when processes ${members.join(', ')} started` };
+    if (!anchored) {
+      return {
+        kind: 'cant-tell',
+        reason: `its leader pid ${String(proc.pid)} exited and none of processes ${members.join(', ')} left in its group started with it, so they can't be proven ours; stop them with kill ${members.join(' ')}`,
+      };
+    }
+    roots = members;
   }
-  const strays = outsideGroup(system, proc.pid);
+  const strays = outsideGroup(system, proc.pid, roots);
   const straysLeft = () => {
     const starts = system.processes.startTimes(strays.map(s => s.pid));
     return strays.filter(s => starts?.get(s.pid) === s.start).map(s => s.pid);
@@ -294,9 +301,32 @@ export async function stopService(
   return left.length === 0 ? { kind: 'stopped', signal: 'SIGKILL' } : { kind: 'survived', members: left };
 }
 
-/** The service's processes that left its process group, found while its leader still ties them to it. */
-function outsideGroup(system: ServiceSystem, leader: number): ProcessIdentity[] {
-  const pids = (system.descendants(leader) ?? []).filter(d => d.pgid !== leader).map(d => d.pid);
+const STARTED_WITH_LEADER_MS = 1000;
+
+/**
+ * Whether the members left after the leader exited are still in the group it started. POSIX keeps a pid from naming a
+ * new process while a process group of that id lives (XBD 4.14 Process ID Reuse; XNU's forkproc skips such pids), so
+ * a later group of that id needs the pid to come round again, a full cycle of the pid space, which takes seconds at
+ * any fork rate. A member started in the leader's second or the next is older than such a group could be.
+ */
+function startedWithLeader(system: ServiceSystem, proc: ServiceProcess, members: readonly number[]): boolean | undefined {
+  const starts = system.processes.startTimes(members);
+  if (!starts) return undefined;
+  const leader = startMs(proc.start);
+  return [...starts.values()].some(start => {
+    const after = startMs(start) - leader;
+    return after >= 0 && after <= STARTED_WITH_LEADER_MS;
+  });
+}
+
+/** The service's processes that left its process group, found while a process of the group still ties them to it. */
+function outsideGroup(system: ServiceSystem, pgid: number, roots: readonly number[]): ProcessIdentity[] {
+  const below = new Map<number, number>();
+  for (const root of roots) {
+    if (below.has(root)) continue;
+    for (const d of system.descendants(root) ?? []) below.set(d.pid, d.pgid);
+  }
+  const pids = [...below].filter(([, group]) => group !== pgid).map(([pid]) => pid);
   if (pids.length === 0) return [];
   const starts = system.processes.startTimes(pids);
   return pids.flatMap(pid => {

@@ -18,6 +18,7 @@ import {
   waitForService,
 } from '../../src/services/services.ts';
 import { realServiceSystem as system } from '../../src/services/system.ts';
+import { stopRecordedProcesses } from '../../src/up/release.ts';
 import { tempDir } from '../support/fakes.ts';
 
 /** Starts its command in a process group of its own, as pnpm exec does, and passes on no signal. */
@@ -186,18 +187,77 @@ test('a recycled pid or a moved working directory is never signalled', async t =
   assert.equal((await inspectService(system, config, port, ready)).healthy, true);
 });
 
-test('when the leader has exited, processes left in its group are reported, not killed', async t => {
+/** Starts a service whose leader exits at once, leaving `members` processes in its group, and waits for that state. */
+async function orphaned(p: ReturnType<typeof project>, start: string, port: number, members = 1): Promise<ServiceProcess> {
+  const proc = p.start(p.service(start), port);
+  const reaped = () => spawnSync('ps', ['-o', 'pid=', '-p', String(proc.pid)], { encoding: 'utf8' }).stdout.trim() === '';
+  await until(() => reaped() && (system.groupMembers(proc.pid) ?? []).length === members);
+  return proc;
+}
+
+test('when the leader has exited, release stops the processes it left in its group', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, "node -e 'setInterval(() => {}, 1e9)' & exit 0", await freePort());
+  const [orphan] = system.groupMembers(proc.pid) ?? [];
+  assert.ok(orphan !== undefined && alive(orphan));
+  const into = { lane: 'lane', notes: [] as string[], problems: [] as string[] };
+  await stopRecordedProcesses({ system, clock: systemClock }, [proc], into);
+  assert.deepEqual(into.problems, []);
+  assert.match(into.notes.join('\n'), /^stopped api/);
+  assert.equal(alive(orphan), false, `pid ${String(orphan)} outlived its service`);
+  assert.deepEqual(system.groupMembers(proc.pid), []);
+});
+
+test('when the leader has exited, a server its group started in a group of its own is stopped too', async t => {
   const p = project(t);
   const port = await freePort();
-  const config = p.service("node -e 'setInterval(() => {}, 1e9)' & exit 0");
-  const proc = p.start(config, port);
-  const reaped = () => spawnSync('ps', ['-o', 'pid=', '-p', String(proc.pid)], { encoding: 'utf8' }).stdout.trim() === '';
-  await until(() => reaped() && (system.groupMembers(proc.pid) ?? []).length === 1);
+  const proc = await orphaned(p, 'SVC_PORT="$SVC_PORT" node wrap.mjs server.mjs & exit 0', port);
+  await until(() => (system.listeners(port) ?? []).length === 1);
+  const [wrapper] = system.groupMembers(proc.pid) ?? [];
+  const [server] = system.listeners(port) ?? [];
+  assert.ok(wrapper !== undefined && server !== undefined);
+  assert.notEqual(system.groups([server])?.get(server), proc.pid, 'the server left the service process group');
+  assert.deepEqual(await stopService(system, proc, systemClock), { kind: 'stopped', signal: 'SIGTERM' });
+  assert.equal(alive(wrapper), false, `the wrapper pid ${String(wrapper)} survived`);
+  assert.equal(alive(server), false, `the server pid ${String(server)} survived`);
+  assert.deepEqual(listenersOn(system, port, null), []);
+});
+
+test('when the leader has exited, a group none of whose processes started with the recorded leader is left alone', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, "node -e 'setInterval(() => {}, 1e9)' & exit 0", await freePort());
   const [orphan] = system.groupMembers(proc.pid) ?? [];
+  const older = await stopService(system, { ...proc, start: 'Mon Jan  1 00:00:00 2024' }, systemClock);
+  assert.equal(older.kind, 'cant-tell');
+  assert.match(
+    (older as { reason: string }).reason,
+    new RegExp(
+      `none of processes ${String(orphan)} left in its group started with it, so they can't be proven ours; stop them with kill ${String(orphan)}$`,
+    ),
+  );
+  const unreadable = await stopService(
+    {
+      ...system,
+      processes: {
+        ...system.processes,
+        startTimes: pids => (pids.includes(proc.pid) ? system.processes.startTimes(pids) : undefined),
+      },
+    },
+    proc,
+    systemClock,
+  );
+  assert.deepEqual(unreadable, { kind: 'cant-tell', reason: `ps could not read when processes ${String(orphan)} started` });
+  assert.equal(alive(orphan ?? 0), true, 'a process that failed the ownership check was signalled');
+});
+
+test('when the leader has exited, a process its group started seconds later is not proof the group is still the service', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, "sleep 2; node -e 'setInterval(() => {}, 1e9)' & exit 0", await freePort());
+  const [late] = system.groupMembers(proc.pid) ?? [];
   const outcome = await stopService(system, proc, systemClock);
   assert.equal(outcome.kind, 'cant-tell');
-  assert.match((outcome as { reason: string }).reason, new RegExp(`processes ${String(orphan)} remain`));
-  assert.equal(alive(orphan ?? 0), true);
+  assert.match((outcome as { reason: string }).reason, new RegExp(`stop them with kill ${String(late)}$`));
+  assert.equal(alive(late ?? 0), true);
 });
 
 test('a service that exits before it is ready fails with the tail of its log', async t => {

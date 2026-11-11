@@ -29,6 +29,11 @@ export function describeStart(start: string): string {
   return `${start} UTC`;
 }
 
+/** The start time as milliseconds since the epoch, to the second `ps` reports; NaN when it isn't a `ps` start time. */
+export function startMs(start: string): number {
+  return Date.parse(describeStart(normalizeStart(start)));
+}
+
 function ps(columns: string, pids: readonly number[]): string[] | undefined {
   const result = spawnSync('ps', ['-o', columns, '-p', pids.join(',')], {
     encoding: 'utf8',
