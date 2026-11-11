@@ -33,6 +33,8 @@ export interface InstallOptions {
   processes?: ProcessTable;
   log?: (line: string) => void;
   lockWaitMs?: number;
+  /** Where to look for JDK 17 past the environment; the system's places when absent. */
+  searchJdk17?: JdkSearch;
 }
 
 export interface Installed {
@@ -106,39 +108,67 @@ async function javaSettings(home: string): Promise<{ spec: string | undefined; j
   };
 }
 
-/** Finds JDK 17: AGENTLANE_JAVA_HOME, then the way maestro/build.sh does, JAVA_HOME, java_home -v 17 and Homebrew's openjdk@17. */
-export async function findJdk17(env: NodeJS.ProcessEnv): Promise<Jdk> {
-  let candidate: string | undefined;
-  let origin: string;
-  const named = env[JAVA_HOME_ENV] ? JAVA_HOME_ENV : env.JAVA_HOME ? 'JAVA_HOME' : undefined;
-  if (named) {
-    candidate = env[named];
-    origin = `${named}=${candidate ?? ''}`;
-  } else {
-    const javaHome = await runCommand('/usr/libexec/java_home', ['-v', '17'], { timeoutMs: 10_000 });
-    if (javaHome.code === 0 && javaHome.stdout.trim()) {
-      candidate = javaHome.stdout.trim();
-      origin = '/usr/libexec/java_home -v 17';
-    } else {
-      const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
-      if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
-        const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
-        if (brew.code === 0 && brew.stdout.trim()) prefixes.unshift(brew.stdout.trim());
-      }
-      candidate = prefixes.find(prefix => isExecutable(path.join(prefix, 'bin', 'java')));
-      origin = `Homebrew's openjdk@17 (${candidate ?? 'not installed'})`;
+/** A place JDK 17 might be installed, and what to call it in a message. */
+export interface JdkCandidate {
+  home: string;
+  origin: string;
+}
+
+export type JdkSearch = () => Promise<JdkCandidate | undefined>;
+
+/** The way maestro/build.sh looks: java_home -v 17, then Homebrew's openjdk@17. */
+export const systemJdk17: JdkSearch = async () => {
+  const javaHome = await runCommand('/usr/libexec/java_home', ['-v', '17'], { timeoutMs: 10_000 });
+  if (javaHome.code === 0 && javaHome.stdout.trim()) {
+    return { home: javaHome.stdout.trim(), origin: '/usr/libexec/java_home -v 17' };
+  }
+  const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
+  if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
+    const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
+    if (brew.code === 0 && brew.stdout.trim()) prefixes.unshift(brew.stdout.trim());
+  }
+  const home = prefixes.find(prefix => isExecutable(path.join(prefix, 'bin', 'java')));
+  return home === undefined ? undefined : { home, origin: `Homebrew's openjdk@17 (${home})` };
+};
+
+function javaProblem(origin: string, spec: string | undefined): string | undefined {
+  if (spec === undefined) return `${origin} has no working bin/java`;
+  if (spec !== '17') return `${origin} is Java ${spec}`;
+  return undefined;
+}
+
+/**
+ * Finds JDK 17: AGENTLANE_JAVA_HOME, which must be one; then JAVA_HOME if it is one, as preflight's findJava17 does;
+ * then the search, java_home -v 17 and Homebrew's openjdk@17 unless a test passes another.
+ */
+export async function findJdk17(env: NodeJS.ProcessEnv, search: JdkSearch = systemJdk17): Promise<Jdk> {
+  const pinned = env[JAVA_HOME_ENV];
+  if (pinned) {
+    const origin = `${JAVA_HOME_ENV}=${pinned}`;
+    const settings = await javaSettings(pinned);
+    const problem = javaProblem(origin, settings.spec);
+    if (problem !== undefined) {
+      throw new DriverError(
+        `${problem}, and Maestro runs on JDK 17`,
+        `${JDK_FIX}, or unset ${JAVA_HOME_ENV} so ${TOOL} finds one`,
+      );
     }
+    return { javaHome: settings.javaHome ?? pinned, origin };
   }
-  if (!candidate) throw new DriverError('no JDK 17 found; Maestro runs on JDK 17', JDK_FIX);
-  const fix = named ? `${JDK_FIX}, or unset ${named} so ${TOOL} finds one` : JDK_FIX;
-  const settings = await javaSettings(candidate);
-  if (settings.spec === undefined) {
-    throw new DriverError(`${origin} has no working bin/java`, fix);
+  let skipped: string | undefined;
+  if (env.JAVA_HOME) {
+    const origin = `JAVA_HOME=${env.JAVA_HOME}`;
+    const settings = await javaSettings(env.JAVA_HOME);
+    skipped = javaProblem(origin, settings.spec);
+    if (skipped === undefined) return { javaHome: settings.javaHome ?? env.JAVA_HOME, origin };
   }
-  if (settings.spec !== '17') {
-    throw new DriverError(`${origin} is Java ${settings.spec}, and Maestro runs on JDK 17`, fix);
-  }
-  return { javaHome: settings.javaHome ?? candidate, origin };
+  const found = await search();
+  const passedOver = skipped === undefined ? '' : ` (${skipped})`;
+  if (!found) throw new DriverError(`no JDK 17 found${passedOver}; Maestro runs on JDK 17`, JDK_FIX);
+  const settings = await javaSettings(found.home);
+  const problem = javaProblem(found.origin, settings.spec);
+  if (problem !== undefined) throw new DriverError(`${problem}${passedOver}, and Maestro runs on JDK 17`, JDK_FIX);
+  return { javaHome: settings.javaHome ?? found.home, origin: found.origin };
 }
 
 export async function sha256Of(file: string): Promise<string> {
@@ -237,7 +267,7 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
   if (ready && options.from === undefined) return ready;
   const started = Date.now();
   const log = options.log ?? (() => undefined);
-  const jdk = await findJdk17(options.env);
+  const jdk = await findJdk17(options.env, options.searchJdk17);
   const home = maestroHome(options.env, release);
   const base = path.dirname(home);
   fs.mkdirSync(base, { recursive: true, mode: 0o700 });

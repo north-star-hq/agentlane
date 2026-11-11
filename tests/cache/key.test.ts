@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { test, type TestContext } from 'node:test';
+import fsp from 'node:fs/promises';
+import { mock, test, type TestContext } from 'node:test';
 
 import {
   androidToolchain,
@@ -10,6 +11,7 @@ import {
   computeKey,
   xcodeVersion,
   type CacheInput,
+  type FileDigests,
   type KeyOptions,
 } from '../../src/cache/index.ts';
 import { androidBuildEnvironment, systemToolchain } from '../../src/up/preflight.ts';
@@ -339,4 +341,29 @@ test('the Android toolchain fails as a key error when the JDK does not run', asy
     androidToolchain({ root: main, sdkRoot: machine.sdkRoot, javaHome: path.join(machine.javaHome, 'missing') }),
     (error: unknown) => error instanceof CacheKeyError && error.message.includes('bin/java -version failed'),
   );
+});
+
+test('keys sharing digests read each unchanged file once, and a file rewritten in place moves the key', async t => {
+  const { main } = repoWithWorktree(t);
+  const reads: string[] = [];
+  const open = fsp.open.bind(fsp);
+  const spy = mock.method(fsp, 'open', (file: string, ...rest: []) => {
+    reads.push(path.relative(main, file));
+    return open(file, ...rest);
+  });
+  t.after(() => {
+    spy.mock.restore();
+  });
+  const digests: FileDigests = new Map();
+  const first = await computeKey(options(main, { digests }));
+  assert.equal(await computeKey(options(main, { digests })), first);
+  assert.equal(reads.filter(r => r === 'app/ios/AppDelegate.swift').length, 1);
+  assert.equal(reads.filter(r => r === 'app/package.json').length, 1);
+
+  fs.writeFileSync(path.join(main, 'app/package.json'), '{"name":"ppa"}\n');
+  const rewritten = await computeKey(options(main, { digests }));
+  assert.notEqual(rewritten, first);
+  assert.equal(rewritten, await computeKey(options(main)));
+  assert.equal(reads.filter(r => r === 'app/package.json').length, 3);
+  assert.equal(reads.filter(r => r === 'app/ios/AppDelegate.swift').length, 2);
 });

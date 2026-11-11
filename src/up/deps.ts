@@ -10,8 +10,11 @@ import type { PortProbe } from '../registry/ports.ts';
 import type { ServiceSystem } from '../services/system.ts';
 import type { Toolchain } from './preflight.ts';
 
-/** Starts the lane's driver engine and reads the screen once, so the agent's first look is warm. */
-export type DriverStarter = (lane: Lane, stateDir: string) => Promise<void>;
+/**
+ * Starts the lane's driver engine and reads the screen once, so the agent's first look is warm. `javaHome` is a JDK 17
+ * home already found; the driver searches for one when it is absent.
+ */
+export type DriverStarter = (lane: Lane, stateDir: string, javaHome?: string) => Promise<void>;
 
 export interface EnvDeps {
   env: NodeJS.ProcessEnv;

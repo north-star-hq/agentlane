@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import type { BigIntStats } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -23,7 +23,10 @@ export interface KeyOptions {
   toolchain: string;
   envFile?: string;
   env?: NodeJS.ProcessEnv;
+  digests?: FileDigests;
 }
+
+export type FileDigests = Map<string, { stamp: string; digest: string }>;
 
 export class CacheKeyError extends Error {
   override name = 'CacheKeyError';
@@ -35,8 +38,22 @@ function sha256(data: string | Buffer): string {
 
 async function sha256File(file: string): Promise<string> {
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
+  const handle = await fs.open(file);
+  for await (const chunk of handle.createReadStream()) hash.update(chunk as Buffer);
   return hash.digest('hex');
+}
+
+function stampOf(stat: BigIntStats): string {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+}
+
+async function fileDigest(full: string, stat: BigIntStats, digests: FileDigests | undefined): Promise<string> {
+  const stamp = stampOf(stat);
+  const known = digests?.get(full);
+  if (known?.stamp === stamp) return known.digest;
+  const digest = await sha256File(full);
+  digests?.set(full, { stamp, digest });
+  return digest;
 }
 
 function errorText(error: unknown): string {
@@ -64,26 +81,26 @@ async function listFiles(root: string, input: FilesInput): Promise<string[]> {
   return names.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
 }
 
-async function describeFile(root: string, name: string): Promise<string> {
+async function describeFile(root: string, name: string, digests: FileDigests | undefined): Promise<string> {
   const full = path.join(root, name);
   let stat;
   try {
-    stat = await fs.lstat(full);
+    stat = await fs.lstat(full, { bigint: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return `deleted ${name}`;
     throw error;
   }
   if (stat.isSymbolicLink()) return `link ${sha256(await fs.readlink(full))} ${name}`;
   if (stat.isDirectory()) return `dir ${name}`;
-  const exec = (stat.mode & 0o111) !== 0 ? 'x' : '-';
-  return `file${exec} ${await sha256File(full)} ${name}`;
+  const exec = (stat.mode & 0o111n) !== 0n ? 'x' : '-';
+  return `file${exec} ${await fileDigest(full, stat, digests)} ${name}`;
 }
 
-async function hashFiles(root: string, input: FilesInput): Promise<string> {
+async function hashFiles(root: string, input: FilesInput, digests: FileDigests | undefined): Promise<string> {
   const names = await listFiles(root, input);
   const lines: string[] = [];
   for (let i = 0; i < names.length; i += HASH_CONCURRENCY) {
-    lines.push(...(await Promise.all(names.slice(i, i + HASH_CONCURRENCY).map(name => describeFile(root, name)))));
+    lines.push(...(await Promise.all(names.slice(i, i + HASH_CONCURRENCY).map(name => describeFile(root, name, digests)))));
   }
   return sha256(lines.join('\n'));
 }
@@ -113,8 +130,8 @@ async function hashEnvFile(root: string, envFile: string | undefined): Promise<s
   }
 }
 
-async function hashInput(root: string, input: CacheInput, env: NodeJS.ProcessEnv | undefined): Promise<string> {
-  return input.kind === 'files' ? hashFiles(root, input) : hashCommand(root, input.run, env);
+async function hashInput(root: string, input: CacheInput, options: KeyOptions): Promise<string> {
+  return input.kind === 'files' ? hashFiles(root, input, options.digests) : hashCommand(root, input.run, options.env);
 }
 
 export async function computeKey(options: KeyOptions): Promise<string> {
@@ -126,7 +143,7 @@ export async function computeKey(options: KeyOptions): Promise<string> {
     `env=${await hashEnvFile(options.root, options.envFile)}`,
   ];
   const inputs = inputsFor(options.inputs, options.platform);
-  const digests = await Promise.all(inputs.map(input => hashInput(options.root, input, options.env)));
+  const digests = await Promise.all(inputs.map(input => hashInput(options.root, input, options)));
   inputs.forEach((input, i) => {
     lines.push(`input=${JSON.stringify(input)} ${digests[i] ?? ''}`);
   });
