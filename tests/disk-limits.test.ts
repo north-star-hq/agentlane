@@ -101,6 +101,44 @@ test('a device trace stopped after a cut holds only the runs recorded after its 
   }
 });
 
+test('a device trace keeps the runs a 0.4.1 engine of the lane recorded after its start, across a clear or a cut', () => {
+  const root = tempDir('trace-041');
+  try {
+    const startedAt = 5000;
+    const timed = (n: number, at: number) => `${JSON.stringify({ yaml: 'x'.repeat(20), n, at })}\n`;
+    const untimed = (n: number) => `${JSON.stringify({ yaml: 'x'.repeat(20), n })}\n`;
+
+    const cleared = path.join(root, 'cleared.jsonl');
+    for (let n = 0; n < 5; n++) fs.appendFileSync(cleared, timed(n, 1000 + n));
+    const clearMark = { bytes: sizeOf(cleared), ino: inodeOf(cleared), startedAt };
+    fs.rmSync(cleared);
+    for (let n = 10; n < 13; n++) fs.appendFileSync(cleared, untimed(n));
+    assert.deepEqual(
+      runsOf(runsSince(cleared, clearMark)).map(entry => entry.n),
+      [10, 11, 12],
+      'a cleared file 0.4.1 wrote to is all after the start',
+    );
+
+    const cut = path.join(root, 'cut.jsonl');
+    for (let n = 0; n < 50; n++) fs.appendFileSync(cut, timed(n, 1000 + n));
+    const cutMark = { bytes: sizeOf(cut), ino: inodeOf(cut), startedAt };
+    for (let n = 100; n < 110; n++) fs.appendFileSync(cut, untimed(n));
+    fs.appendFileSync(cut, timed(200, 6000));
+    assert.equal(keepNewestLinesAsSoleWriter(cut, { maxBytes: 1000, keepBytes: 600 }), true);
+    const kept = runsOf(fs.readFileSync(cut, 'utf8')).map(entry => entry.n);
+    assert.ok(
+      kept.some(n => n < 50),
+      `the cut kept runs from before the trace: ${kept.join(',')}`,
+    );
+    assert.deepEqual(
+      runsOf(runsSince(cut, cutMark)).map(entry => entry.n),
+      [...Array.from({ length: 10 }, (_, i) => 100 + i), 200],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a steps file rewritten in place under the same inode never puts half a line in the trace', () => {
   const root = tempDir('trace-inode');
   try {
