@@ -10,6 +10,7 @@ import { createToolHandler } from '../../src/mcp/tools.ts';
 import { systemProcesses } from '../../src/processes.ts';
 import { DEFAULT_CONFIG } from '../../src/registry/config.ts';
 import { databasePath } from '../../src/registry/paths.ts';
+import { laneLastCall } from '../../src/registry/touch.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
 import type { LaneStatus } from '../../src/registry/types.ts';
 import { realServiceSystem } from '../../src/services/system.ts';
@@ -85,18 +86,26 @@ function booted(w: DriverWorld, id: string): boolean | undefined {
   return w.devices.all().find(d => d.id === id)?.booted;
 }
 
-function lastAction(w: DriverWorld): string {
-  const db = new DatabaseSync(databasePath(w.stateDir), { readOnly: true });
+function lastUse(w: DriverWorld): { at: number; action: string } {
+  const db = new DatabaseSync(databasePath(w.stateDir), { readOnly: true, timeout: 5000 });
   try {
-    return String(db.prepare('SELECT last_action AS action FROM claims WHERE id = ?').get(w.lane.id)?.action);
+    const row = db.prepare('SELECT last_used_at AS at, last_action AS action FROM claims WHERE id = ?').get(w.lane.id);
+    return { at: Number(row?.at), action: String(row?.action) };
   } finally {
     db.close();
   }
 }
 
-/** After a look, waits for the engine's touch of it, which would otherwise land after the lane is aged. */
+/** After a look, waits until the registry holds a touch as late as the last call the lane's folder records. */
 async function parked(w: DriverWorld, looked = true): Promise<void> {
-  if (looked) await until(() => lastAction(w) === 'look', 5000, "the engine's touch of the look");
+  if (looked) {
+    const called = laneLastCall(w.stateDir, { ...w.lane, lastUsedAt: 0 });
+    await until(
+      () => lastUse(w).at >= called && lastUse(w).action === 'look',
+      5000,
+      `the engine's touch of the look at ${String(called)} (the registry has ${JSON.stringify(lastUse(w))})`,
+    );
+  }
   age(w);
   const report = await sweep(w);
   assert.deepEqual(
@@ -195,7 +204,7 @@ test('a run that goes on past the park window counts as a call on each heartbeat
       });
       await until(() => w.events().some(e => e.event === 'call'), 10_000, 'the run to reach Maestro');
       age(w);
-      await until(() => lastAction(w) !== 'aged', 5000, 'a heartbeat to count the run');
+      await until(() => lastUse(w).action !== 'aged', 5000, 'a heartbeat to count the run');
       assert.equal(settled, false, 'the run ended before the heartbeat was seen');
       const report = await sweep(w);
       assert.deepEqual(report.outcomes, []);

@@ -106,6 +106,16 @@ async function counts(state: string, id: string, action: string, call: () => Pro
   );
 }
 
+/** Waits until the registry holds a touch at least as late as the last call the lane's folder records. */
+async function touchesLanded(w: DriverWorld): Promise<void> {
+  const called = laneLastCall(w.stateDir, { ...w.lane, lastUsedAt: 0 });
+  await until(
+    () => lastUse(w.stateDir, w.lane.id).at >= called,
+    5000,
+    `a touch of the call at ${String(called)} (the registry has ${JSON.stringify(lastUse(w.stateDir, w.lane.id))})`,
+  );
+}
+
 function leavesAlone(state: string, id: string): void {
   assert.deepEqual(lastUse(state, id), { at: AGED, action: 'aged' });
 }
@@ -165,7 +175,8 @@ async function withDevice(
   const w = await driverWorld({ platform, env: { ...homeless(home), ...env } });
   try {
     assert.equal((await callEngine(w.target(), { op: 'look', args: {} })).ok, true, 'the engine did not start');
-    await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's first touch");
+    await touchesLanded(w);
+    assert.equal(lastUse(w.stateDir, w.lane.id).action, 'look');
     const env = { ...w.env, AGENTLANE_STATE_DIR: w.stateDir, AGENTLANE_OWNER_PID: String(w.owner.pid) };
     const adb = new FakeAdb(w.lane.device?.serial ?? '');
     await body(w, cli(env, w.worktree, { adb: () => adb }));
@@ -335,6 +346,7 @@ test("a touch that can't open the registry leaves the warm engine running, and l
   withDevice('ios', async w => {
     const warm = await callEngine(w.target(), { op: 'look', args: {} });
     assert.equal(warm.ok, true);
+    await touchesLanded(w);
     age(w.stateDir, w.lane.id);
     const fix = breakConfig(w.stateDir);
     try {
@@ -348,6 +360,24 @@ test("a touch that can't open the registry leaves the warm engine running, and l
     await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, 'the touch tried again once the registry opens');
     const after = await callEngine(w.target(), { op: 'look', args: {} });
     assert.equal(after.pid, warm.pid, 'the engine restarted');
+  }));
+
+test('the MCP retry outlasts a registry that cannot be opened and lands once it opens', () =>
+  withWorld('ios', async w => {
+    const ref = { id: w.lane.id, token: w.lane.token };
+    const toucher = new LaneToucher({ dir: w.stateDir, processes: systemProcesses }, 20);
+    age(w.stateDir, w.lane.id);
+    const free = holdRegistry(w.stateDir);
+    toucher.touch(ref, 'look: browser');
+    const fix = breakConfig(w.stateDir);
+    free();
+    try {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      leavesAlone(w.stateDir, w.lane.id);
+    } finally {
+      fix();
+    }
+    await until(() => lastUse(w.stateDir, w.lane.id).action === 'look: browser', 3000, 'the MCP retry once the registry opens');
   }));
 
 test('a run still in flight has already moved the last use, so a long run never looks idle', () =>
