@@ -7,6 +7,7 @@ export const REFUSAL_CODES = [
   'token-mismatch',
   'registry-busy',
   'resource-busy',
+  'lane-busy',
 ] as const;
 
 export type RefusalCode = (typeof REFUSAL_CODES)[number];

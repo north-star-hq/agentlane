@@ -14,13 +14,16 @@ import { describeOwner, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
-import { keepTouching, touchLane } from '../registry/touch.ts';
+import { keepTouching, recordCall, touchLane } from '../registry/touch.ts';
 import { resolveFolder } from '../registry-cli.ts';
+import type { LanePark } from '../registry/parks.ts';
 import type { Lane } from '../registry/types.ts';
 import { laneDir, readUpRecord } from './lane-files.ts';
 import type { EnvDeps } from './deps.ts';
 import { reversePorts } from './doctor.ts';
 import { driverVariables } from './maestro-env.ts';
+import { enterLane } from './wake.ts';
+import { upWaker } from './waker.ts';
 
 function lenientConfig(
   file: string | null,
@@ -69,15 +72,21 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
     devices: deps.devices,
     clock: deps.clock,
   });
-  let lane;
+  let lane: Lane | null;
+  let park: LanePark | null;
   try {
     lane = registry.find(owner, folder.worktree);
     if (!lane) {
       throw new NotClaimed(`${describeOwner(owner)} holds no lane in ${folder.worktree}`, `${CLI} up   (or ${CLI} claim)`);
     }
+    recordCall(state, { id: lane.id, token: lane.token }, deps.clock.now());
+    park = registry.parkOf(lane.id);
   } finally {
     registry.close();
   }
+  lane = await enterLane({ stateDir: state, processes: deps.processes, clock: deps.clock }, lane, park, upWaker(deps), line => {
+    deps.log(`${TOOL} exec: ${line}`);
+  });
   const site = { dir: state, processes: deps.processes, clock: deps.clock };
   const ref = { id: lane.id, token: lane.token };
   touchLane(site, ref, `exec: ${command}`);

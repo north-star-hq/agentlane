@@ -3,11 +3,21 @@ import type { BackendDevice, DeviceBackend, Platform } from '../devices/backend.
 import type { ProcessTable } from '../processes.ts';
 import type { RegistryConfig } from './config.ts';
 import { judgeProcess, ownerState, worktreeState, type ProcessVerdict } from './owner.ts';
+import { readPark } from './parks.ts';
 import { pendingTeardowns } from './resources.ts';
 import { endedFromHistory, loadLaneInfo } from './rows.ts';
 import type { Store } from './store.ts';
 import { int, optText, text } from './store.ts';
-import type { LaneInfo, LaneStatus, DeviceState, ProcessState, PoolDeviceStatus, QueueEntry, StatusReport } from './types.ts';
+import type {
+  LaneInfo,
+  LaneStatus,
+  DeviceState,
+  ParkStatus,
+  ProcessState,
+  PoolDeviceStatus,
+  QueueEntry,
+  StatusReport,
+} from './types.ts';
 
 export interface StatusSources {
   dir: string;
@@ -63,12 +73,25 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     if (!device) return 'missing';
     return device.booted ? 'booted' : 'shutdown';
   };
+  const parkStatus = (id: string): ParkStatus | null => {
+    const park = readPark(db, id);
+    if (!park) return null;
+    return {
+      state: park.state,
+      since: park.since,
+      parkedAt: park.parkedAt,
+      by: park.holder?.pid ?? null,
+      restarts: park.restarts,
+      problems: park.problems,
+    };
+  };
   report.lanes = lanes.map((lane): LaneStatus => ({
     ...lane,
     processes: lane.processes.map(p => ({ ...p, state: processState(judgeProcess(p, table)) })),
     ownerState: ownerState(judgeProcess(lane.owner.process, table), worktreeState(lane.worktree)),
     idleMs: now - lane.lastUsedAt,
     deviceState: lane.device ? stateOf(lane.device.platform, lane.device.id) : null,
+    park: parkStatus(lane.id),
   }));
   report.pool = db
     .prepare('SELECT * FROM devices ORDER BY created_at, name')

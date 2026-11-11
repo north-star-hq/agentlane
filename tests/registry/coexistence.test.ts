@@ -283,7 +283,6 @@ test('a lane 0.2.x holds keeps its ports, simulator and browser while this versi
     assert.ok(!m.sims.calls.some(c => c.startsWith('create')), 'a simulator was created though a free one was in the pool');
     assert.notEqual(out.lane.browser?.session, old.session);
     assert.deepEqual(out.freed, []);
-    assert.deepEqual(out.tookOver, []);
 
     const status = registry.status();
     const held = status.lanes.find(l => l.id === old.id);

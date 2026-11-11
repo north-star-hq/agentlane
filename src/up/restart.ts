@@ -6,6 +6,7 @@ import { describeOwner, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
+import { recordCall } from '../registry/touch.ts';
 import type { ServiceProcess } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { ServiceFailed } from '../services/services.ts';
@@ -13,6 +14,8 @@ import { laneDir, readUpRecord } from './lane-files.ts';
 import type { LaneServices } from './lane-services.ts';
 import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
 import type { EnvDeps } from './deps.ts';
+import { enterLane } from './wake.ts';
+import { upWaker } from './waker.ts';
 
 export interface RestartedService {
   service: string;
@@ -49,13 +52,23 @@ export async function restart(deps: EnvDeps, names: readonly string[], worktree?
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
   });
   try {
-    const lane = registry.find(owner, folder.worktree);
-    if (!lane) {
+    const found = registry.find(owner, folder.worktree);
+    if (!found) {
       throw new NotClaimed(
         `${describeOwner(owner)} holds no lane in ${folder.worktree}, so there is no service to restart`,
         `${CLI} up   (it claims a lane, starts every service and launches the app)`,
       );
     }
+    recordCall(state, { id: found.id, token: found.token }, deps.clock.now());
+    const lane = await enterLane(
+      { stateDir: state, processes: deps.processes, clock: deps.clock },
+      found,
+      registry.parkOf(found.id),
+      upWaker(deps),
+      line => {
+        deps.log(`${TOOL} restart: ${line}`);
+      },
+    );
     const dir = laneDir(state, lane.id);
     const record = readUpRecord(dir);
     const file = record?.config ?? findProjectConfig(folder.worktree);

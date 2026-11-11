@@ -21,6 +21,7 @@ export type StressOp =
       waitMs: number;
     }
   | { kind: 'touch' }
+  | { kind: 'park' }
   | { kind: 'release' }
   | { kind: 'pause'; ms: number };
 

@@ -24,6 +24,8 @@ import {
 } from './leases.ts';
 import type { Owner } from './owner.ts';
 import { describeOwner, describeState, isProven, judgeProcess, ownerKey, ownerState, worktreeState } from './owner.ts';
+import type { LanePark, ParkRestarts } from './parks.ts';
+import { dropPark, NOTHING_TO_RESTART, readPark, writePark } from './parks.ts';
 import { configPath, diskNames } from './paths.ts';
 import type { PortProbe } from './ports.ts';
 import type { FreePoolDevice, PruneListing, PruneResult } from './prune.ts';
@@ -75,7 +77,6 @@ export const STEPS = [
   'claim:reserve-committed',
   'claim:retired-device',
   'claim:created-device',
-  'claim:took-over',
   'claim:inserted',
   'claim:committed',
   'claim:waiting',
@@ -84,6 +85,8 @@ export const STEPS = [
   'release:ended',
   'release:committed',
   'release:stopped-device',
+  'park:committed',
+  'park:stopped-device',
   'touch:locked',
 ] as const;
 
@@ -141,7 +144,6 @@ interface Caller {
 }
 
 interface Progress {
-  tookOver: EndedLane[];
   freed: EndedLane[];
   notes: string[];
   replacedDriver: BrowserDriverName | null;
@@ -171,10 +173,20 @@ interface EmulatorPortPlan {
 
 interface PortPlan {
   picks: ClaimedPort[];
-  takeovers: string[];
 }
 
 export const HISTORY_KEEP_MS = 7 * 24 * 3_600_000;
+
+export interface ParkCandidate {
+  ref: LaneRef;
+  lastUsedAt: number;
+  owner: Owner;
+  worktree: string;
+  park: LanePark | null;
+}
+
+export type WakeStart =
+  { kind: 'awake' } | { kind: 'busy'; park: LanePark; worktree: string } | { kind: 'taken'; park: LanePark };
 
 const NOUN: Readonly<Record<Platform, string>> = { ios: 'simulator', android: 'emulator' };
 
@@ -471,7 +483,7 @@ export class Registry {
     const keeper = this.keeper();
     const started = this.clock.now();
     const deadline = started + request.waitMs;
-    const progress: Progress = { tookOver: [], freed: [], notes: [], replacedDriver: null };
+    const progress: Progress = { freed: [], notes: [], replacedDriver: null };
     const settling: Settlement[] = this.unstash(me);
     const stopped = new Set<string>();
     let relisted = false;
@@ -872,7 +884,7 @@ export class Registry {
       this.dropReservation(me);
       return { kind: 'refused', refusal };
     };
-    const portPlan = this.planPorts(wanted, listening, now, caller, verdicts);
+    const portPlan = this.planPorts(wanted, listening, now);
     if (portPlan instanceof Refusal) return refuse(portPlan);
     const emulator = this.planEmulatorPort(request, existingId, held, needDevice, listed, listening, now);
     if (emulator instanceof Refusal) return refuse(emulator);
@@ -880,19 +892,10 @@ export class Registry {
     let deviceName: string | null = null;
     if (needDevice && spec && backend && listed) {
       const strict = request.device?.strict === true;
-      const plan = this.planDevice(spec, strict, backend, listed, me, keeper, verdicts, now, caller, progress, 0);
+      const plan = this.planDevice(spec, strict, request.device?.prefer, backend, listed, me, keeper, now, caller, progress);
       if (plan.kind !== 'assign') return plan;
       deviceName = plan.name;
     }
-
-    let tookOverPorts = false;
-    for (const id of portPlan.takeovers) {
-      const row = db.prepare('SELECT * FROM claims WHERE id = ?').get(id);
-      if (!row) continue;
-      progress.tookOver.push(this.end(row, 'taken-over', caller, now));
-      tookOverPorts = true;
-    }
-    if (tookOverPorts) this.step('claim:took-over');
 
     const action = request.action ?? 'claim';
     let laneId: string;
@@ -1179,49 +1182,22 @@ export class Registry {
     return `dropped the reservation for ${name}, left when claiming was interrupted`;
   }
 
-  private idleLanes(now: number, caller: Caller, verdicts: Verdicts): Row[] {
-    return this.store.db
-      .prepare('SELECT * FROM claims WHERE last_used_at < ? AND owner_key != ? ORDER BY last_used_at ASC')
-      .all(now - this.config.idleMs, caller.key)
-      .filter(row => !isProven(this.verdictFor(row, verdicts)));
-  }
-
-  private planPorts(
-    wanted: readonly ServiceRequest[],
-    listening: ReadonlySet<number>,
-    now: number,
-    caller: Caller,
-    verdicts: Verdicts,
-  ): PortPlan | Refusal {
+  private planPorts(wanted: readonly ServiceRequest[], listening: ReadonlySet<number>, now: number): PortPlan | Refusal {
     const held = new Map<number, string>();
     for (const row of this.store.db.prepare('SELECT port, claim_id FROM ports').all())
       held.set(int(row, 'port'), text(row, 'claim_id'));
-    const idle = wanted.length > 0 ? this.idleLanes(now, caller, verdicts) : [];
     const picks: ClaimedPort[] = [];
-    const takeovers: string[] = [];
     for (const service of wanted) {
       const block = this.config.blocks[service.type];
       if (!block) continue;
-      const usable = (p: number) => !listening.has(p) && !picks.some(x => x.port === p);
       let port: number | undefined;
       for (let p = block.first; p <= block.last && port === undefined; p++) {
-        const holder = held.get(p);
-        if (usable(p) && (holder === undefined || takeovers.includes(holder))) port = p;
-      }
-      for (const row of idle) {
-        if (port !== undefined) break;
-        const id = text(row, 'id');
-        if (takeovers.includes(id)) continue;
-        const theirs = [...held].find(([p, c]) => c === id && p >= block.first && p <= block.last && usable(p));
-        if (theirs) {
-          takeovers.push(id);
-          port = theirs[0];
-        }
+        if (!held.has(p) && !listening.has(p) && !picks.some(x => x.port === p)) port = p;
       }
       if (port === undefined) return this.portsExhausted(service.type, held, listening, now);
       picks.push({ service: service.name, type: service.type, port });
     }
-    return { picks, takeovers };
+    return { picks };
   }
 
   private planEmulatorPort(
@@ -1330,15 +1306,14 @@ export class Registry {
   private planDevice(
     spec: DeviceSpec,
     strict: boolean,
+    prefer: string | undefined,
     backend: DeviceBackend,
     listed: Map<string, BackendDevice>,
     me: ProcessIdentity,
     keeper: ProcessIdentity | null,
-    verdicts: Verdicts,
     now: number,
     caller: Caller,
     progress: Progress,
-    depth: number,
   ): DevicePlan {
     const db = this.store.db;
     const platform = backend.platform;
@@ -1384,7 +1359,8 @@ export class Registry {
     };
     if (ahead > 0 && Math.min(free.length + room, fits) <= ahead) return wait();
     if (fits > 0) {
-      const match = free.find(r => text(r, 'device_type') === spec.deviceType && text(r, 'runtime') === spec.runtime);
+      const matches = (r: Row) => text(r, 'device_type') === spec.deviceType && text(r, 'runtime') === spec.runtime;
+      const match = free.find(r => matches(r) && text(r, 'name') === prefer) ?? free.find(matches);
       if (match) {
         this.dropReservation(me);
         return { kind: 'assign', name: text(match, 'name') };
@@ -1410,37 +1386,6 @@ export class Registry {
           now,
         });
         if (retire) return this.reserve(spec, backend, listed, me, now, mine, retire);
-      }
-    }
-    if (depth === 0) {
-      const deviceSlot = free.length + room > 0;
-      const idle = this.idleLanes(now, caller, verdicts).find(row => {
-        const device = db.prepare('SELECT platform FROM devices WHERE claim_id = ?').get(text(row, 'id'));
-        if (!device) return false;
-        const theirs = text(device, 'platform') as Platform;
-        if (theirs === platform) return true;
-        return deviceSlot && spareMemory + DEVICE_MEMORY_MB[theirs] >= DEVICE_MEMORY_MB[platform];
-      });
-      if (idle) {
-        const theirs = db.prepare('SELECT * FROM devices WHERE claim_id = ?').get(text(idle, 'id'));
-        const matches = (r: Row) => text(r, 'device_type') === spec.deviceType && text(r, 'runtime') === spec.runtime;
-        const takes =
-          theirs !== undefined &&
-          text(theirs, 'platform') === platform &&
-          listed.has(text(theirs, 'device_id')) &&
-          (matches(theirs) || (!strict && room === 0 && !free.some(matches)));
-        if (theirs && takes) {
-          progress.tookOver.push(this.end(idle, 'taken-over', caller, now));
-          this.step('claim:took-over');
-          this.dropReservation(me);
-          return { kind: 'assign', name: text(theirs, 'name') };
-        }
-        const { ended, leases } = this.endAndLease([idle], 'taken-over', caller, me, keeper);
-        progress.tookOver.push(...ended);
-        this.step('claim:took-over');
-        this.dropReservation(me);
-        if (leases.length > 0) return { kind: 'leased', leases };
-        return this.planDevice(spec, strict, backend, listed, me, keeper, verdicts, now, caller, progress, depth + 1);
       }
     }
     return wait();
@@ -1848,6 +1793,205 @@ export class Registry {
       const lane = loadLane(this.store.db, ref.id);
       if (!lane) throw new Error(`lane ${ref.id} vanished inside its own transaction`);
       return lane;
+    });
+  }
+
+  /** How the lane is parked, or being parked or woken, and what its next call restarts; null while it is awake. */
+  parkOf(id: string): LanePark | null {
+    return readPark(this.store.db, id);
+  }
+
+  /**
+   * The lanes the sweep looks at: last used, by the registry's record, at or before `idleSince`, and either awake, or
+   * last parked or woken at or before `retrySince` and left holding a device or a service, or left mid-park or mid-wake.
+   */
+  parkCandidates(idleSince: number, retrySince: number): ParkCandidate[] {
+    const db = this.store.db;
+    return db
+      .prepare(
+        `SELECT c.* FROM claims c LEFT JOIN parks p ON p.claim_id = c.id
+           WHERE c.last_used_at <= ?
+             AND (p.claim_id IS NULL OR (p.since <= ? AND (p.state != 'parked'
+               OR EXISTS (SELECT 1 FROM devices d WHERE d.claim_id = c.id)
+               OR EXISTS (SELECT 1 FROM processes r WHERE r.claim_id = c.id))))
+           ORDER BY c.last_used_at, c.id`,
+      )
+      .all(idleSince, retrySince)
+      .map(row => ({
+        ref: { id: text(row, 'id'), token: text(row, 'token') },
+        lastUsedAt: int(row, 'last_used_at'),
+        owner: ownerFromRow(row),
+        worktree: text(row, 'worktree'),
+        park: readPark(db, text(row, 'id')),
+      }));
+  }
+
+  private parkActor(row: Row, doing: string): void {
+    this.store.actor = { who: `${TOOL} ${doing} lane ${text(row, 'id')}`, folder: text(row, 'worktree') };
+  }
+
+  private heldByDead(park: LanePark, dead: ProcessIdentity | null): boolean {
+    return dead !== null && park.holder !== null && sameProcess(dead, park.holder);
+  }
+
+  /**
+   * Starts parking the lane as attempt `attempt` of this process, if the registry's record still has it unused since
+   * `idleSince` and nobody else is parking or waking it; `dead` is the holder of an earlier park or wake that was
+   * proven gone before this call. Null when the lane is not to be parked now.
+   */
+  beginPark(ref: LaneRef, idleSince: number, attempt: string, dead: ProcessIdentity | null): Lane | null {
+    const me = this.self();
+    return this.store.write(() => {
+      const row = this.requireLane(ref);
+      this.parkActor(row, 'parking');
+      if (int(row, 'last_used_at') > idleSince) return null;
+      const db = this.store.db;
+      const park = readPark(db, ref.id);
+      if (park && park.state !== 'parked' && !this.heldByDead(park, dead)) return null;
+      writePark(db, ref.id, {
+        state: 'parking',
+        since: this.clock.now(),
+        parkedAt: park?.parkedAt ?? null,
+        holder: me,
+        attempt,
+        restarts: park?.restarts ?? NOTHING_TO_RESTART,
+        problems: park?.problems ?? [],
+      });
+      return loadLane(db, ref.id);
+    });
+  }
+
+  /** Gives up attempt `attempt` at parking the lane, because it was used meanwhile; a lane parked before stays parked. */
+  abortPark(ref: LaneRef, attempt: string): void {
+    this.store.write(() => {
+      const db = this.store.db;
+      const park = readPark(db, ref.id);
+      if (park?.state !== 'parking' || park.attempt !== attempt) return;
+      if (park.parkedAt === null) dropPark(db, ref.id);
+      else writePark(db, ref.id, { ...park, state: 'parked', since: this.clock.now(), holder: null, attempt: null });
+    });
+  }
+
+  /**
+   * Ends attempt `attempt` at parking the lane: frees its device, which goes back to the pool once it is shut down, and
+   * records the lane as parked with what its next call restarts. False when the attempt no longer holds the lane.
+   */
+  finishPark(ref: LaneRef, attempt: string, restarts: ParkRestarts, problems: readonly string[], notes: string[]): boolean {
+    const me = this.self();
+    const keeper = this.keeper();
+    const pending = this.unstash(me);
+    let done: { parked: boolean; work: Work };
+    try {
+      const listings = this.listOwn(me, pending);
+      done = this.store.write(() => {
+        const db = this.store.db;
+        const others = this.landLeftovers(pending, listings, me, keeper, notes);
+        const row = this.requireLane(ref);
+        this.parkActor(row, 'parking');
+        const park = readPark(db, ref.id);
+        if (park?.state !== 'parking' || park.attempt !== attempt) {
+          return { parked: false, work: this.inWrite({ own: [], others }, me, keeper, notes, 'park:stopped-device') };
+        }
+        const now = this.clock.now();
+        const kept = [...problems];
+        const own: DeviceLease[] = [];
+        const device = db.prepare('SELECT * FROM devices WHERE claim_id = ?').get(ref.id);
+        if (device) {
+          const name = text(device, 'name');
+          const platform = text(device, 'platform') as Platform;
+          if (this.backends[platform]) {
+            const console = db.prepare('SELECT port FROM ports WHERE claim_id = ? AND service = ?').get(ref.id, EMULATOR_SERVICE);
+            db.prepare('UPDATE devices SET claim_id = NULL WHERE name = ?').run(name);
+            const lease = leaseDevice(db, name, {
+              reservation: this.leaseName(name, 'shutdown', []),
+              work: 'shutdown',
+              holder: me,
+              keeper,
+              consolePort: console ? int(console, 'port') : null,
+              now,
+            });
+            if (lease) own.push(lease);
+          } else {
+            kept.push(`kept ${NOUN[platform]} ${name}: this process has no ${NOUN[platform]} tool to shut it down`);
+          }
+        }
+        writePark(db, ref.id, {
+          state: 'parked',
+          since: now,
+          parkedAt: now,
+          holder: null,
+          attempt: null,
+          restarts,
+          problems: kept,
+        });
+        return { parked: true, work: this.inWrite({ own, others }, me, keeper, notes, 'park:stopped-device') };
+      });
+    } catch (error) {
+      this.stash(me, pending);
+      throw error;
+    }
+    if (done.parked) this.step('park:committed');
+    this.afterWrite(done.work, me, keeper, notes, 'park:stopped-device');
+    return done.parked;
+  }
+
+  /** Adds problems to a parked lane's record, such as a device that would not shut down after the park was recorded. */
+  noteParkProblems(ref: LaneRef, problems: readonly string[]): void {
+    if (problems.length === 0) return;
+    this.store.write(() => {
+      const db = this.store.db;
+      const park = readPark(db, ref.id);
+      if (park?.state !== 'parked') return;
+      writePark(db, ref.id, { ...park, problems: [...park.problems, ...problems] });
+    });
+  }
+
+  /**
+   * Takes a parked lane for waking as attempt `attempt` of this process: `taken` with the park it ends, `busy` while
+   * another park or wake runs, `awake` when there is nothing to wake. `dead` is the holder of an earlier park or wake
+   * that was proven gone before this call.
+   */
+  beginWake(ref: LaneRef, attempt: string, dead: ProcessIdentity | null): WakeStart {
+    const me = this.self();
+    return this.store.write(() => {
+      const row = this.requireLane(ref);
+      this.parkActor(row, 'waking');
+      const db = this.store.db;
+      const park = readPark(db, ref.id);
+      if (!park) return { kind: 'awake' };
+      if (park.state !== 'parked' && !this.heldByDead(park, dead)) return { kind: 'busy', park, worktree: text(row, 'worktree') };
+      writePark(db, ref.id, { ...park, state: 'waking', since: this.clock.now(), holder: me, attempt });
+      return { kind: 'taken', park };
+    });
+  }
+
+  /** Records the lane as awake once attempt `attempt` has brought everything back. */
+  finishWake(ref: LaneRef, attempt: string): void {
+    this.store.write(() => {
+      const db = this.store.db;
+      if (readPark(db, ref.id)?.attempt === attempt) dropPark(db, ref.id);
+    });
+  }
+
+  /**
+   * Records the lane as parked, with `problems`, after attempt `attempt` at parking or waking it stopped partway, so the
+   * next sweep or call finishes the job; whatever the attempt left running stays recorded with the lane.
+   */
+  giveUp(ref: LaneRef, attempt: string, problems: readonly string[]): void {
+    this.store.write(() => {
+      const db = this.store.db;
+      const park = readPark(db, ref.id);
+      if (park?.attempt !== attempt) return;
+      const now = this.clock.now();
+      writePark(db, ref.id, {
+        ...park,
+        state: 'parked',
+        since: now,
+        parkedAt: park.parkedAt ?? now,
+        holder: null,
+        attempt: null,
+        problems,
+      });
     });
   }
 

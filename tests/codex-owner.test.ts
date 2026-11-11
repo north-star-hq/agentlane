@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { HOUR_MS } from '../src/registry/config.ts';
+import { Refusal } from '../src/registry/refusal.ts';
 import { codexHome, isCodexDaemon, ownerKey, resolveOwner } from '../src/registry/owner.ts';
 import { FakeProcesses } from './support/fakes.ts';
 import { world } from './support/world.ts';
@@ -98,7 +99,7 @@ test('the VS Code extension and the desktop app run a stdio app server, which is
   assert.deepEqual(resolveOwner({ CODEX_THREAD_ID: 'thread-app', HOME }, procs, appSelf?.pid).process, appServer);
 });
 
-test("a TUI thread's lane is can't tell: never freed by the sweep, taken over when idle under pressure, with the taker told whose it was", async () => {
+test("a TUI thread's lane is can't tell: never freed by the sweep nor taken over at any idle age, and a claim short of its simulator is refused naming it", async () => {
   const w = world({ poolSize: 1 });
   try {
     const [self] = w.procs.tree([SELF, SHELL, `${DAEMON_BIN} app-server --listen unix:// --managed-daemon`]);
@@ -106,18 +107,22 @@ test("a TUI thread's lane is can't tell: never freed by the sweep, taken over wh
     const held = await w.registry().claim(w.request(tui, w.folder('tui')));
     assert.equal(w.registry().status().lanes[0]?.ownerState, 'cant-tell');
 
-    await w.clock.advance(HOUR_MS);
-    await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('early'))), { code: 'pool-busy' });
-    assert.equal(w.registry().status().lanes.length, 1);
-
-    await w.clock.advance(HOUR_MS + 60_000);
-    const taker = await w.registry().claim(w.request(w.procs.owner(), w.folder('taker')));
-    assert.deepEqual(taker.freed, []);
-    assert.deepEqual(
-      taker.tookOver.map(e => [e.id, e.reason, e.owner]),
-      [[held.lane.id, 'taken-over', 'codex thread thread-tui (no process recorded)']],
-    );
-    assert.equal(taker.lane.device?.id, held.lane.device?.id);
+    for (const idle of [HOUR_MS, 3 * HOUR_MS, 7 * 24 * HOUR_MS]) {
+      await w.clock.advance(idle);
+      await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('taker'))), (error: unknown) => {
+        assert.ok(error instanceof Refusal);
+        assert.equal(error.code, 'pool-busy');
+        assert.match(error.message, new RegExp(held.lane.worktree));
+        return true;
+      });
+      assert.deepEqual(
+        w
+          .registry()
+          .status()
+          .lanes.map(c => c.id),
+        [held.lane.id],
+      );
+    }
   } finally {
     w.close();
   }

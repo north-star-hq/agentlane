@@ -26,7 +26,9 @@ import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/co
 import { asMobile } from '../project/config.ts';
 import type { OwnerState } from '../registry/owner.ts';
 import { AGENTS, describeOwner, describeState } from '../registry/owner.ts';
-import type { LaneInfo } from '../registry/types.ts';
+import { formatTime } from '../registry/format.ts';
+import { describeRestarts } from '../registry/parks.ts';
+import type { LaneInfo, ParkStatus } from '../registry/types.ts';
 import { explainInspection, inspectService, listenersElsewhere } from '../services/services.ts';
 import type { EnvDeps } from './deps.ts';
 import { toolchainFindings } from './preflight.ts';
@@ -55,6 +57,8 @@ export interface DoctorInput {
   platform?: ProjectPlatform | undefined;
   /** The iOS build `up` installed last, from the lane's up record. */
   installed?: InstalledBuild | undefined;
+  /** How the lane is parked; null or absent while it is awake. */
+  park?: ParkStatus | null | undefined;
 }
 
 function variantCheck(verdict: VariantVerdict, expected: string): DoctorCheck {
@@ -314,6 +318,10 @@ export async function diagnose(deps: EnvDeps, input: DoctorInput): Promise<Docto
       checks.push({ name: 'Maestro', ok: true, detail: describeMaestroBuild(await maestroBuild(deps.env)), fix: '' });
     }
   }
+  if (lane && !mismatch && input.park) {
+    checks.push(parkCheck(lane, input.park));
+    return finish(lane, checks);
+  }
   if (!config || !lane || mismatch) return finish(lane, checks);
   checks.push(...resourceChecks(config, lane));
   const tools = deps.browser ?? realBrowserTools;
@@ -475,6 +483,22 @@ async function webAppCheck(
           ? url
           : `${url} answers HTTP ${String(answer.status)}${answer.status < 500 ? '' : `, a server error`}`,
     fix: answer === null ? UP : `read the log of ${service} in the lane's log folder`,
+  };
+}
+
+function parkCheck(lane: LaneInfo, park: ParkStatus): DoctorCheck {
+  const by = park.by === null ? '' : ` by pid ${String(park.by)}`;
+  const problems = park.problems.length > 0 ? `; ${park.problems.join('; ')}` : '';
+  const detail =
+    park.state === 'parked'
+      ? `lane ${lane.id} has been parked since ${formatTime(park.parkedAt ?? park.since)}, after going unused: its device went back to the pool and its services stopped, and its next call brings back ${describeRestarts(park.restarts)}${problems}`
+      : `lane ${lane.id} is being ${park.state === 'parking' ? 'parked' : 'brought back'}${by} since ${formatTime(park.since)}${problems}`;
+  return {
+    name: 'parked',
+    ok: true,
+    warning: true,
+    detail,
+    fix: `any call on the lane (${CLI} look, ${CLI} exec, ${CLI} restart) brings it back first, and so does ${UP}`,
   };
 }
 

@@ -34,7 +34,10 @@ export interface EngineTarget {
   /** The Maestro release, its download and the JDK search; for tests. */
   install?: Pick<InstallOptions, 'release' | 'download' | 'searchJdk17'>;
   /** Engine timings; for tests. `idleMs` overrides the Mac's driver.json. */
-  tuning?: Pick<EngineConfig, 'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'>;
+  tuning?: Pick<
+    EngineConfig,
+    'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'heartbeatMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'
+  >;
   /** For judging whether a release in progress still runs; the system's process table when absent. */
   processes?: ProcessTable;
 }

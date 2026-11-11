@@ -2,6 +2,7 @@ import type { BrowserDriverName } from '../browser/kinds.ts';
 import type { Platform } from '../devices/backend.ts';
 import type { RegistryConfig } from './config.ts';
 import type { Owner, OwnerState, ProvenState } from './owner.ts';
+import type { ParkRestarts, ParkState } from './parks.ts';
 
 export interface ServiceRequest {
   name: string;
@@ -13,6 +14,8 @@ export interface DeviceRequest {
   deviceType?: string | undefined;
   runtime?: string | undefined;
   strict?: boolean | undefined;
+  /** The pool device to take when it is free and fits, such as the one a parked lane gave back. */
+  prefer?: string | undefined;
 }
 
 export interface BrowserRequest {
@@ -163,7 +166,6 @@ export interface EndedLane {
 export interface LaneOutcome {
   lane: Lane;
   created: boolean;
-  tookOver: EndedLane[];
   freed: EndedLane[];
   notes: string[];
   /** The driver the lane's browser had before this lane changed it; null when it kept its driver. */
@@ -179,11 +181,23 @@ export interface ProcessStatus extends ServiceProcess {
   state: ProcessState;
 }
 
+export interface ParkStatus {
+  state: ParkState;
+  since: number;
+  parkedAt: number | null;
+  /** The pid parking or waking the lane; null once it is parked. */
+  by: number | null;
+  restarts: ParkRestarts;
+  problems: string[];
+}
+
 export interface LaneStatus extends LaneInfo {
   processes: ProcessStatus[];
   ownerState: OwnerState;
   idleMs: number;
   deviceState: DeviceState | null;
+  /** Null while the lane is awake. */
+  park: ParkStatus | null;
 }
 
 export interface PoolDeviceStatus {
