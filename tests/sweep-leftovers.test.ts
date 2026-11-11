@@ -463,7 +463,7 @@ test('a stop proves ours, through the moment the sweep saw its leader running, a
       name: 'api',
       type: 'api',
       ports: null,
-      start: 'exec node forker.mjs 1500',
+      start: 'exec node forker.mjs 2200',
       cwd: project,
       ready: { kind: 'tcp', host: '127.0.0.1' },
       timeoutMs: 8000,
