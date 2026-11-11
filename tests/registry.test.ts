@@ -6,17 +6,21 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { Platform } from '../src/devices/backend.ts';
 import { DeviceBackendError } from '../src/devices/backend.ts';
+import type { ProcessIdentity, ProcessTable } from '../src/processes.ts';
 import { identityOf, systemProcesses } from '../src/processes.ts';
 import { DEFAULT_CONFIG, DEVICE_MEMORY_MB, HOUR_MS } from '../src/registry/config.ts';
+import type { RegistryConfig } from '../src/registry/config.ts';
 import { allLeases, endLease, leaseDevice } from '../src/registry/leases.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { databasePath } from '../src/registry/paths.ts';
+import type { PortProbe } from '../src/registry/ports.ts';
 import { Refusal } from '../src/registry/refusal.ts';
 import type { Registry, Step } from '../src/registry/registry.ts';
 import { Registry as RegistryClass } from '../src/registry/registry.ts';
 import type { Lane, LaneRequest } from '../src/registry/types.ts';
 import type { SharedRegistry } from './support/stress-plan.ts';
 import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
+import type { FakeProcesses } from './support/fakes.ts';
 import { FakeProbe } from './support/fakes.ts';
 import type { World } from './support/world.ts';
 import { waitForStep, world } from './support/world.ts';
@@ -1494,3 +1498,600 @@ for (const idle of ['simulator', 'emulator'] as const) {
     }
   });
 }
+
+type Pid1 = 'omits pid 1' | 'fails on pid 1';
+
+function withoutPid1(
+  procs: FakeProcesses,
+  blind: Pid1,
+  onRead: (pids: readonly number[]) => void = () => undefined,
+): ProcessTable {
+  return {
+    startTimes: pids => {
+      onRead(pids);
+      if (!pids.includes(1)) return procs.startTimes(pids);
+      return blind === 'fails on pid 1' ? undefined : procs.startTimes(pids.filter(pid => pid !== 1));
+    },
+    info: pid => procs.info(pid),
+    cwd: () => undefined,
+  };
+}
+
+function writeLocked(dir: string): boolean {
+  const probe = new DatabaseSync(databasePath(dir));
+  try {
+    probe.exec('BEGIN IMMEDIATE');
+    probe.exec('ROLLBACK');
+    return false;
+  } catch {
+    return true;
+  } finally {
+    probe.close();
+  }
+}
+
+function committedLeasesOf(dir: string, holder: ProcessIdentity): number {
+  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  try {
+    return Number(
+      db
+        .prepare('SELECT COUNT(*) AS n FROM device_leases WHERE holder_pid = ? AND holder_start = ?')
+        .get(holder.pid, holder.start)?.n,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function watchDeviceCalls(w: World, holder: ProcessIdentity): string[] {
+  const calls: string[] = [];
+  w.devices.during = call => {
+    const where = writeLocked(w.dir) ? 'inside the lock' : 'outside the lock';
+    calls.push(
+      call === 'create' ? `create ${where}` : `${call} ${where}, ${String(committedLeasesOf(w.dir, holder))} leases committed`,
+    );
+  };
+  return calls;
+}
+
+for (const cut of ['release:committed', 'release:stopped-device'] as const) {
+  test(`where ps can't read pid 1, a release shuts its simulator down inside the write lock, so a releaser killed at ${cut} leaves 0.4.1 no stand-in to drop and no room for a second simulator`, async () => {
+    const w = world({ poolSize: 1, memoryBudgetMb: 4000 });
+    try {
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+      const device = a.lane.device;
+      assert.ok(device);
+      const holder = w.procs.spawn();
+      const calls = watchDeviceCalls(w, holder);
+      assert.throws(
+        () =>
+          w
+            .registry({ self: holder, processes: withoutPid1(w.procs, 'omits pid 1'), onStep: cutShort(cut) })
+            .release(refOf(a.lane), owner),
+        /stopped at/,
+      );
+      w.devices.during = null;
+      w.procs.kill(holder.pid);
+      assert.equal(claimAs041(w), 'pool-busy', 'the only pool row is the simulator itself, which 0.4.1 never drops');
+      assert.equal(w.devices.all().length, 1);
+      assert.deepEqual(calls, ['shutdown inside the lock, 0 leases committed']);
+      assert.equal(leaseRows(w.dir), 0);
+
+      w.procs.kill(owner.process?.pid ?? 0);
+      const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c'), { boot: true }));
+      assert.equal(c.lane.device?.id, device.id);
+      assert.deepEqual(
+        w.devices.all().map(d => [d.id, d.booted]),
+        [[device.id, true]],
+      );
+      assert.deepEqual(poolRows(w.dir), [{ name: device.name, id: device.id }]);
+    } finally {
+      w.close();
+    }
+  });
+}
+
+test(
+  "0.4.1's own registry code, beside a release cut short where ps can't read pid 1, makes no second simulator",
+  { skip: !FORMER_041_SRC && "set AGENTLANE_041_SRC to 0.4.1's src folder, such as one from git archive 6777fca src" },
+  async () => {
+    const source = path.join(FORMER_041_SRC ?? '', 'registry', 'registry.ts');
+    const { Registry: Registry041 } = (await import(pathToFileURL(source).href)) as { Registry: typeof Registry };
+    for (const cut of ['release:committed', 'release:stopped-device'] as const) {
+      const w = world({ poolSize: 1, memoryBudgetMb: 4000 });
+      try {
+        const owner = w.procs.owner();
+        const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+        const device = a.lane.device;
+        assert.ok(device);
+        const holder = w.procs.spawn();
+        const calls = watchDeviceCalls(w, holder);
+        assert.throws(
+          () =>
+            w
+              .registry({ self: holder, processes: withoutPid1(w.procs, 'omits pid 1'), onStep: cutShort(cut) })
+              .release(refOf(a.lane), owner),
+          /stopped at/,
+        );
+        w.devices.during = null;
+        w.procs.kill(holder.pid);
+        const former = Registry041.open({
+          dir: w.dir,
+          processes: w.procs,
+          ports: w.probe,
+          devices: { ios: w.devices, android: w.emulators },
+          config: w.config,
+          clock: w.clock,
+          pollMs: 500,
+          self: w.procs.spawn(),
+        });
+        let took: string | null = null;
+        try {
+          const b = former.claim(w.request(w.procs.owner(), w.folder('b'), { boot: true }));
+          if (cut === 'release:committed') took = (await b).lane.device?.id ?? null;
+          else await assert.rejects(b, { code: 'pool-busy' }, cut);
+        } finally {
+          former.close();
+        }
+        assert.deepEqual(
+          w.devices.all().map(d => d.id),
+          [device.id],
+          `0.4.1 made no second simulator after a cut at ${cut}`,
+        );
+        assert.equal(poolRows(w.dir).length, 1);
+        assert.equal(took, cut === 'release:committed' ? device.id : null, '0.4.1 took the simulator back from the pool');
+        assert.deepEqual(calls, ['shutdown inside the lock, 0 leases committed'], cut);
+      } finally {
+        w.close();
+      }
+    }
+  },
+);
+
+for (const blind of ['omits pid 1', 'fails on pid 1'] as const) {
+  test(`where ps ${blind}, a process reads pid 1 once and never inside the write lock, however many registries it opens, even beside another process's stand-in`, async () => {
+    const w = world({ poolSize: 2 });
+    const opened: Registry[] = [];
+    try {
+      w.procs.recycle(process.pid);
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+      const holder = w.procs.spawn();
+      assert.throws(
+        () => w.registry({ self: holder, onStep: cutShort('release:committed') }).release(refOf(a.lane), owner),
+        /stopped at/,
+      );
+      assert.equal(leaseRows(w.dir), 1, "a live holder's lease, its stand-in created by pid 1");
+
+      const reads: string[] = [];
+      const processes = withoutPid1(w.procs, blind, pids => {
+        reads.push(`${pids.join(',')}${writeLocked(w.dir) ? ' inside the lock' : ''}`);
+      });
+      const open = () => {
+        const registry = RegistryClass.open({
+          dir: w.dir,
+          processes,
+          ports: w.probe,
+          devices: { ios: w.devices, android: w.emulators },
+          config: w.config,
+          clock: w.clock,
+        });
+        opened.push(registry);
+        return registry;
+      };
+      open().finishTeardown('nolane', 'nothing');
+      open().finishTeardown('nolane', 'nothing');
+      const me = w.procs.owner();
+      const b = await open().claim(w.request(me, w.folder('b'), { boot: true }));
+      assert.ok(b.lane.device);
+      open().takeTeardowns();
+      open().cancelPending();
+      open().release(refOf(b.lane), me);
+      const again = await open().claim(w.request(me, w.folder('b')));
+      open().releaseOwn(me, again.lane.worktree);
+
+      assert.equal(reads.filter(r => r.split(' ')[0]?.split(',').includes('1')).length, 1, reads.join('\n'));
+      assert.deepEqual(
+        reads.filter(r => r.endsWith('inside the lock')),
+        [],
+      );
+      assert.equal(leaseRows(w.dir), 1, "the live holder's lease is untouched");
+    } finally {
+      for (const registry of opened) registry.close();
+      w.close();
+    }
+  });
+}
+
+const FALLBACK_PATHS: {
+  path: string;
+  config: Partial<RegistryConfig>;
+  run: (w: World, blind: () => Registry) => Promise<void>;
+}[] = [
+  {
+    path: 'a release',
+    config: {},
+    run: async (w, blind) => {
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+      blind().release(refOf(a.lane), owner);
+      assert.equal(w.devices.all()[0]?.booted, false);
+    },
+  },
+  {
+    path: 'a claim that finds an unclaimed simulator booted',
+    config: { poolSize: 1 },
+    run: async (w, blind) => {
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a')));
+      const device = a.lane.device;
+      assert.ok(device);
+      w.registry().release(refOf(a.lane), owner);
+      w.devices.setBooted(device.id, true);
+      const b = await blind().claim(w.request(w.procs.owner(), w.folder('b')));
+      assert.equal(b.lane.device?.id, device.id);
+      assert.ok(b.notes.includes(`shut down unclaimed pool simulator ${device.name}`), b.notes.join('\n'));
+    },
+  },
+  {
+    path: 'a strict claim that replaces a spare',
+    config: { poolSize: 1 },
+    run: async (w, blind) => {
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a')));
+      w.registry().release(refOf(a.lane), owner);
+      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+      const b = await blind().claim(w.request(w.procs.owner(), w.folder('b'), strict));
+      assert.equal(b.lane.device?.deviceTypeName, 'iPhone 17 Pro');
+      assert.deepEqual(
+        w.devices.all().map(d => d.id),
+        [b.lane.device.id],
+      );
+    },
+  },
+  {
+    path: "a claim that takes over an idle lane's simulator without using it",
+    config: { poolSize: 2, memoryBudgetMb: 4000 },
+    run: async (w, blind) => {
+      const held = await w.registry().claim(w.request(w.procs.owner(), w.folder('idle'), { boot: true }));
+      await w.clock.advance(w.config.idleMs + 1);
+      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+      const b = await blind().claim(w.request(w.procs.owner(), w.folder('b'), strict));
+      assert.deepEqual(
+        b.tookOver.map(t => t.id),
+        [held.lane.id],
+      );
+      assert.equal(w.devices.all().find(d => d.id === held.lane.device?.id)?.booted, false);
+    },
+  },
+  {
+    path: 'a claim whose new simulator fails to boot',
+    config: {},
+    run: async (w, blind) => {
+      w.devices.failBoot = true;
+      await assert.rejects(blind().claim(w.request(w.procs.owner(), w.folder('a'), { boot: true })), DeviceBackendError);
+      assert.equal(poolRows(w.dir).length, 1);
+    },
+  },
+  {
+    path: "a claim that finds a dead releaser's lease",
+    config: { poolSize: 1 },
+    run: async (w, blind) => {
+      const device = await releaseCutShort(w);
+      const b = await blind().claim(w.request(w.procs.owner(), w.folder('b')));
+      assert.equal(b.lane.device?.id, device.id);
+      assert.equal(w.devices.all()[0]?.booted, false);
+    },
+  },
+  {
+    path: 'a release into a pool past its size',
+    config: { poolSize: 1 },
+    run: async (w, blind) => {
+      const owner = w.procs.owner();
+      const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+      const spec = w.devices.resolveSpec({});
+      const other = w.devices.addByHand('agentlane-pool-0a0b0c', false, spec);
+      const db = new DatabaseSync(databasePath(w.dir));
+      try {
+        db.prepare(
+          `INSERT INTO devices (name, platform, device_id, device_type, device_type_name, runtime, runtime_name, created_at)
+           VALUES ('agentlane-pool-0a0b0c', 'ios', ?, ?, ?, ?, ?, ?)`,
+        ).run(other, spec.deviceType, spec.deviceTypeName, spec.runtime, spec.runtimeName, w.clock.now());
+      } finally {
+        db.close();
+      }
+      blind().release(refOf(a.lane), owner);
+      assert.deepEqual(
+        w.devices.all().map(d => d.id),
+        [other],
+      );
+    },
+  },
+];
+
+for (const { path: route, config, run } of FALLBACK_PATHS) {
+  test(`where ps can't read pid 1, ${route} shuts down and deletes simulators only inside the write lock and creates them outside it`, async () => {
+    const w = world(config);
+    try {
+      const me = w.procs.spawn();
+      let calls: string[] = [];
+      await run(w, () => {
+        calls = watchDeviceCalls(w, me);
+        return w.registry({ self: me, processes: withoutPid1(w.procs, 'omits pid 1') });
+      });
+      w.devices.during = null;
+      const work = calls.filter(c => !c.startsWith('create'));
+      assert.ok(work.length > 0, 'the path shut down or deleted a simulator');
+      assert.deepEqual(
+        work.filter(c => !c.endsWith('inside the lock, 0 leases committed')),
+        [],
+        calls.join('\n'),
+      );
+      assert.deepEqual(
+        calls.filter(c => c.startsWith('create') && c !== 'create outside the lock'),
+        [],
+      );
+      assert.equal(leaseRows(w.dir), 0);
+    } finally {
+      w.close();
+    }
+  });
+}
+
+test('a release that settles while a strict claim retires a spare and creates its replacement puts its simulator back, and the pool ends at its size', async () => {
+  const w = world({ poolSize: 2, memoryBudgetMb: 20000 });
+  try {
+    const ownerA = w.procs.owner();
+    const a = await w.registry().claim(w.request(ownerA, w.folder('a'), { boot: true }));
+    const d1 = a.lane.device;
+    assert.ok(d1);
+    const ownerB = w.procs.owner();
+    const b = await w
+      .registry()
+      .claim(w.request(ownerB, w.folder('b'), { device: { platform: 'ios', deviceType: 'iPhone Air' } }));
+    const d2 = b.lane.device;
+    assert.ok(d2);
+    w.registry().release(refOf(b.lane), ownerB);
+
+    const notes: string[] = [];
+    let during: { name: string; id: string | null }[] = [];
+    w.devices.during = call => {
+      if (call !== 'create' || during.length > 0) return;
+      during = poolRows(w.dir);
+      w.registry().release(refOf(a.lane), ownerA, notes);
+    };
+    const strict = { device: { platform: 'ios', deviceType: 'iPhone 17e', strict: true } } as const;
+    const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c'), strict));
+    w.devices.during = null;
+    const made = c.lane.device;
+    assert.ok(made);
+    assert.equal(during.length, 3, `${d1.name}, ${d2.name} under its delete lease, and the reservation being created`);
+    assert.deepEqual(
+      notes.filter(n => n.startsWith('deleted pool simulator')),
+      [],
+    );
+    assert.deepEqual(
+      w.devices
+        .all()
+        .map(d => d.id)
+        .sort(),
+      [d1.id, made.id].sort(),
+    );
+    assert.deepEqual(
+      poolRows(w.dir)
+        .map(r => r.id)
+        .sort(),
+      [d1.id, made.id].sort(),
+    );
+    assert.equal(leaseRows(w.dir), 0);
+  } finally {
+    w.close();
+  }
+});
+
+test("a claim doesn't plan while its process holds a settlement it couldn't land: it lands it in its own write, so no second simulator is made under one name", async () => {
+  const w = world({ poolSize: 1 });
+  let blocker: DatabaseSync | null = null;
+  const block = () => {
+    blocker = new DatabaseSync(databasePath(w.dir));
+    blocker.exec('BEGIN IMMEDIATE');
+  };
+  const unblock = () => {
+    blocker?.exec('ROLLBACK');
+    blocker?.close();
+    blocker = null;
+  };
+  try {
+    const me = w.procs.spawn();
+    const owner = w.procs.owner();
+    await assert.rejects(
+      w
+        .registry({
+          self: me,
+          lockWaitMs: 50,
+          onStep: step => {
+            if (step === 'claim:created-device' && !blocker) block();
+          },
+        })
+        .claim(w.request(owner, w.folder('a'))),
+      { code: 'registry-busy' },
+    );
+    unblock();
+    const [made] = w.devices.all();
+    assert.ok(made);
+
+    block();
+    let openProbe: () => void = () => undefined;
+    w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+    const again = w.registry({ self: me, lockWaitMs: 50 }).claim(w.request(owner, w.folder('a')));
+    unblock();
+    w.probe.gate = null;
+    openProbe();
+    const got = await again;
+    assert.equal(got.lane.device?.id, made.id);
+    assert.deepEqual(
+      w.devices.all().map(d => [d.id, d.name]),
+      [[made.id, made.name]],
+      'no second simulator under its name',
+    );
+    assert.deepEqual(poolRows(w.dir), [{ name: made.name, id: made.id }]);
+  } finally {
+    unblock();
+    w.close();
+  }
+});
+
+test('a claim or release whose process holds a settlement it could not land waits on a held registry lock no longer than one that holds none', async () => {
+  const w = world({ poolSize: 1 });
+  let blocker: DatabaseSync | null = null;
+  const block = () => {
+    blocker = new DatabaseSync(databasePath(w.dir));
+    blocker.exec('BEGIN IMMEDIATE');
+  };
+  const unblock = () => {
+    blocker?.exec('ROLLBACK');
+    blocker?.close();
+    blocker = null;
+  };
+  const lockWaitMs = 1000;
+  try {
+    const me = w.procs.spawn();
+    const owner = w.procs.owner();
+    const a = await w.registry({ self: me }).claim(w.request(owner, w.folder('a'), { boot: true }));
+    const other = await w.registry().claim(w.request(owner, w.folder('other'), { device: null }));
+    const notes: string[] = [];
+    w.registry({
+      self: me,
+      lockWaitMs: 50,
+      onStep: step => {
+        if (step === 'release:stopped-device' && !blocker) block();
+      },
+    }).release(refOf(a.lane), owner, notes);
+    assert.ok(
+      notes.some(n => n.startsWith('could not return')),
+      notes.join('\n'),
+    );
+
+    let started = Date.now();
+    await assert.rejects(w.registry({ self: me, lockWaitMs }).claim(w.request(owner, w.folder('b'))), {
+      code: 'registry-busy',
+    });
+    const claimWaited = Date.now() - started;
+    started = Date.now();
+    assert.throws(() => w.registry({ self: me, lockWaitMs }).release(refOf(other.lane), owner), { code: 'registry-busy' });
+    const releaseWaited = Date.now() - started;
+    assert.ok(claimWaited < 2.5 * lockWaitMs, `the claim waited ${String(claimWaited)} ms: its write and its cleanup's`);
+    assert.ok(releaseWaited < 1.5 * lockWaitMs, `the release waited ${String(releaseWaited)} ms: its one write's`);
+    unblock();
+
+    await w.registry({ self: me }).claim(w.request(owner, w.folder('b'), { device: null }));
+    assert.equal(leaseRows(w.dir), 0, 'the kept settlement landed once the lock was free');
+    assert.equal((await w.registry().claim(w.request(w.procs.owner(), w.folder('c')))).lane.device?.id, a.lane.device?.id);
+  } finally {
+    unblock();
+    w.close();
+  }
+});
+
+for (const waitMs of [0, 1000]) {
+  test(`a claim with a timeout of ${String(waitMs)} ms that sees a lane holding a device end during every listing is refused once that time has passed, rather than listing again forever`, async () => {
+    const w = world({ poolSize: 8, memoryBudgetMb: 40_000 });
+    try {
+      const lanes: { owner: Owner; lane: Lane }[] = [];
+      for (let i = 0; i < 6; i++) {
+        const owner = w.procs.owner();
+        lanes.push({ owner, lane: (await w.registry().claim(w.request(owner, w.folder(`l${String(i)}`)))).lane });
+      }
+      let listings = 0;
+      const churn: PortProbe = {
+        listening: async () => {
+          listings++;
+          const next = lanes.shift();
+          if (next) w.registry().release(refOf(next.lane), next.owner);
+          await w.clock.advance(400);
+          return new Set();
+        },
+      };
+      const late = w.registry({ ports: churn }).claim(w.request(w.procs.owner(), w.folder('late'), { waitMs }));
+      await assert.rejects(late, (error: unknown) => {
+        assert.ok(error instanceof Refusal);
+        assert.equal(error.code, 'pool-busy');
+        assert.match(error.summary, /kept changing/);
+        assert.ok(error.holders.some(h => h.who.includes('whose lane')));
+        return true;
+      });
+      assert.equal(listings, waitMs === 0 ? 2 : 3, 'it looks once more after the first change, then only while time is left');
+      assert.equal(lanes.length, 6 - listings);
+      assert.deepEqual(
+        poolRows(w.dir).filter(r => r.id === null),
+        [],
+        'it left no reservation behind',
+      );
+    } finally {
+      w.close();
+    }
+  });
+}
+
+test('a kept settlement that is handed over to delete its simulator is worked once, beside other leftovers of the same process', async () => {
+  const w = world({ poolSize: 1 });
+  let blocker: DatabaseSync | null = null;
+  const unblock = () => {
+    blocker?.exec('ROLLBACK');
+    blocker?.close();
+    blocker = null;
+  };
+  try {
+    const me = w.procs.spawn();
+    const owner = w.procs.owner();
+    const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+    const d1 = a.lane.device;
+    assert.ok(d1);
+    const notes: string[] = [];
+    w.registry({
+      self: me,
+      lockWaitMs: 50,
+      onStep: step => {
+        if (step !== 'release:stopped-device' || blocker) return;
+        blocker = new DatabaseSync(databasePath(w.dir));
+        blocker.exec('BEGIN IMMEDIATE');
+      },
+    }).release(refOf(a.lane), owner, notes);
+    unblock();
+    assert.ok(
+      notes.some(n => n.startsWith(`could not return ${d1.name} to the pool yet`)),
+      notes.join('\n'),
+    );
+
+    const spec = w.devices.resolveSpec({});
+    const other = w.devices.addByHand('agentlane-pool-0a0b0c', false, spec);
+    const db = new DatabaseSync(databasePath(w.dir));
+    try {
+      db.prepare(
+        `INSERT INTO devices (name, platform, device_id, device_type, device_type_name, runtime, runtime_name, created_at)
+         VALUES ('agentlane-pool-0a0b0c', 'ios', ?, ?, ?, ?, ?, ?)`,
+      ).run(other, spec.deviceType, spec.deviceTypeName, spec.runtime, spec.runtimeName, w.clock.now());
+      db.prepare(
+        `INSERT INTO devices (name, platform, device_id, device_type, device_type_name, runtime, runtime_name,
+           creator_pid, creator_start, created_at)
+         VALUES ('agentlane-pool-1e1e1e', 'ios', NULL, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(spec.deviceType, spec.deviceTypeName, spec.runtime, spec.runtimeName, me.pid, me.start, w.clock.now());
+    } finally {
+      db.close();
+    }
+
+    w.devices.calls.length = 0;
+    const next = await w.registry({ self: me }).claim(w.request(w.procs.owner(), w.folder('b'), NO_DEVICE));
+    assert.deepEqual(
+      w.devices.calls.filter(c => c.startsWith('delete')),
+      [`delete ${d1.id}`],
+    );
+    assert.equal(next.notes.filter(n => n.startsWith(`deleted pool simulator ${d1.name}`)).length, 1, next.notes.join('\n'));
+    assert.deepEqual(poolRows(w.dir), [{ name: 'agentlane-pool-0a0b0c', id: other }]);
+    assert.equal(leaseRows(w.dir), 0);
+  } finally {
+    unblock();
+    w.close();
+  }
+});

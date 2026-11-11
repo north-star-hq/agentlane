@@ -37,9 +37,11 @@ export function sameProcess(a: ProcessIdentity, b: ProcessIdentity): boolean {
  * pre-lock snapshot proves the creator dead they adopt the listed device of the same name or drop the row.
  * A leased device's row becomes such a reservation under a name no device has, created by `keeper`, pid 1
  * with its start time, which those versions can't prove dead while the machine stays up. So they hold the
- * device's place until this version ends the lease, judging the lease by its holder.
+ * device's place until this version ends the lease, judging the lease by its holder. A holder those versions
+ * can prove dead would let them drop the row and admit another device while this one still runs.
  */
-function insertLease(db: DatabaseSync, lease: DeviceLease, keeper: ProcessIdentity, now: number): DeviceLease {
+function insertLease(db: DatabaseSync, lease: DeviceLease, keeper: ProcessIdentity | null, now: number): DeviceLease {
+  const creator = keeper ?? lease.holder;
   db.prepare(
     `INSERT INTO devices (name, platform, device_id, device_type, device_type_name, runtime, runtime_name,
        creator_pid, creator_start, claim_id, created_at)
@@ -51,8 +53,8 @@ function insertLease(db: DatabaseSync, lease: DeviceLease, keeper: ProcessIdenti
     lease.deviceTypeName,
     lease.runtime,
     lease.runtimeName,
-    keeper.pid,
-    keeper.start,
+    creator.pid,
+    creator.start,
     now,
   );
   db.prepare(
@@ -82,7 +84,7 @@ export interface LeaseTerms {
   reservation: string;
   work: DeviceWork;
   holder: ProcessIdentity;
-  keeper: ProcessIdentity;
+  keeper: ProcessIdentity | null;
   consolePort: number | null;
   now: number;
 }
@@ -182,7 +184,10 @@ export function endLease(db: DatabaseSync, lease: DeviceLease, outcome: LeaseOut
     return 'recorded-elsewhere';
   }
   const others = db
-    .prepare('SELECT COUNT(*) AS n FROM devices WHERE platform = ? AND name != ?')
+    .prepare(
+      `SELECT COUNT(*) AS n FROM devices WHERE platform = ? AND name != ?
+         AND name NOT IN (SELECT reservation FROM device_leases WHERE work = 'delete')`,
+    )
     .get(lease.platform, lease.reservation);
   if (outcome === 'present' && others && int(others, 'n') >= poolCap) return 'no-room';
   removeLease(db, lease);
