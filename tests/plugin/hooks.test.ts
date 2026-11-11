@@ -9,6 +9,7 @@ import { runHookCommand, SESSION_END_OWNER_ENV } from '../../src/plugin/hook-cli
 import { claudeSessionName } from '../../src/plugin/session-name.ts';
 import { identityOf, systemProcesses } from '../../src/processes.ts';
 import { tcpProbe } from '../../src/registry/ports.ts';
+import { laneDir, lastCallFile } from '../../src/up/lane-files.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { FakeDevices, tempDir } from '../support/fakes.ts';
@@ -120,6 +121,47 @@ test('pre-tool-use denies an install on another session’s simulator, naming th
       assert.equal(await runHookCommand(['pre-tool-use'], deps(s, { AGENTLANE_OWNER_PID: String(me.pid) }, quiet, { stdin })), 0);
       assert.equal(quiet.join(''), '', stdin);
     }
+  } finally {
+    other.kill('SIGKILL');
+    me.kill('SIGKILL');
+    fs.rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
+test('pre-tool-use counts a command it allows on my own simulator as a call on my lane, and one aimed at no device as none', async () => {
+  const s = setup('hook-call');
+  const other = sleeper();
+  const me = sleeper();
+  try {
+    const env = { AGENTLANE_OWNER_PID: String(me.pid) };
+    await lane(s, { AGENTLANE_OWNER_PID: String(other.pid) }, s.folder('other'));
+    const mine = await lane(s, env, s.folder('mine'));
+    const status = () => readRegistryStatus({ dir: s.stateDir, processes: systemProcesses, devices: {} });
+    const own = status().lanes.find(c => c.worktree === s.folder('mine'));
+    assert.ok(own);
+    const lastCall = () => {
+      const file = lastCallFile(laneDir(s.stateDir, own.id));
+      return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as { at: number }).at : null;
+    };
+    fs.rmSync(lastCallFile(laneDir(s.stateDir, own.id)), { force: true });
+    const run = async (command: string) => {
+      const stdin = JSON.stringify({
+        session_id: 's',
+        cwd: s.folder('mine'),
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command },
+      });
+      const out: string[] = [];
+      assert.equal(await runHookCommand(['pre-tool-use'], deps(s, env, out, { stdin })), 0);
+      return out.join('');
+    };
+
+    assert.equal(await run('xcrun simctl list'), '');
+    assert.equal(lastCall(), null, 'a command aimed at no device counted');
+    const before = Date.now();
+    assert.equal(await run(`xcrun simctl openurl ${mine} https://example.com`), '');
+    assert.ok((lastCall() ?? 0) >= before, 'the command on my simulator did not count');
   } finally {
     other.kill('SIGKILL');
     me.kill('SIGKILL');
