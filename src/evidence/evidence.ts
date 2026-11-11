@@ -16,6 +16,7 @@ import { startDeviceVideo, stopDeviceVideo, writeDeviceLog, type DeviceTarget, t
 import {
   clearInProgress,
   copyNewer,
+  inodeOf,
   newEvidenceFile,
   newEvidenceFolder,
   readFrom,
@@ -181,12 +182,14 @@ export async function startTrace(ctx: EvidenceContext, target: EvidenceTarget): 
     return { path: evidence, files: [], notes: [`tracing the ${control.driver} browser's actions`], problems: [] };
   }
   const files = driverFiles(ctx);
+  const stepsIno = inodeOf(files.steps);
   writeInProgress(evidence, 'trace', {
     version: 1,
     target,
     startedAt,
     driverLogBytes: sizeOf(files.log),
     stepsBytes: sizeOf(files.steps),
+    ...(stepsIno === undefined ? {} : { stepsIno }),
   });
   return { path: evidence, files: [], notes: ["tracing the driver's calls, the flows run and the device's log"], problems: [] };
 }
@@ -235,7 +238,7 @@ export async function stopTrace(ctx: EvidenceContext, target: EvidenceTarget): P
     kept.files.push(file);
   };
   write('driver.log', readFrom(files.log, started.driverLogBytes ?? 0));
-  write('flows.jsonl', readFrom(files.steps, started.stepsBytes ?? 0));
+  write('flows.jsonl', readFrom(files.steps, started.stepsBytes ?? 0, started.stepsIno));
   kept.files.push(...copyNewer(files.shots, path.join(dir, 'screenshots'), started.startedAt));
   try {
     const file = path.join(dir, 'device.log');

@@ -55,6 +55,8 @@ export interface InProgress {
   /** How far the driver's log and recorded steps reached when a device trace began. */
   driverLogBytes?: number;
   stepsBytes?: number;
+  /** The recorded steps' inode then, so a stop can tell the file was replaced. */
+  stepsIno?: number;
 }
 
 function stateFile(evidence: string, kind: 'video' | 'trace', target: EvidenceTarget): string {
@@ -79,15 +81,27 @@ export function clearInProgress(evidence: string, kind: 'video' | 'trace', targe
   fs.rmSync(stateFile(evidence, kind, target), { force: true });
 }
 
-/** The bytes a file grew by since `from`, or all of it when it is shorter than that (it was replaced). */
-export function readFrom(file: string, from: number): string {
+/**
+ * The bytes a file grew by since `from`, or all of it when it is shorter than that or is no longer the inode `ino`
+ * (it was replaced).
+ */
+export function readFrom(file: string, from: number, ino?: number): string {
   let data: Buffer;
   try {
     data = fs.readFileSync(file);
   } catch {
     return '';
   }
-  return data.subarray(data.length >= from ? from : 0).toString('utf8');
+  const replaced = ino !== undefined && inodeOf(file) !== ino;
+  return data.subarray(!replaced && data.length >= from ? from : 0).toString('utf8');
+}
+
+export function inodeOf(file: string): number | undefined {
+  try {
+    return fs.statSync(file).ino;
+  } catch {
+    return undefined;
+  }
 }
 
 export function sizeOf(file: string): number {

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { rotateLog } from '../disk-limits.ts';
 import { JAVA_HOME_ENV } from '../hooks/env.ts';
 import { EMULATOR_NAME_PREFIX, FORMER } from '../name.ts';
 import { emulatorSerial } from '../registry/config.ts';
@@ -17,6 +18,7 @@ export const EMULATOR_FLAGS = ['-no-window', '-no-audio', '-no-boot-anim'] as co
 
 const BOOT_TIMEOUT_MS = 300_000;
 const STOP_TIMEOUT_MS = 60_000;
+export const EMULATOR_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 
 export interface AndroidSdk {
@@ -415,6 +417,7 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
       if (live.get(id) !== serial) {
         if (live.has(id)) backend.shutdown(id);
         fs.mkdirSync(options.logDir, { recursive: true, mode: 0o700 });
+        rotateLog(log, EMULATOR_LOG_MAX_BYTES);
         const out = fs.openSync(log, 'a');
         const started = spawn(sdk().emulator, ['-avd', id, '-port', String(consolePort), ...EMULATOR_FLAGS], {
           detached: true,

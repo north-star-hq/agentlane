@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
-import { runAgentCommand } from '../../src/agents/cli.ts';
+import { INIT_BACKUPS_KEPT, runAgentCommand } from '../../src/agents/cli.ts';
 import { hookCommand, mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills, stubOf } from '../../src/agents/skills.ts';
 import { tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -286,6 +287,38 @@ model = "o4-mini"
     const again = await init(dir, state, '--all');
     assert.equal(again.code, 0, again.stderr);
     assert.match(again.stdout, /Nothing to change/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('init keeps the project’s newest backups, its own included, so the last init can be undone, and leaves other projects’ alone', async () => {
+  const { dir, state, cleanup } = project();
+  try {
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    const earlier = Array.from({ length: 7 }, (_, i) => `2026-10-0${String(i + 1)}T09-00-00-000Z-app`);
+    for (const name of [...earlier, '2026-10-01T09-00-00-000Z-web']) fs.mkdirSync(path.join(backups, name), { recursive: true });
+    const before = `${JSON.stringify({ mcpServers: { docs: { command: 'docs-mcp' } } }, null, 2)}\n`;
+    write(dir, '.mcp.json', before);
+    let stderr = '';
+    const code = await runAgentCommand('init', ['--agents', 'claude'], {
+      env,
+      cwd: dir,
+      install: recordingInstaller().install,
+      stdout: () => undefined,
+      stderr: text => (stderr += text),
+      now: () => Date.UTC(2026, 9, 12, 9, 0, 0),
+    });
+    assert.equal(code, 0, stderr);
+    const newest = '2026-10-12T09-00-00-000Z-app';
+    assert.deepEqual(fs.readdirSync(backups).sort(), [
+      '2026-10-01T09-00-00-000Z-web',
+      ...earlier.slice(-(INIT_BACKUPS_KEPT - 1)),
+      newest,
+    ]);
+    assert.equal(fs.readFileSync(path.join(backups, newest, '.mcp.json'), 'utf8'), before, 'the last init can be undone');
+    assert.notEqual(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'), before);
   } finally {
     cleanup();
   }

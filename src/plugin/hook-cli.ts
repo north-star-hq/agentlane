@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { systemClock } from '../clock.ts';
+import { rotateLog } from '../disk-limits.ts';
 import { envName, TOOL } from '../name.ts';
 import type { Agent, Owner } from '../registry/owner.ts';
 import { AGENTS, describeOwner, judgeProcess, ownerKey, resolveOwner } from '../registry/owner.ts';
@@ -41,6 +42,7 @@ export const SESSION_END_OWNER_ENV = envName('SESSION_END_OWNER');
 export const SESSION_END_WAIT_ENV = envName('SESSION_END_WAIT_MS');
 const OWNER_EXIT_WAIT_MS = 30_000;
 const OWNER_EXIT_POLL_MS = 250;
+export const SESSION_END_LOG_MAX_BYTES = 1024 * 1024;
 
 export interface HookDeps extends CliDeps {
   stdin: string;
@@ -158,6 +160,7 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
 export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: string) => void {
   return (env, log) => {
     fs.mkdirSync(path.dirname(log), { recursive: true });
+    rotateLog(log, SESSION_END_LOG_MAX_BYTES);
     const fd = fs.openSync(log, 'a');
     try {
       const child = spawn(process.execPath, [cli, 'hook', 'session-end'], {
