@@ -11,6 +11,15 @@ import { DriverError } from './errors.ts';
 import { runCommand, tail } from './exec.ts';
 import { tryLock, unlock } from './lock.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from './release.ts';
+import {
+  compareVersions,
+  laneToolsOf,
+  removeOlderVersions,
+  systemCommandLines,
+  type CommandLines,
+  type LaneTools,
+  type OlderVersion,
+} from './superseded.ts';
 
 export interface Jdk {
   javaHome: string;
@@ -31,6 +40,8 @@ export interface InstallOptions {
   from?: string;
   download?: Downloader;
   processes?: ProcessTable;
+  commandLines?: CommandLines;
+  laneTools?: LaneTools;
   log?: (line: string) => void;
   lockWaitMs?: number;
   /** Where to look for JDK 17 past the environment; the system's places when absent. */
@@ -63,8 +74,32 @@ export function dataDir(env: NodeJS.ProcessEnv): string {
   return path.join(base, TOOL);
 }
 
+/** The data folder when the environment names it, by XDG_DATA_HOME or HOME, rather than by the OS's idea of home. */
+export function namedDataDir(env: NodeJS.ProcessEnv): string | undefined {
+  const xdg = env.XDG_DATA_HOME;
+  return (xdg && path.isAbsolute(xdg)) || env.HOME ? dataDir(env) : undefined;
+}
+
 export function maestroHome(env: NodeJS.ProcessEnv, release: MaestroRelease = MAESTRO_RELEASE): string {
   return path.join(dataDir(env), 'maestro', release.version);
+}
+
+function lockOf(base: string, version: string): string {
+  return path.join(base, `.${version}.lock`);
+}
+
+/** The builds this toolkit installed beside the pinned one that are older than it. */
+function olderBuilds(base: string, release: MaestroRelease): OlderVersion[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(base);
+  } catch {
+    return [];
+  }
+  return names
+    .filter(name => !name.startsWith('.') && compareVersions(name, release.version) < 0)
+    .filter(name => readMarker(path.join(base, name))?.version === name)
+    .map(name => ({ dir: path.join(base, name), lock: lockOf(base, name) }));
 }
 
 function binaryIn(home: string): string {
@@ -260,7 +295,10 @@ async function unpack(release: MaestroRelease, zip: string, into: string, jdk: J
   }
 }
 
-/** Installs the pinned Maestro build on first use: download, check against the pinned sha256, unpack, check --version. */
+/**
+ * Installs the pinned Maestro build on first use: download, check against the pinned sha256, unpack, check --version.
+ * Then removes the older builds it installed that no running process or lane uses.
+ */
 export async function ensureMaestro(options: InstallOptions): Promise<Installed> {
   const release = options.release ?? MAESTRO_RELEASE;
   const ready = installedMaestro(options.env, release);
@@ -275,7 +313,7 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
   const processes = options.processes ?? systemProcesses;
   const me = identityOf(processes, process.pid);
   if (!me) throw new Error(`ps could not read this process's start time (pid ${String(process.pid)})`);
-  const lock = path.join(base, `.${release.version}.lock`);
+  const lock = lockOf(base, release.version);
   const deadline = Date.now() + (options.lockWaitMs ?? INSTALL_LOCK_WAIT_MS);
   let announced = false;
   for (;;) {
@@ -310,6 +348,14 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
     if (fs.existsSync(home)) fs.renameSync(home, path.join(work, 'previous'));
     fs.renameSync(unpacked, home);
     log(`installed Maestro ${release.version} in ${home}`);
+    removeOlderVersions(olderBuilds(base, release), {
+      root: namedDataDir(options.env),
+      me,
+      processes,
+      commandLines: options.commandLines ?? systemCommandLines,
+      laneTools: options.laneTools ?? laneToolsOf(options.env),
+      log,
+    });
     return { home, binary: binaryIn(home), version: release.version, installedNow: true, ms: Date.now() - started };
   } finally {
     fs.rmSync(work, { recursive: true, force: true });

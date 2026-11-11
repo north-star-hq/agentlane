@@ -9,6 +9,7 @@ import type { SystemImage } from '../../src/devices/emulator.ts';
 import { MAESTRO_DRIVER_PACKAGE, resolveAndroidSpec } from '../../src/devices/emulator.ts';
 import type { SimRuntime } from '../../src/devices/simctl.ts';
 import { resolveSimSpec } from '../../src/devices/simctl.ts';
+import type { CommandLines } from '../../src/driver/superseded.ts';
 import type { ProcessIdentity, ProcessInfo, ProcessTable } from '../../src/processes.ts';
 import type { Owner } from '../../src/registry/owner.ts';
 import type { PortProbe } from '../../src/registry/ports.ts';
@@ -289,4 +290,9 @@ export class FakeDevices implements DeviceBackend {
     const device = this.read(id);
     if (device) this.write({ ...device, booted });
   }
+}
+
+/** Processes running these command lines, whose environments can't be read. */
+export function runningCommands(...commands: string[]): CommandLines {
+  return () => commands.map(args => ({ args, environment: () => undefined }));
 }
