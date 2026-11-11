@@ -170,7 +170,15 @@ export interface LaneOutcome {
 
 export type DeviceState = 'booted' | 'shutdown' | 'missing' | 'unknown';
 
+export type ProcessState = 'running' | 'gone' | 'unknown';
+
+export interface ProcessStatus extends ServiceProcess {
+  /** gone when no process has this pid, or another process has taken it since. */
+  state: ProcessState;
+}
+
 export interface LaneStatus extends LaneInfo {
+  processes: ProcessStatus[];
   ownerState: OwnerState;
   idleMs: number;
   deviceState: DeviceState | null;

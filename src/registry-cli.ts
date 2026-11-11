@@ -224,7 +224,9 @@ function laneLines(c: LaneStatus, sessionName: SessionNames): string[] {
     lines.push(`      resources    ${shown.join(', ')}`);
   }
   for (const p of c.processes)
-    lines.push(`      process      ${p.service} pid ${String(p.pid)} (started ${describeStart(p.start)})`);
+    lines.push(
+      `      process      ${p.service} pid ${String(p.pid)} (started ${describeStart(p.start)})  ${p.state === 'unknown' ? "can't tell" : p.state}`,
+    );
   if (c.ownerState === 'cant-tell')
     lines.push(`      left alone: its owner can't be judged; ${CLI} release --lane ${c.id} --force frees it`);
   return lines;
