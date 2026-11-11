@@ -50,6 +50,13 @@ function ps(columns: string, pids: readonly number[]): string[] | undefined {
   return undefined;
 }
 
+// Linux appends " (deleted)" to the /proc/<pid>/cwd link once the directory is removed (proc(5)).
+const DELETED_SUFFIX = ' (deleted)';
+
+export function cwdOfProcLink(link: string): string {
+  return link.endsWith(DELETED_SUFFIX) ? link.slice(0, -DELETED_SUFFIX.length) : link;
+}
+
 function lsofCwd(pid: number): string | undefined {
   const result = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
     encoding: 'utf8',
@@ -105,7 +112,7 @@ export const systemProcesses: ProcessTable = {
   cwd(pid) {
     if (process.platform === 'linux') {
       try {
-        return fs.readlinkSync(`/proc/${String(pid)}/cwd`);
+        return cwdOfProcLink(fs.readlinkSync(`/proc/${String(pid)}/cwd`));
       } catch {
         return undefined;
       }

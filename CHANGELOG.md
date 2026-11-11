@@ -71,6 +71,7 @@ A lane now gives its simulator or emulator back when nobody uses it, and ends on
 - The driver looks past a `JAVA_HOME` that names a JDK other than 17 for one that is, as `up` does, so a driver `up` started restarts after an idle stop or a crash. A non-17 `AGENTLANE_JAVA_HOME` is still refused.
 - `prune` shuts down a free pool simulator that simctl lists as booting or shutting down before it deletes it, and lists it as "starting or stopping, so it is shut down first" (`"state": "changing"` in `--json`).
 - `prune --yes` reports what happened when its registry lock fails to commit after a step: a 0.2.x folder it took for removal is deleted and reported deleted, and one it put back for a 0.2.x lane is reported put back.
+- On Linux, a reap or release stops the services of a lane whose worktree folder was deleted. It used to leave them running, with `pid N is no longer in <folder>`, because Linux names a deleted working folder with ` (deleted)` after it.
 
 ## 0.4.1
 
