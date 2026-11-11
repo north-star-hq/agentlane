@@ -14,6 +14,8 @@ pnpm test            # node --test on tests/**/*.test.ts, no build step
 pnpm run build       # tsc to dist/, then: node dist/cli.js --version
 ```
 
+`pnpm test` starts every test process in a temp home of its own, so no test reaches the real `~/.local/state` or `~/.local/share`, where agentlane deletes things. Run one file the same way: `node --import ./tests/support/isolate.ts --test tests/<file>.test.ts`.
+
 ## Layout
 
 - `src/`: TypeScript source. `src/cli.ts` is the `agentlane` bin. Each module arrives with its code; don't create empty folders for later phases.

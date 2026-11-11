@@ -8,7 +8,7 @@ summary: "`agentlane doctor` answers one question before an agent trusts a runni
 npx agentlane doctor
 ```
 
-`up` ends by running `doctor`, and agents run it again before they trust a running app and whenever something looks off. It changes nothing: every check reads.
+`up` ends by running `doctor`, and agents run it again before they trust a running app and whenever something looks off. It changes nothing in the lane: its checks read, and the only command it runs is an agent's guard hook on a harmless command, when that hook has left no recent mark. It counts as a call on the lane, so it puts off parking, but it doesn't bring a parked lane back.
 
 ## What it checks
 
@@ -16,6 +16,7 @@ npx agentlane doctor
 | -------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `config`                         | `agentlane.json` exists and matches the schema. A failure names each field that breaks it.           |
 | `wiring <agent>`                 | Each wired agent's skills, MCP server and hooks are as `init` writes them.                            |
+| `hooks <agent>`                  | Each wired agent's hooks reach this project's toolkit: from the mark the hook left when it last ran, or by running the guard hook on a harmless command. |
 | `lane`                           | This session holds a lane in this folder, with the platform's device or browser.                      |
 | Toolchain                        | Xcode, the simulator runtime, Java 17, the hook locale and the pinned Maestro are there, as the platform needs. |
 | `resource <name>`                | Each resource was created for this lane and exported its values.                                      |
@@ -74,8 +75,10 @@ A lane that holds the other platform's device fails the `lane` check, with the f
 A `warn` line doesn't fail `doctor`. It flags something to fix soon:
 
 - a project with no agent wired at all, with the `init` command that wires them;
-- wiring that has gone stale, such as stubs an older version wrote;
-- Claude Code wired twice, by the plugin and by the project's own files.
+- wiring that has gone stale, such as stubs or hooks an older version wrote;
+- Claude Code's skills or MCP server wired twice, by the plugin and by the project's own files;
+- a project that enables the Claude Code plugin when Claude Code hasn't installed it on this machine;
+- `parked`: the lane is parked, with what its next call brings back. `doctor` skips the device and service checks then, and any call on the lane, such as `look`, `exec` or `up`, brings it back first.
 
 ## JSON output
 

@@ -85,7 +85,7 @@ npx agentlane driver stop
 npx agentlane driver start
 ```
 
-The driver starts on its own at the first call when it isn't running. It stops when the lane is released.
+The driver starts on its own at the first call when it isn't running. It stops when the lane is released or parked.
 
 ## Running Maestro under exec
 

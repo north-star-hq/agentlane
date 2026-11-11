@@ -26,7 +26,7 @@ agentlane's job is the whole environment an agent needs to run your app, for eve
 - **iOS, Android and web in one tool**, with one config, one set of commands and one lane that can hold a device and a browser together.
 - **Every major agent.** Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity reach it through the CLI, the MCP server and the same skills.
 - **Checks before trust.** `doctor` confirms that each server on a lane's ports runs that worktree's code, and that the app on the device is the build `up` installed.
-- **Cleanup on its own.** A lane's servers stop and its data is torn down when the session ends, and a crashed session's lane is reaped by the next claim.
+- **Cleanup on its own.** A lane's servers stop and its data is torn down when the session ends, and a crashed session's lane is parked within minutes and ended 30 minutes later. A lane nobody uses gives its device back after 30 minutes.
 - **Speed.** A warm driver per lane, a patched Maestro and a build cache shared by every worktree. [What makes it fast](speed.md) shows how.
 
 The Android robot in the animation is Google's, used under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
