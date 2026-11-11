@@ -346,6 +346,7 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
           deviceType: avd.deviceType,
           runtime: avd.runtime,
           booted: live.has(avd.name),
+          stopped: !live.has(avd.name),
           disk: { paths: [avd.ini, avd.dir], bytes: null },
           ...(serial ? { serial } : {}),
         };

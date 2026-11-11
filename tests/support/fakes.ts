@@ -221,6 +221,7 @@ export class FakeDevices implements DeviceBackend {
       deviceType,
       runtime,
       booted,
+      stopped: !booted,
       ...(booted && port !== undefined ? { serial: `emulator-${String(port)}` } : {}),
     }));
   }

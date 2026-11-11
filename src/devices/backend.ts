@@ -20,6 +20,7 @@ export interface BackendDevice {
   deviceType: string;
   runtime: string;
   booted: boolean;
+  stopped?: boolean;
   serial?: string;
   disk?: DeviceDisk;
 }

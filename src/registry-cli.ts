@@ -27,6 +27,7 @@ import {
   describeOrphanResult,
   describePruneResult,
   listPrunable,
+  putBackAsideCopies,
   renderPruneReport,
   reportPrunable,
   requireHome,
@@ -102,7 +103,7 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
 `,
     prune: `  prune      List what takes disk and nothing uses, each with its size; --yes deletes it:
              the pool simulators and emulators no lane holds, 0.2.x's included; devices named
-             like pool devices that no registry prune reads records and that are not booted;
+             like pool devices that no registry prune reads records and that are shut down;
              and, while no registry 0.2.x may use has a lane, the downloads 0.2.x left in
              ~/.local/share/agent-env and its build cache in .git/agent-env of this repository
              and of every folder a registry names. prune reads the registries in
@@ -492,7 +493,8 @@ function prune(deps: CliDeps, yes: boolean, json: boolean): number {
         orphanResults.push(result);
         tell(result.outcome, describeOrphanResult(result));
       }
-      leftoverResults = deleteLeftovers(ctx, report.leftoversKept === null ? report.leftovers : []);
+      leftoverResults =
+        report.leftoversKept === null ? deleteLeftovers(ctx, report.leftovers) : putBackAsideCopies(ctx, report.leftovers);
       for (const result of leftoverResults) tell(result.outcome, describeLeftoverResult(result));
     }
     if (json) {

@@ -120,6 +120,7 @@ export function parseDeviceList(json: string): BackendDevice[] {
         deviceType: d.deviceTypeIdentifier ?? '',
         runtime,
         booted: d.state === 'Booted',
+        stopped: d.state === 'Shutdown',
         ...(d.dataPath ? { disk: { paths: [path.dirname(d.dataPath)], bytes: d.dataPathSize ?? null } } : {}),
       });
     }
@@ -146,7 +147,7 @@ export const simctlBackend: DeviceBackend = {
   },
 
   delete(id, whenRunning) {
-    if (whenRunning === 'refuse' && parseDeviceList(simctl(['list', '-j', 'devices'])).some(d => d.id === id && d.booted)) {
+    if (whenRunning === 'refuse' && parseDeviceList(simctl(['list', '-j', 'devices'])).some(d => d.id === id && !d.stopped)) {
       throw new DeviceRunningError(id);
     }
     simctl(['delete', id], 120_000);

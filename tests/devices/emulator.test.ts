@@ -18,6 +18,7 @@ import {
 } from '../../src/devices/emulator.ts';
 import { UsageError } from '../../src/registry/refusal.ts';
 import { tempDir } from '../support/fakes.ts';
+import { isolatedEnv } from '../support/isolated-env.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_EMULATOR === '1';
 
@@ -153,25 +154,38 @@ test('the emulator backend refuses to boot, stop or delete an AVD it did not cre
 });
 
 test('deleting an AVD that is running, when the caller refuses to stop it, stops and deletes nothing', async () => {
-  const root = fakeSdk();
-  const sdk = findAndroidSdk({ ANDROID_HOME: root, HOME: tempDir('home') });
+  const root = tempDir('emulator-refuse');
+  const env = { ...isolatedEnv(root), PATH: '/usr/bin:/bin', ANDROID_HOME: fakeSdk() };
+  const sdk = findAndroidSdk(env);
   assert.ok(sdk);
   const name = `agentlane-emu-${randomBytes(3).toString('hex')}`;
-  const emulator = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30_000)', '--', '-avd', name], {
-    argv0: path.join(tempDir('bin'), 'emulator'),
-    stdio: 'ignore',
-  });
+  const seen = path.join(root, 'stand-in-env.json');
+  const emulator = spawn(
+    process.execPath,
+    [
+      '-e',
+      `require('fs').writeFileSync(${JSON.stringify(seen)}, JSON.stringify(process.env)); setTimeout(() => {}, 30_000)`,
+      '--',
+      '-avd',
+      name,
+    ],
+    { argv0: path.join(root, 'bin', 'emulator'), stdio: 'ignore', env },
+  );
   try {
     const listed = () =>
-      parseRunningEmulators(spawnSync('ps', ['-A', '-o', 'args='], { encoding: 'utf8' }).stdout.split('\n')).has(name);
+      fs.existsSync(seen) &&
+      parseRunningEmulators(spawnSync('ps', ['-A', '-o', 'args='], { encoding: 'utf8', env }).stdout.split('\n')).has(name);
     for (let tries = 0; !listed() && tries < 50; tries++) await new Promise(resolve => setTimeout(resolve, 100));
     assert.ok(listed(), 'the stand-in emulator never showed in ps');
-    const backend = createEmulatorBackend({ env: {}, logDir: tempDir('emulator-logs'), sdk });
+    const theirs = JSON.parse(fs.readFileSync(seen, 'utf8')) as Record<string, string>;
+    assert.deepEqual(Object.fromEntries(Object.keys(env).map(key => [key, theirs[key]])), env);
+    const backend = createEmulatorBackend({ env, logDir: path.join(root, 'emulator-logs'), sdk });
     assert.throws(() => {
       backend.delete(name, 'refuse');
     }, DeviceRunningError);
   } finally {
     emulator.kill();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
