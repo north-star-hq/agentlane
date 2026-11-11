@@ -2,12 +2,12 @@ import type { Clock } from '../clock.ts';
 import type { BackendDevice, DeviceBackend, Platform } from '../devices/backend.ts';
 import type { ProcessTable } from '../processes.ts';
 import type { RegistryConfig } from './config.ts';
-import { judgeProcess, ownerState, worktreeState } from './owner.ts';
+import { judgeProcess, ownerState, worktreeState, type ProcessVerdict } from './owner.ts';
 import { pendingTeardowns } from './resources.ts';
 import { endedFromHistory, loadLaneInfo } from './rows.ts';
 import type { Store } from './store.ts';
 import { int, optText, text } from './store.ts';
-import type { LaneInfo, LaneStatus, DeviceState, PoolDeviceStatus, QueueEntry, StatusReport } from './types.ts';
+import type { LaneInfo, LaneStatus, DeviceState, ProcessState, PoolDeviceStatus, QueueEntry, StatusReport } from './types.ts';
 
 export interface StatusSources {
   dir: string;
@@ -18,6 +18,12 @@ export interface StatusSources {
 }
 
 const RECENT_MS = 24 * 3_600_000;
+
+function processState(verdict: ProcessVerdict): ProcessState {
+  if (verdict === 'alive') return 'running';
+  if (verdict === 'cant-tell') return 'unknown';
+  return 'gone';
+}
 
 export function readStatus(store: Store | null, sources: StatusSources): StatusReport {
   const now = sources.clock.now();
@@ -38,7 +44,9 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     .all()
     .map(row => loadLaneInfo(db, text(row, 'id')))
     .filter((c): c is LaneInfo => c !== null);
-  const table = sources.processes.startTimes(lanes.flatMap(c => (c.owner.process ? [c.owner.process.pid] : [])));
+  const table = sources.processes.startTimes(
+    lanes.flatMap(c => [...(c.owner.process ? [c.owner.process.pid] : []), ...c.processes.map(p => p.pid)]),
+  );
   const listed = new Map<Platform, Map<string, BackendDevice> | null>();
   for (const backend of Object.values(sources.devices)) {
     if (db.prepare('SELECT 1 FROM devices WHERE platform = ? LIMIT 1').get(backend.platform) === undefined) continue;
@@ -57,6 +65,7 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
   };
   report.lanes = lanes.map((lane): LaneStatus => ({
     ...lane,
+    processes: lane.processes.map(p => ({ ...p, state: processState(judgeProcess(p, table)) })),
     ownerState: ownerState(judgeProcess(lane.owner.process, table), worktreeState(lane.worktree)),
     idleMs: now - lane.lastUsedAt,
     deviceState: lane.device ? stateOf(lane.device.platform, lane.device.id) : null,
