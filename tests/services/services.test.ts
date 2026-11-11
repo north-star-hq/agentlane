@@ -904,6 +904,36 @@ for (const c of strayReads) {
   });
 }
 
+const unlisted = strayReads[0]?.reason ?? '';
+
+test('a leader that survives SIGKILL, when the processes below it could not be listed, is not said to have survived as all that is left', async () => {
+  const f = fakeStop({ [LEADER]: leaderEndingOn(), [STRAY]: strayEndingOn('SIGTERM') }, { descendants: () => true });
+  const outcome = await f.stop();
+  assert.deepEqual(f.sent, [`group ${String(LEADER)} SIGTERM`, `group ${String(LEADER)} SIGKILL`, `${String(LEADER)} SIGKILL`]);
+  assert.deepEqual([...f.live.keys()].sort(), [LEADER, STRAY]);
+  assert.deepEqual(outcome, {
+    kind: 'cant-tell',
+    sent: 'SIGKILL',
+    killed: { group: true, pids: [LEADER] },
+    reason: `processes ${String(LEADER)} survived SIGKILL; ${unlisted}`,
+  });
+});
+
+test('a stop whose every read after SIGTERM fails, when the processes below the leader could not be listed, names both', async () => {
+  const f = fakeStop(
+    { [LEADER]: leaderEndingOn('SIGKILL'), [STRAY]: strayEndingOn('SIGTERM') },
+    { descendants: () => true, starts: () => true, group: () => true },
+  );
+  const outcome = await f.stop();
+  assert.deepEqual(f.sent, [`group ${String(LEADER)} SIGTERM`]);
+  assert.deepEqual(outcome, {
+    kind: 'cant-tell',
+    sent: 'SIGTERM',
+    reason: `ps could not read when processes ${String(LEADER)} started, nor list process group ${String(LEADER)}, so processes ${String(LEADER)} can't be proven stopped; stop them with kill ${String(LEADER)}; ${unlisted}`,
+  });
+  assert.ok(f.live.has(STRAY), "a process not proven the service's was signalled");
+});
+
 const strayFates: { on: string; stray: FakeProcess; sent: string[]; outcome: StopOutcome; line: string }[] = [
   {
     on: 'SIGTERM',
