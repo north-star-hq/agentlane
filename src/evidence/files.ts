@@ -50,6 +50,10 @@ export interface InProgress {
   pid?: number;
   /** What `pid` ran, so a stop never signals a process that reused it. */
   command?: string;
+  /** When `pid` started, as ps prints it, so a sweep after the lane has ended can prove the recorder is that process. */
+  start?: string;
+  /** When a sweep last left the recorder of an ended lane running, because it could not prove it was the recorder. */
+  leftAt?: number;
   platform?: 'ios' | 'android';
   device?: string;
   /** Where an emulator's recording sits on the emulator until it is pulled. */
@@ -77,6 +81,11 @@ export function readInProgress(evidence: string, kind: 'video' | 'trace', target
 export function writeInProgress(evidence: string, kind: 'video' | 'trace', state: InProgress): void {
   fs.mkdirSync(evidence, { recursive: true, mode: 0o700 });
   fs.writeFileSync(stateFile(evidence, kind, state.target), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Whether a device recording in the evidence folder is marked as running: its recorder may still write there. */
+export function deviceRecordingMarked(evidence: string): boolean {
+  return fs.existsSync(stateFile(evidence, 'video', 'device'));
 }
 
 export function clearInProgress(evidence: string, kind: 'video' | 'trace', target: EvidenceTarget): void {

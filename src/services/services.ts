@@ -275,6 +275,22 @@ export function leaderAliveAt(system: ServiceSystem, proc: ServiceProcess, clock
   return judgeLeader(system, { ...proc, cwd: null }) === 'alive' ? at : undefined;
 }
 
+/**
+ * `leaderAliveAt` for many processes in one read of the process table: the moment just before it, and those of `procs`
+ * it found running with their recorded start time. Null when ps could not read them.
+ */
+export function leadersAliveAt<T extends { process: ServiceProcess }>(
+  system: ServiceSystem,
+  procs: readonly T[],
+  clock: Clock,
+): { at: number; alive: T[] } | null {
+  const at = clock.now();
+  if (procs.length === 0) return { at, alive: [] };
+  const starts = system.running(procs.map(p => p.process.pid));
+  if (!starts) return null;
+  return { at, alive: procs.filter(p => starts.get(p.process.pid) === p.process.start) };
+}
+
 export async function stopService(
   system: ServiceSystem,
   proc: ServiceProcess,

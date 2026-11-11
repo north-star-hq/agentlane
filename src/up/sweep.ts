@@ -8,6 +8,10 @@ import { systemClock } from '../clock.ts';
 import type { DeviceBackend, Platform } from '../devices/backend.ts';
 import { rotateLog } from '../disk-limits.ts';
 import { messageOf } from '../driver/errors.ts';
+import { realEvidenceSystem } from '../evidence/device.ts';
+import { laneEvidence } from '../evidence/evidence.ts';
+import type { StrayRecorder } from '../evidence/strays.ts';
+import { describeStray, stopStrayRecorder, strayDue } from '../evidence/strays.ts';
 import type { ProcessIdentity, ProcessTable } from '../processes.ts';
 import { systemProcesses } from '../processes.ts';
 import type { RegistryConfig } from '../registry/config.ts';
@@ -22,6 +26,8 @@ import { tcpProbe } from '../registry/ports.ts';
 import type { JudgedOwner, ParkCandidate, SweptLane } from '../registry/registry.ts';
 import { Registry } from '../registry/registry.ts';
 import { laneLastCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
+import { leadersAliveAt } from '../services/services.ts';
+import { LANE_FILES_KEEP_MS, laneFolderIds, pruneEndedLaneFiles } from './lane-files.ts';
 import type { ParkDeps, ParkOutcome } from './park.ts';
 import { attemptId, deadHolder, PARK_RETRY_MS, parkLane } from './park.ts';
 import { tearDownLane } from './release.ts';
@@ -34,6 +40,12 @@ export const SWEEP_RESPAWN_MS = 2 * 60_000;
 /** How often each running MCP server passes by, for every lane on the Mac. */
 export const SWEEP_INTERVAL_MS = 5 * 60_000;
 export const SWEEP_LOG_MAX_BYTES = 1024 * 1024;
+/**
+ * How old the moment a lane's service leader was last seen running may grow before a sweep is due to look again. A stop
+ * whose leader has exited proves ours only the processes of its group that started before that moment, so a longer
+ * wait leaves more of them unproven; a shorter one starts a sweeper more often while the lanes are in use.
+ */
+export const ALIVE_REFRESH_MS = 10 * 60_000;
 
 interface SweepMark {
   startedAt: number;
@@ -87,6 +99,22 @@ function unseen(dir: string, lane: SweptLane, now: number): boolean {
   return laneLastCall(dir, { ...lane.ref, lastUsedAt: lane.lastUsedAt }) <= since;
 }
 
+/**
+ * Whether a lane records a service whose leader no check has seen running for ALIVE_REFRESH_MS, and no sweep has
+ * finished since then: one that did found that leader gone, or could not tell, and waits as long for the next look.
+ */
+function aliveRefreshDue(registry: Registry, mark: SweepMark | null, now: number): boolean {
+  const since = now - ALIVE_REFRESH_MS;
+  if ((mark?.finishedAt ?? Number.NEGATIVE_INFINITY) > since) return false;
+  return registry.serviceProcesses().some(p => (p.process.aliveAt ?? Number.NEGATIVE_INFINITY) <= since);
+}
+
+/** The lane folders, listed before `lanes` was read, of lanes that have ended. */
+function endedFolders(folders: readonly string[], lanes: readonly SweptLane[]): string[] {
+  const live = new Set(lanes.map(l => l.ref.id));
+  return folders.filter(id => !live.has(id));
+}
+
 /** Whether a lane whose owner is gone is still to be parked: never yet, or a park left it running or stopped partway. */
 function goneParkDue(lane: SweptLane, now: number): boolean {
   const park = lane.park;
@@ -104,8 +132,9 @@ function reapDue(lane: SweptLane, now: number): boolean {
 
 /**
  * Whether the sweep has work: an owner no check or call has shown alive lately, a lane whose owner is gone to park or
- * end, a lane no hold keeps up to park, or one a park or wake left partway. One read of the registry, plus the
- * lane-folder call record of each lane the registry has as unused; no process starts.
+ * end, a lane no hold keeps up to park, or one a park or wake left partway; a service leader not seen running lately;
+ * a device recorder an ended lane left marked as running. One read of the registry, plus the lane-folder call record
+ * of each lane the registry has as unused and the lane folders' list; no process starts.
  */
 export function sweepDue(site: SweepSite): boolean {
   if (!fs.existsSync(databasePath(site.dir))) return false;
@@ -120,9 +149,12 @@ export function sweepDue(site: SweepSite): boolean {
   });
   try {
     const idleSince = now - registry.config.parkMs;
+    const folders = laneFolderIds(site.dir);
     const lanes = registry.sweepList();
     const gone = new Set(lanes.filter(l => l.gone).map(l => l.ref.id));
     if (lanes.some(l => (l.gone ? goneParkDue(l, now) || reapDue(l, now) : unseen(site.dir, l, now)))) return true;
+    if (aliveRefreshDue(registry, readMark(site.dir), now)) return true;
+    if (endedFolders(folders, lanes).some(id => strayDue(laneEvidence(site.dir, id), now))) return true;
     return registry
       .parkCandidates(idleSince, now - PARK_RETRY_MS)
       .some(c => c.hold === null && !gone.has(c.ref.id) && unused(site.dir, c, idleSince));
@@ -216,6 +248,12 @@ export type ReapOutcome =
   | { kind: 'ended'; lane: string; state: ProvenState; foundAt: number; notes: string[]; problems: string[] }
   | { kind: 'left'; lane: string; reason: string };
 
+export interface LeaderSeen {
+  lane: string;
+  service: string;
+  aliveAt: number;
+}
+
 export interface SweepReport {
   /** Lanes whose owner this sweep asked the process table about, since no check or call had shown it alive lately. */
   checked: string[];
@@ -226,8 +264,27 @@ export interface SweepReport {
   held: string[];
   /** Lanes whose owner stayed gone through its window, ended as a release ends a lane. */
   reaps: ReapOutcome[];
+  /** The service leaders this sweep saw running, whose recorded moment it moved on so a later stop can prove their groups. */
+  alive: LeaderSeen[];
+  /** The device recorders of ended lanes this sweep looked at: stopped, found gone, or left running unproven. */
+  recorders: StrayRecorder[];
+  /** The ended lanes whose files this sweep removed, LANE_FILES_KEEP_MS after they ended. */
+  pruned: string[];
   /** What the sweep could not do, each line naming its lane. */
   problems: string[];
+}
+
+/** Records the moment each service leader the lanes record was seen running, as `waitForService` does at its start. */
+function refreshLeaders(deps: SweepDeps, registry: Registry, say: (line: string) => void): LeaderSeen[] {
+  const leaders = registry.serviceProcesses();
+  const seen = leadersAliveAt(deps.system, leaders, deps.clock);
+  if (!seen) {
+    say(`could not read whether the services of lanes ${[...new Set(leaders.map(l => l.lane))].join(', ')} run`);
+    return [];
+  }
+  return registry
+    .recordLeadersAlive(seen.alive, seen.at)
+    .map(l => ({ lane: l.lane, service: l.process.service, aliveAt: seen.at }));
 }
 
 function judged(lane: SweptLane): JudgedOwner {
@@ -287,7 +344,17 @@ async function reapLane(
  */
 export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   const say = deps.log ?? (() => undefined);
-  const report: SweepReport = { checked: [], found: [], outcomes: [], held: [], reaps: [], problems: [] };
+  const report: SweepReport = {
+    checked: [],
+    found: [],
+    outcomes: [],
+    held: [],
+    reaps: [],
+    alive: [],
+    recorders: [],
+    pruned: [],
+    problems: [],
+  };
   const problem = (lane: string, line: string) => {
     report.problems.push(`lane ${lane}: ${line}`);
     say(`lane ${lane}: PROBLEM: ${line}`);
@@ -304,6 +371,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   try {
     const now = deps.clock.now();
     const lanes = registry.sweepList();
+    report.alive = refreshLeaders(deps, registry, say);
     const unseenLanes = new Set(lanes.filter(l => unseen(deps.dir, l, now)));
     const stuckReapers = lanes.flatMap(l => (l.gone?.reaper && reapDue(l, now) ? [l.gone.reaper] : []));
     const pids = [
@@ -394,6 +462,25 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
         problem(lane.ref.id, `ending it stopped partway: ${messageOf(error)}`);
       }
     }
+
+    const folders = laneFolderIds(deps.dir);
+    for (const id of endedFolders(folders, registry.sweepList())) {
+      const evidence = laneEvidence(deps.dir, id);
+      if (!strayDue(evidence, now)) continue;
+      try {
+        const stray = await stopStrayRecorder(deps.evidence ?? realEvidenceSystem, evidence, id, deps.clock);
+        if (!stray) continue;
+        report.recorders.push(stray);
+        if (stray.kind === 'cant-tell' || stray.kind === 'survived') problem(id, describeStray(stray));
+        else say(`lane ${id}: ${describeStray(stray)}`);
+        if (stray.kind === 'stopped' || stray.kind === 'survived') for (const line of stray.problems) problem(id, line);
+      } catch (error) {
+        problem(id, `stopping the recorder it left stopped partway: ${messageOf(error)}`);
+      }
+    }
+
+    report.pruned = pruneEndedLaneFiles(deps.dir, registry.keptLaneIds(now - LANE_FILES_KEEP_MS), now, deps.env);
+    if (report.pruned.length > 0) say(`removed the files of ended lanes ${report.pruned.join(', ')}`);
     return report;
   } finally {
     registry.close();

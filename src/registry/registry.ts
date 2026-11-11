@@ -234,6 +234,11 @@ export interface SweptLane {
   running: boolean;
 }
 
+export interface LaneProcess {
+  lane: string;
+  process: ServiceProcess;
+}
+
 /** A lane's owner as a check judged it: the owner key and the process the check looked at. */
 export interface JudgedOwner {
   id: string;
@@ -2401,17 +2406,33 @@ export class Registry {
    * very process; returns whether the stored moment changed.
    */
   recordLeaderAlive(laneId: string, proc: ServiceProcess, at: number): boolean {
+    return this.recordLeadersAlive([{ lane: laneId, process: proc }], at).length > 0;
+  }
+
+  /** `recordLeaderAlive` for each of `seen`, in one write; returns those whose stored moment changed. */
+  recordLeadersAlive(seen: readonly LaneProcess[], at: number): LaneProcess[] {
+    if (seen.length === 0) return [];
     return this.store.write(() => {
-      const written = this.store.db
-        .prepare(
-          `INSERT INTO process_alive (claim_id, service, pid, start, alive_at)
-           SELECT claim_id, service, pid, start, ? FROM processes WHERE claim_id = ? AND service = ? AND pid = ? AND start = ?
-           ON CONFLICT (claim_id, service) DO UPDATE SET pid = excluded.pid, start = excluded.start, alive_at = excluded.alive_at
-           WHERE NOT (pid = excluded.pid AND start = excluded.start AND alive_at >= excluded.alive_at)`,
-        )
-        .run(at, laneId, proc.service, proc.pid, proc.start);
-      return Number(written.changes) > 0;
+      const insert = this.store.db.prepare(
+        `INSERT INTO process_alive (claim_id, service, pid, start, alive_at)
+         SELECT claim_id, service, pid, start, ? FROM processes WHERE claim_id = ? AND service = ? AND pid = ? AND start = ?
+         ON CONFLICT (claim_id, service) DO UPDATE SET pid = excluded.pid, start = excluded.start, alive_at = excluded.alive_at
+         WHERE NOT (pid = excluded.pid AND start = excluded.start AND alive_at >= excluded.alive_at)`,
+      );
+      return seen.filter(s => Number(insert.run(at, s.lane, s.process.service, s.process.pid, s.process.start).changes) > 0);
     });
+  }
+
+  /** Every service process a lane records, with the moment a check last found it running. */
+  serviceProcesses(): LaneProcess[] {
+    const db = this.store.db;
+    return db
+      .prepare('SELECT DISTINCT claim_id FROM processes ORDER BY claim_id')
+      .all()
+      .flatMap(row => {
+        const lane = text(row, 'claim_id');
+        return processesOf(db, lane).map(process => ({ lane, process }));
+      });
   }
 
   forgetProcess(ref: LaneRef, service: string): void {
@@ -2492,6 +2513,25 @@ export class Registry {
 
   pendingTeardowns(): PendingTeardown[] {
     return pendingTeardowns(this.store.db);
+  }
+
+  /**
+   * The lanes whose files are kept: every lane the registry records, each ended one whose browser or resources still
+   * wait for their stop, and each that ended at or after `endedSince`.
+   */
+  keptLaneIds(endedSince: number): Set<string> {
+    const db = this.store.db;
+    const ids = (sql: string, ...args: number[]) =>
+      db
+        .prepare(sql)
+        .all(...args)
+        .map(row => text(row, 'id'));
+    return new Set([
+      ...ids('SELECT id FROM claims'),
+      ...ids('SELECT claim_id AS id FROM browsers'),
+      ...ids('SELECT DISTINCT claim_id AS id FROM resources'),
+      ...ids('SELECT DISTINCT claim_id AS id FROM history WHERE ended_at >= ?', endedSince),
+    ]);
   }
 
   prunable(): PruneListing {

@@ -124,7 +124,17 @@ test('a held lane is not parked at the park cutoff nor while the hold lasts, and
     );
     assert.equal(started, 0);
     let report = await runSweep(sweepDeps(w));
-    assert.deepEqual(report, { checked: [], found: [], outcomes: [], held: [a.lane.id], reaps: [], problems: [] });
+    assert.deepEqual(report, {
+      checked: [],
+      found: [],
+      outcomes: [],
+      held: [a.lane.id],
+      reaps: [],
+      alive: [],
+      recorders: [],
+      pruned: [],
+      problems: [],
+    });
     assert.equal(statusOf(w, a.lane).park, null);
     assert.equal(statusOf(w, a.lane).device?.id, a.lane.device?.id);
 

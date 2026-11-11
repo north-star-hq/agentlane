@@ -3,6 +3,8 @@ import path from 'node:path';
 import type { InstalledBuild } from '../devices/variant.ts';
 import { sweepMaestroRunLinks } from '../driver/maestro-runs.ts';
 import { pruneDriverFiles } from '../driver/paths.ts';
+import { deviceRecordingMarked } from '../evidence/files.ts';
+import { evidenceDir } from '../hooks/env.ts';
 import type { LaunchMode, ProjectPlatform } from '../project/config.ts';
 import { lanesRoot } from '../registry/paths.ts';
 import { HISTORY_KEEP_MS } from '../registry/registry.ts';
@@ -28,8 +30,10 @@ export interface UpRecord {
   updatedAt: number;
 }
 
+const LANE_ID = /^[0-9a-f]{8}$/;
+
 export function laneDir(stateDir: string, laneId: string): string {
-  if (!/^[0-9a-f]{8}$/.test(laneId)) throw new Error(`'${laneId}' is not a lane id`);
+  if (!LANE_ID.test(laneId)) throw new Error(`'${laneId}' is not a lane id`);
   return path.join(lanesRoot(stateDir), laneId);
 }
 
@@ -66,20 +70,24 @@ export function writeUpRecord(dir: string, record: UpRecord): void {
   fs.renameSync(tmp, file);
 }
 
-export function pruneLaneDirs(stateDir: string, liveIds: ReadonlySet<string>, now: number): string[] {
-  const root = lanesRoot(stateDir);
-  let names: string[];
+/** The ids of the lane folders in the state folder, of lanes running and ended. */
+export function laneFolderIds(stateDir: string): string[] {
   try {
-    names = fs.readdirSync(root);
+    return fs.readdirSync(lanesRoot(stateDir)).filter(name => LANE_ID.test(name));
   } catch {
     return [];
   }
+}
+
+/** Removes the folders of lanes not in `liveIds` untouched for LANE_FILES_KEEP_MS, but not one a recorder may still write in. */
+export function pruneLaneDirs(stateDir: string, liveIds: ReadonlySet<string>, now: number): string[] {
+  const root = lanesRoot(stateDir);
   const removed: string[] = [];
-  for (const name of names) {
-    if (!/^[0-9a-f]{8}$/.test(name) || liveIds.has(name)) continue;
+  for (const name of laneFolderIds(stateDir)) {
+    if (liveIds.has(name)) continue;
     const dir = path.join(root, name);
     try {
-      if (now - fs.statSync(dir).mtimeMs < LANE_FILES_KEEP_MS) continue;
+      if (now - fs.statSync(dir).mtimeMs < LANE_FILES_KEEP_MS || deviceRecordingMarked(evidenceDir(dir))) continue;
       fs.rmSync(dir, { recursive: true, force: true });
       removed.push(name);
     } catch {
