@@ -96,6 +96,15 @@ export function waitForStep(step: Step): { onStep: (s: Step) => void; reached: P
   };
 }
 
+/** Records every lane's owner as seen alive now, as the sweep does when the process table shows it running. */
+export function sawOwners(registry: Registry): void {
+  const seen = registry
+    .sweepList()
+    .filter(l => l.gone === null)
+    .map(l => ({ id: l.ref.id, ownerKey: l.ownerKey, process: l.owner.process }));
+  registry.noteOwners(seen, []);
+}
+
 /** Parks a lane at once through the registry alone, as the sweep's park does once the lane's services are stopped. */
 export function parkNow(registry: Registry, lane: LaneRef, notes: string[] = []): boolean {
   const ref = { id: lane.id, token: lane.token };

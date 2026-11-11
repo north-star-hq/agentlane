@@ -17,8 +17,9 @@ import { realServiceSystem } from '../src/services/system.ts';
 import { parkLane } from '../src/up/park.ts';
 import { passBy, runSweep, sweepDue, type SweepDeps } from '../src/up/sweep.ts';
 import { tempDir } from './support/fakes.ts';
+import { OWNER_CHECK_MS } from '../src/registry/owner-checks.ts';
 import type { World } from './support/world.ts';
-import { world } from './support/world.ts';
+import { sawOwners, world } from './support/world.ts';
 
 const PARK_MS = 30 * MINUTE_MS;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -114,6 +115,7 @@ test('a held lane is not parked at the park cutoff nor while the hold lasts, and
     const until = w.clock.now() + HOUR_MS;
 
     await w.clock.advance(PARK_MS);
+    sawOwners(w.registry());
     assert.equal(due(w), false, 'a held lane is no work for the commands passing by');
     let started = 0;
     assert.equal(
@@ -122,11 +124,12 @@ test('a held lane is not parked at the park cutoff nor while the hold lasts, and
     );
     assert.equal(started, 0);
     let report = await runSweep(sweepDeps(w));
-    assert.deepEqual(report, { outcomes: [], leftAlone: [], held: [a.lane.id] });
+    assert.deepEqual(report, { checked: [], found: [], outcomes: [], held: [a.lane.id], reaps: [], problems: [] });
     assert.equal(statusOf(w, a.lane).park, null);
     assert.equal(statusOf(w, a.lane).device?.id, a.lane.device?.id);
 
     await w.clock.advance(until - w.clock.now() - 1000);
+    sawOwners(w.registry());
     assert.equal(due(w), false);
     report = await runSweep(sweepDeps(w));
     assert.deepEqual(report.held, [a.lane.id]);
@@ -270,7 +273,7 @@ test("release ends the hold with the lane, and the folder's next lane starts wit
   }
 });
 
-test("the owner's death ends its hold: the sweep no longer counts the lane as held, leaves it as any dead owner's lane, and drops the hold", async () => {
+test("the owner's death ends its hold: the sweep no longer counts the lane as held, parks it as any gone owner's lane, and drops the hold", async () => {
   const w = world();
   try {
     const a = await session(w, 'a', { boot: true });
@@ -285,8 +288,14 @@ test("the owner's death ends its hold: the sweep no longer counts the lane as he
     w.procs.kill(a.owner.process?.pid ?? 0);
     assert.equal(statusOf(w, a.lane).ownerState, 'dead');
     assert.equal(statusOf(w, a.lane).hold, null, 'status shows no hold on a dead owner');
+    await w.clock.advance(OWNER_CHECK_MS);
     const report = await runSweep(sweepDeps(w));
-    assert.deepEqual(report, { outcomes: [], leftAlone: [a.lane.id], held: [] });
+    assert.deepEqual(report.found, [{ lane: a.lane.id, state: 'dead' }]);
+    assert.deepEqual(
+      report.outcomes.map(o => [o.kind, o.lane]),
+      [['parked', a.lane.id]],
+    );
+    assert.deepEqual(report.held, []);
     assert.equal(holdRows(w), 0, 'the sweep recorded that the hold ended');
   } finally {
     w.close();
@@ -416,7 +425,7 @@ test(
       try {
         const b = await old.claim(w.request(w.procs.owner(), w.folder('b'), { device: null, services: [] }));
         assert.deepEqual(
-          b.freed.map(e => e.id),
+          (b as unknown as { freed: { id: string }[] }).freed.map(e => e.id),
           [a.lane.id],
         );
       } finally {

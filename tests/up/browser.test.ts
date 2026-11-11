@@ -16,7 +16,8 @@ import type { DoctorReport } from '../../src/up/doctor.ts';
 import type { EnvDeps } from '../../src/up/deps.ts';
 import { up, type UpResult } from '../../src/up/up.ts';
 import type { LaneInfo, ClaimedBrowser } from '../../src/registry/types.ts';
-import { alive, failures, OPTIONS, sleeper, until, world, type World } from '../support/up-world.ts';
+import { RETURN_WINDOW_MS } from '../../src/registry/owner-checks.ts';
+import { alive, clockAt, failures, foundGoneAt, OPTIONS, sleeper, until, world, type World } from '../support/up-world.ts';
 
 const FIXTURE = path.join(import.meta.dirname, '..', 'fixtures', 'signin-site');
 
@@ -214,7 +215,7 @@ test('on a machine whose browsers lack system libraries, up stops before opening
   );
 });
 
-test("a reaped lane's browser is stopped by the next claim, from the process table, even when it ignores SIGTERM", async t => {
+test("a gone owner's lane has its browser stopped by the sweep, from the process table when its daemon died with the owner and the browser ignores SIGTERM, and is ended once its window passes", async t => {
   const w = world(t);
   const [one, two] = twoWorktrees(w, 'agent-browser');
   const [a, b] = owners(t, 2);
@@ -227,8 +228,12 @@ test("a reaped lane's browser is stopped by the next claim, from the process tab
   const reaped = new Promise(resolve => a?.once('exit', resolve));
   a?.kill('SIGKILL');
   await reaped;
+  w.browser.remove(session.daemonPid);
   const second = await up({ ...w.deps({ owner: b?.pid ?? 0 }), cwd: two }, OPTIONS);
   assert.equal(second.doctor.ok, true, failures(second));
+  const out: string[] = [];
+  assert.equal(await runRegistryCommand('reap', [], cliDeps(w, b?.pid ?? 0, two, out)), 0, out.join(''));
+  assert.match(out.join(''), new RegExp(`parked lane ${first.lane.id}, whose owner is gone`));
   assert.deepEqual(
     onProfile(w, session.profile),
     [],
@@ -241,11 +246,14 @@ test("a reaped lane's browser is stopped by the next claim, from the process tab
     "the reaped lane's agent-browser daemon still runs",
   );
   await until(() => !alive(service?.pid ?? 0));
+  const later = { ...cliDeps(w, b?.pid ?? 0, two, out), clock: clockAt(foundGoneAt(w, first.lane.id) + RETURN_WINDOW_MS) };
+  assert.equal(await runRegistryCommand('reap', [], later), 0, out.join(''));
   const status = readRegistryStatus({ dir: w.state, processes: systemProcesses });
   assert.deepEqual(
     status.lanes.map(c => c.id),
     [second.lane.id],
   );
+  assert.deepEqual(onProfile(w, session.profile), []);
 });
 
 test('doctor fails, naming the cause, when the web service listener runs another folder’s code and when the driver install is missing or mismatched', async t => {

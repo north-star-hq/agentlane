@@ -1,35 +1,43 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { stopEndedBrowsers } from '../browser/lane-browser.ts';
+import { realBrowserTools } from '../browser/tools.ts';
 import type { Clock } from '../clock.ts';
 import { systemClock } from '../clock.ts';
+import type { DeviceBackend, Platform } from '../devices/backend.ts';
 import { rotateLog } from '../disk-limits.ts';
 import { messageOf } from '../driver/errors.ts';
 import type { ProcessIdentity, ProcessTable } from '../processes.ts';
 import { systemProcesses } from '../processes.ts';
 import type { RegistryConfig } from '../registry/config.ts';
-import { describeState, isProven, judgeProcess, ownerState, worktreeState } from '../registry/owner.ts';
+import { formatAge, formatTime } from '../registry/format.ts';
+import type { ProvenState } from '../registry/owner.ts';
+import { describeHostSession, describeState, isProven, judgeProcess, ownerState, worktreeState } from '../registry/owner.ts';
+import { OWNER_CHECK_MS, REAP_RETRY_MS, RETURN_WINDOW_MS } from '../registry/owner-checks.ts';
 import { describeRestarts } from '../registry/parks.ts';
 import { databasePath } from '../registry/paths.ts';
 import type { PortProbe } from '../registry/ports.ts';
 import { tcpProbe } from '../registry/ports.ts';
-import type { ParkCandidate } from '../registry/registry.ts';
+import type { JudgedOwner, ParkCandidate, SweptLane } from '../registry/registry.ts';
 import { Registry } from '../registry/registry.ts';
 import { laneLastCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
 import type { ParkDeps, ParkOutcome } from './park.ts';
-import { PARK_RETRY_MS, parkLane } from './park.ts';
+import { attemptId, deadHolder, PARK_RETRY_MS, parkLane } from './park.ts';
+import { tearDownLane } from './release.ts';
+import { tearDownEndedResources } from './resources.ts';
 
 export const SWEEP_COMMAND = 'sweep';
 
 /** How long after starting a sweeper the commands passing by leave the sweep to it. */
 export const SWEEP_RESPAWN_MS = 2 * 60_000;
+/** How often each running MCP server passes by, for every lane on the Mac. */
+export const SWEEP_INTERVAL_MS = 5 * 60_000;
 export const SWEEP_LOG_MAX_BYTES = 1024 * 1024;
 
 interface SweepMark {
   startedAt: number;
   finishedAt: number | null;
-  /** Lanes whose owner the last sweep found dead: the sweep that ends such lanes is a claim's, not this one. */
-  leftAlone: string[];
 }
 
 function markFile(dir: string): string {
@@ -44,11 +52,7 @@ function readMark(dir: string): SweepMark | null {
   try {
     const raw = JSON.parse(fs.readFileSync(markFile(dir), 'utf8')) as Partial<SweepMark>;
     if (typeof raw.startedAt !== 'number') return null;
-    return {
-      startedAt: raw.startedAt,
-      finishedAt: typeof raw.finishedAt === 'number' ? raw.finishedAt : null,
-      leftAlone: Array.isArray(raw.leftAlone) ? raw.leftAlone.filter((id): id is string => typeof id === 'string') : [],
-    };
+    return { startedAt: raw.startedAt, finishedAt: typeof raw.finishedAt === 'number' ? raw.finishedAt : null };
   } catch {
     return null;
   }
@@ -75,15 +79,37 @@ function unused(dir: string, candidate: ParkCandidate, idleSince: number): boole
   return laneLastCall(dir, { ...candidate.ref, lastUsedAt: candidate.lastUsedAt }) <= idleSince;
 }
 
+/** Whether no check or call has shown the lane's owner alive for OWNER_CHECK_MS, so the sweep asks the process table. */
+function unseen(dir: string, lane: SweptLane, now: number): boolean {
+  if (lane.gone || !lane.owner.process) return false;
+  const since = now - OWNER_CHECK_MS;
+  if (Math.max(lane.checkedAt ?? Number.NEGATIVE_INFINITY, lane.lastUsedAt) > since) return false;
+  return laneLastCall(dir, { ...lane.ref, lastUsedAt: lane.lastUsedAt }) <= since;
+}
+
+/** Whether a lane whose owner is gone is still to be parked: never yet, or a park left it running or stopped partway. */
+function goneParkDue(lane: SweptLane, now: number): boolean {
+  const park = lane.park;
+  if (!park) return true;
+  if (park.since > now - PARK_RETRY_MS) return false;
+  return park.state !== 'parked' || lane.running;
+}
+
+/** Whether a lane whose owner is gone has stayed gone through its window, and no process is ending it lately. */
+function reapDue(lane: SweptLane, now: number): boolean {
+  const gone = lane.gone;
+  if (!gone || now < gone.foundAt + RETURN_WINDOW_MS || lane.running) return false;
+  return gone.reapingSince === null || gone.reapingSince <= now - REAP_RETRY_MS;
+}
+
 /**
- * Whether the sweep has work: a lane no hold keeps up to park, or one a park or wake left partway. One read of the
- * registry, plus the lane-folder call record of each lane the registry has as unused for the park window; no process
- * starts.
+ * Whether the sweep has work: an owner no check or call has shown alive lately, a lane whose owner is gone to park or
+ * end, a lane no hold keeps up to park, or one a park or wake left partway. One read of the registry, plus the
+ * lane-folder call record of each lane the registry has as unused; no process starts.
  */
 export function sweepDue(site: SweepSite): boolean {
   if (!fs.existsSync(databasePath(site.dir))) return false;
   const now = (site.clock ?? systemClock).now();
-  const left = new Set(readMark(site.dir)?.leftAlone ?? []);
   const registry = Registry.open({
     dir: site.dir,
     processes: site.processes ?? systemProcesses,
@@ -94,9 +120,12 @@ export function sweepDue(site: SweepSite): boolean {
   });
   try {
     const idleSince = now - registry.config.parkMs;
+    const lanes = registry.sweepList();
+    const gone = new Set(lanes.filter(l => l.gone).map(l => l.ref.id));
+    if (lanes.some(l => (l.gone ? goneParkDue(l, now) || reapDue(l, now) : unseen(site.dir, l, now)))) return true;
     return registry
       .parkCandidates(idleSince, now - PARK_RETRY_MS)
-      .some(c => c.hold === null && !left.has(c.ref.id) && unused(site.dir, c, idleSince));
+      .some(c => c.hold === null && !gone.has(c.ref.id) && unused(site.dir, c, idleSince));
   } finally {
     registry.close();
   }
@@ -112,11 +141,45 @@ export function passBy(site: SweepSite, start: (dir: string) => void): boolean {
     const mark = readMark(site.dir);
     if (mark?.finishedAt === null && now - mark.startedAt < SWEEP_RESPAWN_MS) return false;
     if (!sweepDue(site)) return false;
-    writeMark(site.dir, { startedAt: now, finishedAt: null, leftAlone: mark?.leftAlone ?? [] });
+    writeMark(site.dir, { startedAt: now, finishedAt: null });
     start(site.dir);
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * What a running MCP server does every SWEEP_INTERVAL_MS: it lands the device work its own calls could not record as
+ * done, then passes by. Neither waits on a teardown, so the server's tool calls never wait on its sweep.
+ */
+export function sweepTick(
+  site: SweepSite,
+  devices: Partial<Record<Platform, DeviceBackend>>,
+  start: (dir: string) => void,
+): boolean {
+  settleLeftovers(site, devices);
+  return passBy(site, start);
+}
+
+function settleLeftovers(site: SweepSite, devices: Partial<Record<Platform, DeviceBackend>>): void {
+  if (!Registry.holdsLeftovers(site.dir)) return;
+  try {
+    const registry = Registry.open({
+      dir: site.dir,
+      processes: site.processes ?? systemProcesses,
+      ports: tcpProbe,
+      devices,
+      lockWaitMs: TOUCH_WAIT_MS,
+      ...(site.clock ? { clock: site.clock } : {}),
+    });
+    try {
+      registry.settleOwn();
+    } finally {
+      registry.close();
+    }
+  } catch {
+    return;
   }
 }
 
@@ -144,18 +207,91 @@ export interface SweepDeps extends ParkDeps {
   self?: ProcessIdentity;
 }
 
-export interface SweepReport {
-  outcomes: ParkOutcome[];
-  /** Lanes left to a claim's sweep because their owner is dead; a hold such a lane had is ended. */
-  leftAlone: string[];
-  /** Lanes left up because their owner holds them. */
-  held: string[];
+export interface FoundGone {
+  lane: string;
+  state: ProvenState;
 }
 
-/** The sweep's work, in the process that does it: parks each lane whose owner is alive, left it unused, and holds it no more. */
+export type ReapOutcome =
+  | { kind: 'ended'; lane: string; state: ProvenState; foundAt: number; notes: string[]; problems: string[] }
+  | { kind: 'left'; lane: string; reason: string };
+
+export interface SweepReport {
+  /** Lanes whose owner this sweep asked the process table about, since no check or call had shown it alive lately. */
+  checked: string[];
+  /** Lanes whose owner this sweep found gone: each is parked now and ended RETURN_WINDOW_MS later, unless its session comes back. */
+  found: FoundGone[];
+  outcomes: ParkOutcome[];
+  /** Lanes left up because their owner holds them. */
+  held: string[];
+  /** Lanes whose owner stayed gone through its window, ended as a release ends a lane. */
+  reaps: ReapOutcome[];
+  /** What the sweep could not do, each line naming its lane. */
+  problems: string[];
+}
+
+function judged(lane: SweptLane): JudgedOwner {
+  return { id: lane.ref.id, ownerKey: lane.ownerKey, process: lane.owner.process };
+}
+
+function untilEnd(lane: SweptLane, foundAt: number): string {
+  const session = describeHostSession(lane.owner);
+  const ends = `ends at ${formatTime(foundAt + RETURN_WINDOW_MS)}`;
+  return session ? `${ends} unless ${session} comes back` : `${ends}; nothing can take it back`;
+}
+
+async function reapLane(
+  deps: SweepDeps,
+  registry: Registry,
+  lane: SweptLane,
+  dead: readonly ProcessIdentity[],
+): Promise<ReapOutcome> {
+  const { ref } = lane;
+  const attempt = attemptId();
+  const start = registry.beginReap(ref, attempt, dead);
+  if (start.kind === 'left') return { kind: 'left', lane: ref.id, reason: start.reason };
+  try {
+    const teardown = await tearDownLane(
+      { ...deps, sim: deps.sim ?? null, browser: deps.browser ?? realBrowserTools },
+      deps.dir,
+      start.lane,
+    );
+    const notes = [...teardown.notes];
+    const ended = registry.endReaped(ref, attempt, notes);
+    if (!ended) return { kind: 'left', lane: ref.id, reason: 'another call took it while it was being ended' };
+    const after = [
+      ...(await stopEndedBrowsers(deps.browser ?? realBrowserTools, registry, deps.dir, deps.clock)).filter(
+        t => t.lane === ref.id,
+      ),
+      ...(await tearDownEndedResources(deps, registry, deps.dir, { lane: ref.id })),
+    ];
+    return {
+      kind: 'ended',
+      lane: ref.id,
+      state: start.gone.state,
+      foundAt: start.gone.foundAt,
+      notes: [...notes, ...after.flatMap(t => t.notes)],
+      problems: [...teardown.problems, ...after.flatMap(t => t.problems)],
+    };
+  } catch (error) {
+    registry.abortReap(ref, attempt);
+    throw error;
+  }
+}
+
+/**
+ * The sweep's work, in the process that does it, for every lane on the Mac. It asks the process table once about the
+ * owners no check or call has shown alive lately. A lane whose owner it finds gone is parked at once, and ended with
+ * what a release does RETURN_WINDOW_MS after it was found gone, unless a process of its owner's session takes it back
+ * first. It parks each lane whose owner left it unused for the park window and holds it no more.
+ */
 export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   const say = deps.log ?? (() => undefined);
-  const report: SweepReport = { outcomes: [], leftAlone: [], held: [] };
+  const report: SweepReport = { checked: [], found: [], outcomes: [], held: [], reaps: [], problems: [] };
+  const problem = (lane: string, line: string) => {
+    report.problems.push(`lane ${lane}: ${line}`);
+    say(`lane ${lane}: PROBLEM: ${line}`);
+  };
   const registry = Registry.open({
     dir: deps.dir,
     processes: deps.processes,
@@ -167,19 +303,59 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   });
   try {
     const now = deps.clock.now();
-    const idleSince = now - registry.config.parkMs;
-    const candidates = registry.parkCandidates(idleSince, now - PARK_RETRY_MS).filter(c => unused(deps.dir, c, idleSince));
-    const pids = candidates.flatMap(c => (c.owner.process ? [c.owner.process.pid] : []));
+    const lanes = registry.sweepList();
+    const unseenLanes = new Set(lanes.filter(l => unseen(deps.dir, l, now)));
+    const stuckReapers = lanes.flatMap(l => (l.gone?.reaper && reapDue(l, now) ? [l.gone.reaper] : []));
+    const pids = [
+      ...[...unseenLanes].flatMap(l => (l.owner.process ? [l.owner.process.pid] : [])),
+      ...stuckReapers.map(r => r.pid),
+    ];
     const table = pids.length > 0 ? deps.processes.startTimes(pids) : new Map<number, string>();
-    for (const candidate of candidates) {
-      const state = ownerState(judgeProcess(candidate.owner.process, table), worktreeState(candidate.worktree));
-      if (isProven(state)) {
-        if (candidate.hold && registry.endHold(candidate.ref.id, candidate.ownerKey)) {
-          say(`ended the hold on lane ${candidate.ref.id}, "${candidate.hold.reason}": ${describeState(state)}`);
-        }
-        report.leftAlone.push(candidate.ref.id);
-        continue;
+    report.checked = [...unseenLanes].map(l => l.ref.id);
+
+    const seen: JudgedOwner[] = [];
+    const gone: (JudgedOwner & { state: ProvenState })[] = [];
+    for (const lane of lanes) {
+      if (lane.gone) continue;
+      const verdict = unseenLanes.has(lane)
+        ? judgeProcess(lane.owner.process, table)
+        : lane.owner.process
+          ? 'alive'
+          : 'cant-tell';
+      const state = ownerState(verdict, worktreeState(lane.worktree));
+      if (isProven(state)) gone.push({ ...judged(lane), state });
+      else if (unseenLanes.has(lane)) seen.push(judged(lane));
+    }
+    const found = new Set(registry.noteOwners(seen, gone));
+    for (const g of gone) {
+      const lane = lanes.find(l => l.ref.id === g.id);
+      if (!found.has(g.id) || !lane) continue;
+      report.found.push({ lane: g.id, state: g.state });
+      say(
+        `found the owner of lane ${g.id} gone (${describeState(g.state)}): the lane is parked now, and it ${untilEnd(lane, now)}`,
+      );
+      if (lane.hold) say(`ended the hold on lane ${g.id}, "${lane.hold.reason}": ${describeState(g.state)}`);
+    }
+
+    const goneLanes = (found.size > 0 ? registry.sweepList() : lanes).filter(l => l.gone !== null);
+    for (const lane of goneLanes) {
+      if (!lane.gone || !goneParkDue(lane, now)) continue;
+      try {
+        const outcome = await parkLane(deps, registry, lane, 'owner-gone');
+        report.outcomes.push(outcome);
+        if (outcome.kind === 'parked') {
+          say(`parked lane ${outcome.lane}, whose owner is gone; it ${untilEnd(lane, lane.gone.foundAt)}`);
+          for (const line of outcome.problems) problem(outcome.lane, line);
+        } else say(`left lane ${outcome.lane} as it was: ${outcome.reason}`);
+      } catch (error) {
+        problem(lane.ref.id, `parking stopped partway: ${messageOf(error)}`);
       }
+    }
+
+    const idleSince = now - registry.config.parkMs;
+    const goneIds = new Set(goneLanes.map(l => l.ref.id));
+    for (const candidate of registry.parkCandidates(idleSince, now - PARK_RETRY_MS)) {
+      if (goneIds.has(candidate.ref.id) || !unused(deps.dir, candidate, idleSince)) continue;
       if (candidate.hold) {
         report.held.push(candidate.ref.id);
         continue;
@@ -190,19 +366,37 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
         if (outcome.kind === 'parked') {
           say(`parked lane ${outcome.lane}; its next call brings back ${describeRestarts(outcome.restarts)}`);
           for (const line of outcome.notes) say(`lane ${outcome.lane}: ${line}`);
-          for (const line of outcome.problems) say(`lane ${outcome.lane}: PROBLEM: ${line}`);
+          for (const line of outcome.problems) problem(outcome.lane, line);
         } else say(`left lane ${outcome.lane} awake: ${outcome.reason}`);
       } catch (error) {
-        say(`lane ${candidate.ref.id}: PROBLEM: parking stopped partway: ${messageOf(error)}`);
+        problem(candidate.ref.id, `parking stopped partway: ${messageOf(error)}`);
+      }
+    }
+
+    for (const lane of goneIds.size > 0 ? registry.sweepList() : []) {
+      const reaper = lane.gone?.reaper ?? null;
+      if (!reapDue(lane, now)) continue;
+      const dead = [
+        ...(reaper && isProven(judgeProcess(reaper, table)) ? [reaper] : []),
+        ...[deadHolder(lane.park, deps.processes)].filter((p): p is ProcessIdentity => p !== null),
+      ];
+      try {
+        const outcome = await reapLane(deps, registry, lane, dead);
+        report.reaps.push(outcome);
+        if (outcome.kind === 'ended') {
+          say(
+            `ended lane ${outcome.lane}: its owner was found gone (${describeState(outcome.state)}) at ${formatTime(outcome.foundAt)}, ${formatAge(now - outcome.foundAt)} ago, and did not come back`,
+          );
+          for (const line of outcome.notes) say(`lane ${outcome.lane}: ${line}`);
+          for (const line of outcome.problems) problem(outcome.lane, line);
+        } else say(`did not end lane ${outcome.lane} yet: ${outcome.reason}`);
+      } catch (error) {
+        problem(lane.ref.id, `ending it stopped partway: ${messageOf(error)}`);
       }
     }
     return report;
   } finally {
     registry.close();
-    writeMark(deps.dir, {
-      startedAt: readMark(deps.dir)?.startedAt ?? deps.clock.now(),
-      finishedAt: deps.clock.now(),
-      leftAlone: report.leftAlone,
-    });
+    writeMark(deps.dir, { startedAt: readMark(deps.dir)?.startedAt ?? deps.clock.now(), finishedAt: deps.clock.now() });
   }
 }

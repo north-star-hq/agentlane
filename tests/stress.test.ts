@@ -14,6 +14,9 @@ import type { Owner } from '../src/registry/owner.ts';
 import { databasePath } from '../src/registry/paths.ts';
 import type { Step } from '../src/registry/registry.ts';
 import { Registry, STEPS } from '../src/registry/registry.ts';
+import { OWNER_CHECK_MS, RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
+import { realServiceSystem } from '../src/services/system.ts';
+import { runSweep } from '../src/up/sweep.ts';
 import { FakeDevices, tempDir } from './support/fakes.ts';
 import { parkNow } from './support/world.ts';
 import type { ClaimerPlan, SlowDevices, StressOp } from './support/stress-plan.ts';
@@ -255,8 +258,9 @@ async function runSeed(
             boot: true,
             waitMs: 700,
           },
+          { kind: 'release' },
         ],
-        crashAt: ['claim:booted'],
+        crashAt: ['release:committed'],
         crashOccurrence: 1,
       });
       assert.equal(
@@ -353,6 +357,21 @@ async function runSeed(
         waitMs: 0,
       });
       registry.release({ id: settled.lane.id, token: settled.lane.token }, settler);
+      const found = Date.now() + OWNER_CHECK_MS;
+      for (const at of [found, found + RETURN_WINDOW_MS]) {
+        const swept = await runSweep({
+          dir: stateDir,
+          env: process.env,
+          processes: systemProcesses,
+          system: realServiceSystem,
+          clock: { now: () => at, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) },
+          devices: { ios: devices, android: emulators },
+          ports: { listening: () => Promise.resolve(new Set<number>()) },
+          config,
+          log: () => undefined,
+        });
+        assert.deepEqual(swept.problems, [], `seed ${String(seed)}: the sweep at ${String(at)}: ${JSON.stringify(swept)}`);
+      }
       const status = registry.status();
       const immortalKeys = new Set(
         immortal.map(o => {

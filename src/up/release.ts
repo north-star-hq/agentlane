@@ -10,9 +10,9 @@ import { stopRecordings } from '../evidence/evidence.ts';
 import { laneEnvironment } from '../hooks/env.ts';
 import { runHook } from '../hooks/run.ts';
 import { loadLaneConfig, loadProjectConfig } from '../project/config.ts';
-import type { ClaimedBrowser, LaneInfo, EndedLane } from '../registry/types.ts';
+import type { ClaimedBrowser, LaneInfo } from '../registry/types.ts';
 import { describeStop, stopService } from '../services/services.ts';
-import { laneDir, hookLog, readUpRecord } from './lane-files.ts';
+import { laneDir, hookLog, readUpRecord, type UpRecord } from './lane-files.ts';
 import type { EnvDeps } from './deps.ts';
 import { dialArguments } from './doctor.ts';
 
@@ -86,21 +86,16 @@ export async function stopRecordedProcesses(
   }
 }
 
-export async function tearDownLane(deps: TeardownDeps, stateDir: string, lane: LaneInfo & { token?: string }): Promise<Teardown> {
-  const result: Teardown = { lane: lane.id, notes: [], problems: [] };
-  await stopDriver(deps, stateDir, lane.id, result);
-  const dir = laneDir(stateDir, lane.id);
-  const record = readUpRecord(dir);
-  const control = hasBrowser(lane) ? await browserControl(deps, stateDir, lane, result) : null;
-  const recordings = await stopRecordings(
-    { stateDir, lane, env: deps.env, clock: deps.clock, system: deps.evidence ?? realEvidenceSystem },
-    control,
-  );
-  result.notes.push(...recordings.notes);
-  result.problems.push(...recordings.problems);
-  if (hasBrowser(lane)) await stopBrowser(deps, stateDir, lane, control, result);
-  await stopRecordedProcesses(deps, lane.processes, result);
-
+/**
+ * Clears what `up` left on the lane's device for its app, while the lane still holds the device: the bundler pin and
+ * the dial defaults on a booted simulator, and the adb reverse rules on an emulator.
+ */
+export async function clearDeviceState(
+  deps: Pick<TeardownDeps, 'env' | 'sim' | 'adb'>,
+  lane: LaneInfo,
+  record: UpRecord | null,
+  result: Teardown,
+): Promise<void> {
   const udid = lane.device?.id;
   if (record?.pinned && record.bundleId !== null && udid && deps.sim) {
     try {
@@ -141,6 +136,24 @@ export async function tearDownLane(deps: TeardownDeps, stateDir: string, lane: L
       result.notes.push(`left the adb reverse rules on ${serial}: ${message(error)}`);
     }
   }
+}
+
+export async function tearDownLane(deps: TeardownDeps, stateDir: string, lane: LaneInfo & { token?: string }): Promise<Teardown> {
+  const result: Teardown = { lane: lane.id, notes: [], problems: [] };
+  await stopDriver(deps, stateDir, lane.id, result);
+  const dir = laneDir(stateDir, lane.id);
+  const record = readUpRecord(dir);
+  const control = hasBrowser(lane) ? await browserControl(deps, stateDir, lane, result) : null;
+  const recordings = await stopRecordings(
+    { stateDir, lane, env: deps.env, clock: deps.clock, system: deps.evidence ?? realEvidenceSystem },
+    control,
+  );
+  result.notes.push(...recordings.notes);
+  result.problems.push(...recordings.problems);
+  if (hasBrowser(lane)) await stopBrowser(deps, stateDir, lane, control, result);
+  await stopRecordedProcesses(deps, lane.processes, result);
+
+  await clearDeviceState(deps, lane, record, result);
 
   if (record) {
     let teardown: { command: string; cwd: string; env: NodeJS.ProcessEnv } | null = null;
@@ -170,19 +183,4 @@ export async function tearDownLane(deps: TeardownDeps, stateDir: string, lane: L
     }
   }
   return result;
-}
-
-export async function stopEndedLanes(
-  deps: Pick<EnvDeps, 'system' | 'clock' | 'processes'>,
-  stateDir: string,
-  ended: readonly EndedLane[],
-): Promise<Teardown[]> {
-  const results: Teardown[] = [];
-  for (const e of ended) {
-    const result: Teardown = { lane: e.id, notes: [], problems: [] };
-    await stopDriver(deps, stateDir, e.id, result);
-    await stopRecordedProcesses(deps, e.processes ?? [], result);
-    if (result.notes.length > 0 || result.problems.length > 0) results.push(result);
-  }
-  return results;
 }

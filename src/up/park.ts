@@ -2,7 +2,9 @@ import { randomBytes } from 'node:crypto';
 import { hasBrowser, stopLaneBrowser } from '../browser/lane-browser.ts';
 import { realBrowserTools, type BrowserTools } from '../browser/tools.ts';
 import type { Clock } from '../clock.ts';
+import type { AdbFactory } from '../devices/adb.ts';
 import type { DeviceBackend, Platform } from '../devices/backend.ts';
+import type { SimTools } from '../devices/tools.ts';
 import { stopLaneEngine } from '../driver/client.ts';
 import { messageOf } from '../driver/errors.ts';
 import { realEvidenceSystem, type EvidenceSystem } from '../evidence/device.ts';
@@ -17,7 +19,7 @@ import type { Lane } from '../registry/types.ts';
 import { describeStop, judgeLeader, stopService } from '../services/services.ts';
 import type { ServiceSystem } from '../services/system.ts';
 import { laneDir, readUpRecord } from './lane-files.ts';
-import { browserControl } from './release.ts';
+import { browserControl, clearDeviceState } from './release.ts';
 
 /** How long a park or wake may stand unfinished before the sweep looks at it again, and between its tries at a lane it could not park in full. */
 export const PARK_RETRY_MS = 5 * 60_000;
@@ -32,6 +34,9 @@ export interface ParkDeps {
   devices: Partial<Record<Platform, DeviceBackend>>;
   browser?: BrowserTools;
   evidence?: EvidenceSystem;
+  /** How the bundler pin and dial defaults `up` wrote are cleared from a simulator before it goes back to the pool. */
+  sim?: SimTools | null;
+  adb?: AdbFactory;
 }
 
 export type ParkOutcome =
@@ -114,19 +119,26 @@ async function stopEverything(deps: ParkDeps, registry: Registry, dir: string, l
     if (outcome.kind === 'stopped' || outcome.kind === 'already-gone') notes.push(line);
     else problems.push(line);
   }
+  await clearDeviceState(
+    { env: deps.env, sim: deps.sim ?? null, ...(deps.adb ? { adb: deps.adb } : {}) },
+    lane,
+    readUpRecord(laneDir(dir, lane.id)),
+    into,
+  );
   return problems;
 }
 
 /**
- * Parks a lane its owner left unused since `idleSince`: stops its driver, browser, recordings and services, then frees
- * its device, which goes back to the pool once it is shut down. Its ports, resources and record stay, and the lane is
- * recorded as parked with what its next call restarts. A call that lands meanwhile keeps the lane awake.
+ * Parks a lane its owner left unused since `idleSince`, or whose owner a check found gone: stops its driver, browser,
+ * recordings and services, clears what `up` left on its device, then frees the device, which goes back to the pool
+ * once it is shut down. Its ports, resources and record stay, and the lane is recorded as parked with what its next
+ * call restarts. A call that lands meanwhile keeps an idle lane awake.
  */
 export async function parkLane(
   deps: ParkDeps,
   registry: Registry,
   candidate: Pick<ParkCandidate, 'ref' | 'park'>,
-  idleSince: number,
+  idleSince: number | 'owner-gone',
 ): Promise<ParkOutcome> {
   const { ref } = candidate;
   const dir = registry.dir;
@@ -138,8 +150,14 @@ export async function parkLane(
     if (laneHasEnded(error)) return { kind: 'left', lane: ref.id, reason: 'it has ended' };
     throw error;
   }
-  if (!lane) return { kind: 'left', lane: ref.id, reason: 'it was used or held, or another call is parking or waking it' };
-  if (laneLastCall(dir, { ...ref, lastUsedAt: lane.lastUsedAt }) > idleSince) {
+  if (!lane) {
+    const reason =
+      idleSince === 'owner-gone'
+        ? 'its owner came back, or another call is parking, waking or ending it'
+        : 'it was used or held, or another call is parking or waking it';
+    return { kind: 'left', lane: ref.id, reason };
+  }
+  if (idleSince !== 'owner-gone' && laneLastCall(dir, { ...ref, lastUsedAt: lane.lastUsedAt }) > idleSince) {
     registry.abortPark(ref, attempt);
     return { kind: 'left', lane: ref.id, reason: 'it was used' };
   }

@@ -75,7 +75,7 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
   let lane: Lane | null;
   let park: LanePark | null;
   try {
-    lane = registry.find(owner, folder.worktree);
+    lane = registry.takeBack(owner, folder.worktree);
     if (!lane) {
       throw new NotClaimed(`${describeOwner(owner)} holds no lane in ${folder.worktree}`, `${CLI} up   (or ${CLI} claim)`);
     }

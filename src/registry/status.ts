@@ -3,13 +3,15 @@ import type { BackendDevice, DeviceBackend, Platform } from '../devices/backend.
 import type { ProcessTable } from '../processes.ts';
 import type { RegistryConfig } from './config.ts';
 import { readHold } from './holds.ts';
-import { isProven, judgeProcess, ownerState, worktreeState, type ProcessVerdict } from './owner.ts';
+import { hostSession, isProven, judgeProcess, ownerState, worktreeState, type ProcessVerdict } from './owner.ts';
+import { readCheck, RETURN_WINDOW_MS } from './owner-checks.ts';
 import { readPark } from './parks.ts';
 import { pendingTeardowns } from './resources.ts';
 import { endedFromHistory, loadLaneInfo } from './rows.ts';
 import type { Store } from './store.ts';
 import { int, optText, text } from './store.ts';
 import type {
+  LaneGone,
   LaneInfo,
   LaneStatus,
   DeviceState,
@@ -86,8 +88,20 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
       problems: park.problems,
     };
   };
+  const goneOf = (lane: LaneInfo): LaneGone | null => {
+    const gone = readCheck(db, lane.id, lane.ownerKey)?.gone ?? null;
+    if (!gone) return null;
+    return {
+      state: gone.state,
+      foundAt: gone.foundAt,
+      endsAt: gone.foundAt + RETURN_WINDOW_MS,
+      session: hostSession(lane.owner),
+      by: gone.reaper?.pid ?? null,
+    };
+  };
   report.lanes = lanes.map((lane): LaneStatus => {
     const owner = ownerState(judgeProcess(lane.owner.process, table), worktreeState(lane.worktree));
+    const ownerGone = goneOf(lane);
     return {
       ...lane,
       processes: lane.processes.map(p => ({ ...p, state: processState(judgeProcess(p, table)) })),
@@ -95,7 +109,8 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
       idleMs: now - lane.lastUsedAt,
       deviceState: lane.device ? stateOf(lane.device.platform, lane.device.id) : null,
       park: parkStatus(lane.id),
-      hold: isProven(owner) ? null : readHold(db, lane.id, lane.ownerKey, now),
+      hold: isProven(owner) || ownerGone ? null : readHold(db, lane.id, lane.ownerKey, now),
+      ownerGone,
     };
   });
   report.pool = db

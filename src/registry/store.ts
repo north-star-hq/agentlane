@@ -83,8 +83,24 @@ CREATE TABLE IF NOT EXISTS holds (
   until INTEGER NOT NULL,
   CHECK (until > since)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS owner_checks (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+  owner_key TEXT NOT NULL,
+  checked_at INTEGER,
+  gone TEXT,
+  gone_at INTEGER,
+  reaper_pid INTEGER,
+  reaper_start TEXT,
+  reaping_since INTEGER,
+  attempt TEXT,
+  CHECK (gone IS NULL OR gone IN ('dead', 'pid-reused', 'worktree-gone')),
+  CHECK ((gone IS NULL) = (gone_at IS NULL)),
+  CHECK ((reaper_pid IS NULL) = (reaper_start IS NULL) AND (reaper_pid IS NULL) = (reaping_since IS NULL)
+    AND (reaper_pid IS NULL) = (attempt IS NULL)),
+  CHECK (reaper_pid IS NULL OR gone IS NOT NULL)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds'];
+const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds', 'owner_checks'];
 
 const SCHEMA = `
 CREATE TABLE claims (

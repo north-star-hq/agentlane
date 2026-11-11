@@ -6,7 +6,9 @@ import type { Owner } from '../src/registry/owner.ts';
 import { UsageError } from '../src/registry/refusal.ts';
 import type { LaneRequest } from '../src/registry/types.ts';
 import type { Lane } from '../src/registry/types.ts';
-import { FakeProbe } from './support/fakes.ts';
+import { realServiceSystem } from '../src/services/system.ts';
+import { runSweep } from '../src/up/sweep.ts';
+import { FakeProbe, tempDir } from './support/fakes.ts';
 import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
 import type { World } from './support/world.ts';
 import { parkNow, world } from './support/world.ts';
@@ -127,11 +129,19 @@ test("the sweep stops a dead owner's emulator the same way, and leaves a can't-t
     const thread: Owner = { kind: 'codex', process: null, sessionId: null, threadId: 't-emu' };
     const unknown = await w.registry().claim(android(w, thread, 'unknown'));
     w.procs.kill(dead.process?.pid ?? 0);
-    const next = await w.registry().claim(w.request(w.procs.owner(), w.folder('next'), { device: null, services: [] }));
-    assert.deepEqual(
-      next.freed.map(f => [f.id, f.reason]),
-      [[gone.lane.id, 'dead']],
-    );
+    await w.clock.advance(5 * 60_000);
+    const report = await runSweep({
+      dir: w.dir,
+      env: { PATH: process.env.PATH, HOME: tempDir('emulators-home') },
+      processes: w.procs,
+      system: realServiceSystem,
+      clock: w.clock,
+      devices: { ios: w.devices, android: w.emulators },
+      ports: w.probe,
+      config: w.config,
+      self: w.procs.spawn(),
+    });
+    assert.deepEqual(report.found, [{ lane: gone.lane.id, state: 'dead' }]);
     assert.deepEqual(w.emulators.calls.slice(-2), KILL(gone.lane.device?.serial ?? ''));
     const left = w.emulators.all().find(d => d.id === unknown.lane.device?.id);
     assert.equal(left?.booted, true);

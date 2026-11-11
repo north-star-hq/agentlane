@@ -167,7 +167,6 @@ export interface EndedLane {
 export interface LaneOutcome {
   lane: Lane;
   created: boolean;
-  freed: EndedLane[];
   notes: string[];
   /** The driver the lane's browser had before this lane changed it; null when it kept its driver. */
   replacedDriver: BrowserDriverName | null;
@@ -201,6 +200,23 @@ export interface LaneStatus extends LaneInfo {
   park: ParkStatus | null;
   /** What keeps the lane up past the park window, and until when; null when nothing does, or its owner is gone. */
   hold: LaneHold | null;
+  /** Null unless a check found the lane's owner gone; the lane is then parked until it ends. */
+  ownerGone: LaneGone | null;
+}
+
+export interface LaneGone {
+  /** What the check found: the owner's process dead, its pid taken by another process, or the lane's folder gone. */
+  state: ProvenState;
+  foundAt: number;
+  /** When the lane ends, with what release does, unless `session` comes back before. */
+  endsAt: number;
+  /**
+   * The host's session id (Claude Code's session id, or a Codex thread's id) whose next call from the lane's folder takes
+   * the lane back with its data; null when nothing can.
+   */
+  session: string | null;
+  /** The pid ending the lane now that its window has passed; null until one does. */
+  by: number | null;
 }
 
 export interface PoolDeviceStatus {

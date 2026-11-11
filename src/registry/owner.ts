@@ -100,6 +100,23 @@ export function ownerKey(owner: Owner): string {
   return `${label}:${String(owner.process.pid)}:${owner.process.start}`;
 }
 
+/**
+ * The host's own id for the session behind an owner, which a later process of that session presents again: Claude
+ * Code's session id, or a Codex thread's id. Null for the other agents, whose hosts give none that outlives a process.
+ */
+export function hostSession(owner: Owner): string | null {
+  if (owner.kind === 'claude') return owner.sessionId;
+  if (owner.kind === 'codex') return owner.threadId;
+  return null;
+}
+
+/** The session that can still take its lane back, for people: null when nothing can. */
+export function describeHostSession(owner: Owner): string | null {
+  const session = hostSession(owner);
+  if (session === null) return null;
+  return owner.kind === 'codex' ? `codex thread ${session}` : `claude session ${session.slice(0, 8)}`;
+}
+
 export function describeOwner(owner: Owner): string {
   const pid = owner.process ? `pid ${String(owner.process.pid)}` : null;
   const agent = agentOf(owner);

@@ -63,7 +63,6 @@ import type { DoctorReport } from './doctor.ts';
 import { bundlerPort, diagnose, dialArguments, reversePorts } from './doctor.ts';
 import { driverVariables } from './maestro-env.ts';
 import { androidBuildEnvironment, projectFindings, toolchainFindings, Unmet } from './preflight.ts';
-import { stopEndedLanes } from './release.ts';
 import { createResources, tearDownEndedResources } from './resources.ts';
 import { settleWake, takeLane, type LaneEntry, type WakeHandle } from './wake.ts';
 
@@ -622,12 +621,13 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     config: registryConfig,
     clock: deps.clock,
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
+    ...(deps.passBy ? { sweepSoon: deps.passBy } : {}),
   });
   let woken: WakeHandle | null = null;
   const entry: LaneEntry = { stateDir: state, processes: deps.processes, clock: deps.clock };
   try {
     const owner = resolveOwner(deps.env, deps.processes, deps.selfPid);
-    const before = options.waking ? null : registry.find(owner, folder.worktree);
+    const before = options.waking ? null : registry.takeBack(owner, folder.worktree);
     if (before) {
       const ref = { id: before.id, token: before.token };
       recordCall(state, ref, deps.clock.now());
@@ -663,14 +663,8 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
         `${o.created ? 'claimed lane' : 'reusing lane'} ${o.lane.id}: ${o.lane.device?.name ?? 'no device'}${o.lane.device ? ` (${o.lane.device.id})` : ''}${o.lane.browser ? `, a ${o.lane.browser.driver} browser` : ''}, ${o.lane.ports.map(p => `${p.service} ${String(p.port)}`).join(', ')}`,
     );
     for (const note of outcome.notes) deps.log(`${TOOL} up: ${note}`);
-    for (const e of outcome.freed) {
-      deps.log(
-        `${TOOL} up: ended lane ${e.id} of ${e.owner} in ${e.worktree} (${e.reason}, idle ${formatAge(e.endedAt - e.lastUsedAt)})`,
-      );
-    }
     const browsers = deps.browser ?? realBrowserTools;
     const ended = [
-      ...(await stopEndedLanes(deps, state, outcome.freed)),
       ...(await stopEndedBrowsers(browsers, registry, state, deps.clock)),
       ...(await tearDownEndedResources(deps, registry, state)),
     ];

@@ -17,7 +17,7 @@ import { passBy, runSweep, sweepDue, type SweepDeps } from '../src/up/sweep.ts';
 import { takeLane } from '../src/up/wake.ts';
 import { tempDir } from './support/fakes.ts';
 import type { World } from './support/world.ts';
-import { world } from './support/world.ts';
+import { sawOwners, world } from './support/world.ts';
 
 const PARK_MS = 30 * MINUTE_MS;
 
@@ -58,9 +58,10 @@ test('a lane is parked 30 minutes after its last call and not a second before: i
     assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, true);
 
     await w.clock.advance(PARK_MS - 1000);
-    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false);
     const early = await runSweep(sweepDeps(w));
     assert.deepEqual(early.outcomes, []);
+    assert.deepEqual(early.checked, [a.lane.id], 'the sweep asked about the owner no call had shown alive lately');
+    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false);
     assert.equal(parkOf(w, a.lane), null);
     assert.equal(w.registry().status().lanes[0]?.device?.id, device.id);
 
@@ -133,7 +134,9 @@ test('the check every command makes as it passes by reads the registry and start
   const w = world();
   try {
     for (const name of ['a', 'b', 'c']) await w.registry().claim(w.request(w.procs.owner(), w.folder(name)));
-    await w.clock.advance(PARK_MS - 1);
+    await w.clock.advance(PARK_MS - 2 * MINUTE_MS);
+    sawOwners(w.registry());
+    await w.clock.advance(2 * MINUTE_MS - 1);
     const reads: (readonly number[])[] = [];
     const counting: ProcessTable = {
       startTimes: pids => {
@@ -217,22 +220,6 @@ test('a parked lane keeps its ports and resource values exactly, and no teardown
   }
 });
 
-test("a lane whose owner is dead is left to a claim's sweep, and the commands passing by don't start a sweeper for it again", async () => {
-  const w = world();
-  try {
-    const owner = w.procs.owner();
-    const a = await w.registry().claim(w.request(owner, w.folder('a')));
-    await w.clock.advance(PARK_MS);
-    w.procs.kill(owner.process?.pid ?? 0);
-    const report = await runSweep(sweepDeps(w));
-    assert.deepEqual(report, { outcomes: [], leftAlone: [a.lane.id], held: [] });
-    assert.equal(parkOf(w, a.lane), null);
-    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false);
-  } finally {
-    w.close();
-  }
-});
-
 test('two calls waking one lane: the registry hands the wake to one, the other waits until it is done and finds the lane awake', async () => {
   const w = world();
   try {
@@ -260,6 +247,7 @@ test('a park or wake whose process died is taken over: a call takes the lane to 
     assert.ok(w.registry({ self: parker }).beginPark(refOf(a.lane), w.clock.now(), 'died', null));
     w.procs.kill(parker.pid);
     assert.equal(parkOf(w, a.lane)?.state, 'parking');
+    sawOwners(w.registry());
     assert.equal(
       sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }),
       false,
@@ -431,7 +419,7 @@ test(
           [],
           `0.4.1 handed out a parked lane's port: ${theirs.join(', ')}`,
         );
-        assert.deepEqual(b.freed, []);
+        assert.deepEqual((b as unknown as { freed: unknown[] }).freed, []);
       } finally {
         former.close();
       }

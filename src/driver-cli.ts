@@ -45,12 +45,13 @@ import { ensureMaestro, findJdk17, installedMaestro } from './driver/install.ts'
 import { enginePaths } from './driver/paths.ts';
 import { MAESTRO_RELEASE } from './driver/release.ts';
 import type { LookArgs, RunArgs, ScreenshotArgs } from './driver/session.ts';
-import { serveMcp } from './mcp/server.ts';
+import { serveMcp, type Every } from './mcp/server.ts';
 import { createToolHandler, TOOLS } from './mcp/tools.ts';
 import { CLI, TOOL } from './name.ts';
 import type { ProcessTable } from './processes.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
 import { touchLane } from './registry/touch.ts';
+import { SWEEP_INTERVAL_MS } from './up/sweep.ts';
 import { enterLane, type LaneWaker } from './up/wake.ts';
 import { groupUsage, helpOf, type UsageGroup } from './usage.ts';
 
@@ -69,6 +70,8 @@ export interface DriverCliDeps {
   evidence?: EvidenceSystem;
   /** Brings a parked lane back before a call on it runs; without it, a call on a parked lane is refused. */
   wake?: LaneWaker;
+  /** The sweep `mcp` runs every SWEEP_INTERVAL_MS, for every lane on the Mac; `wait` stands in for the timer. */
+  sweep?: Omit<Every, 'ms'>;
 }
 
 export const DRIVER_COMMANDS = ['look', 'run', 'screenshot', 'record', 'evidence', 'driver', 'browser', 'device', 'mcp'] as const;
@@ -916,6 +919,7 @@ async function mcp(args: string[], deps: DriverCliDeps): Promise<number> {
       processes: deps.processes,
       ...(deps.wake ? { wake: deps.wake } : {}),
     }),
+    ...(deps.sweep ? { every: { ms: SWEEP_INTERVAL_MS, ...deps.sweep } } : {}),
   });
   return 0;
 }

@@ -280,7 +280,7 @@ test('release takes a bare lane id as --lane does, and refuses two different ids
   }
 });
 
-test('a lane whose owner process has exited is freed by the next claim from another session', async () => {
+test('a lane whose owner process has exited is found gone by the next claim from another session, keeps its ports, and is parked by reap until its window ends', async () => {
   const doomed = sleeper();
   const next = sleeper();
   try {
@@ -300,11 +300,15 @@ test('a lane whose owner process has exited is freed by the next claim from anot
       AGENTLANE_OWNER_PID: String(next.pid),
     });
     assert.equal(second.code, 0, second.stderr);
-    assert.match(
-      second.stderr,
-      new RegExp(`freed lane ${id} of process ${String(doomed.pid)} in ${fs.realpathSync(folder)}: owner dead`),
-    );
-    assert.match(second.stdout, new RegExp(`^export AGENTLANE_METRO_PORT=${String(PORTS)}$`, 'm'));
+    assert.match(second.stdout, new RegExp(`^export AGENTLANE_METRO_PORT=${String(PORTS + 1)}$`, 'm'));
+    const reaped = cli(['reap'], env);
+    assert.equal(reaped.code, 0, reaped.stderr);
+    const status = cli(['status'], env).stdout;
+    assert.match(status, new RegExp(`${id}  process ${String(doomed.pid)}  \\[OWNER DEAD\\]`));
+    assert.match(status, /owner gone {3}owner dead, found .*; the lane ends .* \(in \d+m\), and nothing can take it back/);
+    assert.match(status, /parked {7}since /);
+    const json = JSON.parse(cli(['reap', '--json'], env).stdout) as { reaps: unknown[]; found: unknown[] };
+    assert.deepEqual([json.found, json.reaps], [[], []]);
   } finally {
     doomed.kill('SIGKILL');
     next.kill('SIGKILL');
