@@ -98,8 +98,12 @@ function laneDatabases(w: World): string[] {
   return databases(w.state).filter(name => /^app_[0-9a-f]{8}$/.test(name));
 }
 
-async function until(check: () => boolean): Promise<void> {
-  while (!check()) await new Promise(resolve => setTimeout(resolve, 10));
+async function until(what: string, check: () => boolean, ms = 5000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error(`gave up after ${String(ms)} ms waiting for ${what}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
 }
 
 describe('the lane Postgres recipe', () => {
@@ -225,7 +229,7 @@ describe('the lane Postgres recipe', () => {
     assert.equal(readDatabase(w.state, 'app_0000000b')?.applied.length, 2);
   });
 
-  for (const timeout of ['statement_timeout', 'lock_timeout', 'idle_session_timeout']) {
+  for (const timeout of ['statement_timeout', 'lock_timeout', 'idle_session_timeout', 'transaction_timeout']) {
     test(`builds the template once when eight lanes start together under a role with a short ${timeout}`, async () => {
       const w = world();
       const ids = ['0000000a', '0000000b', '0000000c', '0000000d', '0000000e', '0000000f', '00000010', '00000011'];
@@ -268,7 +272,7 @@ describe('the lane Postgres recipe', () => {
     }));
     const connection = path.join(w.state, 'connections', `app_0000000a.${String(held.pid)}`);
     try {
-      await until(() => fs.existsSync(connection));
+      await until(`the session's connection file ${connection}`, () => fs.existsSync(connection));
       await ok(lane(w, '0000000a', 'drop'));
       assert.deepEqual(laneDatabases(w), []);
       assert.equal(await ended, 'SIGTERM');

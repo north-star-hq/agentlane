@@ -70,7 +70,7 @@ case "$1" in
     template="${prefix}_template_$fp"
     if ! exists "$template"; then
       psql "$server/postgres" -X -q -v ON_ERROR_STOP=1 >/dev/null <<EOF
-SELECT set_config(name, '0', false) FROM pg_settings WHERE name IN ('statement_timeout', 'lock_timeout', 'idle_session_timeout');
+SELECT set_config(name, '0', false) FROM pg_settings WHERE name IN ('statement_timeout', 'lock_timeout', 'idle_session_timeout', 'transaction_timeout');
 SELECT pg_advisory_lock($((0x$fp)));
 \! sh "$0" build-template </dev/null >&2
 EOF

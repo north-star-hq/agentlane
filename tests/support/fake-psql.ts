@@ -53,7 +53,12 @@ function roleSettings(): Map<string, number> {
 
 function serverSettings(): string[] {
   const version = Number(process.env.FAKE_PG_VERSION ?? '17');
-  return ['statement_timeout', 'lock_timeout', ...(version >= 14 ? ['idle_session_timeout'] : [])];
+  return [
+    'statement_timeout',
+    'lock_timeout',
+    ...(version >= 14 ? ['idle_session_timeout'] : []),
+    ...(version >= 17 ? ['transaction_timeout'] : []),
+  ];
 }
 
 function run(state: string, argv: string[]): void {
@@ -68,7 +73,7 @@ function run(state: string, argv: string[]): void {
     else if (!arg.startsWith('-')) target = arg;
   }
   if (target === null) throw new Failure('no connection string');
-  const db = new URL(target).pathname.slice(1);
+  const db = identifier(new URL(target).pathname.slice(1));
   const log = (line: string): void => {
     fs.appendFileSync(path.join(state, 'calls.log'), `${line}\n`);
   };
@@ -133,6 +138,7 @@ function run(state: string, argv: string[]): void {
       const lock = path.join(state, 'locks', m[1] ?? '');
       fs.mkdirSync(path.dirname(lock), { recursive: true });
       const limits = [setting('statement_timeout'), setting('lock_timeout')].filter(limit => limit > 0);
+      const transaction = serverSettings().includes('transaction_timeout') ? setting('transaction_timeout') : 0;
       const started = Date.now();
       for (;;) {
         try {
@@ -141,6 +147,9 @@ function run(state: string, argv: string[]): void {
         } catch {
           if (limits.some(limit => Date.now() - started >= limit)) {
             throw new Failure('ERROR: canceling statement due to statement timeout');
+          }
+          if (transaction > 0 && Date.now() - started >= transaction) {
+            throw new Failure('FATAL: terminating connection due to transaction timeout');
           }
           sleep(5);
         }
