@@ -15,12 +15,23 @@ import { databasePath } from '../src/registry/paths.ts';
 import type { Step } from '../src/registry/registry.ts';
 import { Registry, STEPS } from '../src/registry/registry.ts';
 import { FakeDevices, tempDir } from './support/fakes.ts';
-import type { ClaimerPlan, StressOp } from './support/stress-plan.ts';
-import { EXIT_REFUSED } from './support/stress-plan.ts';
+import type { ClaimerPlan, SlowDevices, StressOp } from './support/stress-plan.ts';
+import { EXIT_REFUSED, runClaimer } from './support/stress-plan.ts';
 
-const CLAIMER = path.join(import.meta.dirname, 'support', 'stress-claimer.ts');
 const CLAIMERS = 16;
 const SEEDS = Number(process.env.STRESS_SEEDS ?? 10);
+const SLOW_SEEDS = Number(process.env.STRESS_SLOW_SEEDS ?? 4);
+const SLOW_MS = { create: 150, shutdown: 100, delete: 80 } as const;
+const LEASE_STEPS: readonly Step[] = ['claim:lease-committed', 'claim:stopped-device'];
+const SLOW_LEASE_STEPS: readonly Step[] = [...LEASE_STEPS, 'release:committed', 'release:stopped-device'];
+const DEVICE_WORK_STEPS: readonly Step[] = [
+  'claim:reserve-committed',
+  'claim:retired-device',
+  'claim:created-device',
+  ...LEASE_STEPS,
+  'release:committed',
+  'release:stopped-device',
+];
 const DEVICE_TYPES = { ios: ['iPhone 17', 'iPhone 17 Pro'], android: ['pixel_8', 'pixel_9'] } as const;
 const THREAD = 'stress-thread';
 
@@ -33,26 +44,6 @@ function rng(seed: number): () => number {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-interface Exit {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  stdout: string;
-  stderr: string;
-}
-
-function run(plan: ClaimerPlan): Promise<Exit> {
-  return new Promise(resolve => {
-    const child = spawn(process.execPath, [CLAIMER, JSON.stringify(plan)], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on('close', (code, signal) => {
-      resolve({ code, signal, stdout, stderr });
-    });
-  });
 }
 
 function sleeper(): ChildProcess {
@@ -68,15 +59,44 @@ interface SeedResult {
   runs: number;
   ops: number;
   ended: number;
+  claims: number;
+  refusals: number;
+  slowCalls: number;
+  overlaps: number;
 }
 
-async function runSeed(seed: number, idleMs: number, targets: readonly Step[], lead: Step | null): Promise<SeedResult> {
+function overlapsIn(journal: string): { calls: number; overlaps: number } {
+  const lines = fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').trim().split('\n') : [];
+  const open = new Map<string, number>();
+  const calls: { pid: string; from: number; to: number }[] = [];
+  const commits: { pid: string; at: number }[] = [];
+  for (const line of lines) {
+    const [kind = '', second = '', third = '', fourth = ''] = line.split(' ');
+    if (kind === 'commit') commits.push({ pid: second, at: Number(third) });
+    else if (kind === 'start') open.set(`${third} ${second}`, Number(fourth));
+    else if (kind === 'end') {
+      const from = open.get(`${third} ${second}`);
+      if (from !== undefined) calls.push({ pid: third, from, to: Number(fourth) });
+    }
+  }
+  const overlaps = commits.filter(c => calls.some(k => k.pid !== c.pid && k.from < c.at && c.at < k.to)).length;
+  return { calls: calls.length, overlaps };
+}
+
+async function runSeed(
+  seed: number,
+  idleMs: number,
+  targets: readonly Step[],
+  lead: Step | null,
+  slowMs: SlowDevices['ms'] | null = null,
+): Promise<SeedResult> {
   const random = rng(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
   const root = tempDir(`stress-${String(seed)}`);
   const stateDir = path.join(root, 'state');
   const devicesDir = path.join(root, 'devices');
   const emulatorsDir = path.join(root, 'emulators');
+  const slow: SlowDevices | null = slowMs ? { ms: slowMs, journal: path.join(root, 'calls.journal') } : null;
   const config: RegistryConfig = {
     poolSize: 3,
     emulatorPoolSize: 2,
@@ -115,6 +135,7 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
       devicesDir,
       emulatorsDir,
       config,
+      ...(slow ? { slow } : {}),
       ownerPid: owner.pid ?? null,
       threadOwner: null,
       startMs: 0,
@@ -127,6 +148,7 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
       devicesDir,
       emulatorsDir,
       config,
+      ...(slow ? { slow } : {}),
       ownerPid: null,
       threadOwner: THREAD,
       startMs: 0,
@@ -177,6 +199,7 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
         devicesDir,
         emulatorsDir,
         config,
+        ...(slow ? { slow } : {}),
         ownerPid: shared ? (shared.pid ?? null) : null,
         threadOwner: null,
         startMs,
@@ -187,17 +210,48 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
     }
     const squatted = idleSeed || lead !== null;
     if (squatted) {
-      for (const exit of await Promise.all(squatters.map(run)))
+      for (const exit of await Promise.all(squatters.map(runClaimer)))
         assert.equal(exit.code, 0, `squatter: ${exit.stdout}${exit.stderr}`);
     }
     if (idleSeed) await new Promise(resolve => setTimeout(resolve, idleMs + 50));
     const crashes: Step[] = [];
-    if (lead !== null) {
-      const exit = await run({
+    if (lead !== null && LEASE_STEPS.includes(lead)) {
+      const dropper = await runClaimer({
         stateDir,
         devicesDir,
         emulatorsDir,
         config,
+        ...(slow ? { slow } : {}),
+        ownerPid: null,
+        threadOwner: null,
+        startMs: 0,
+        ops: [
+          {
+            kind: 'claim',
+            worktree: folder('dropper'),
+            platform: 'android',
+            device: DEVICE_TYPES.android[0],
+            strict: false,
+            boot: true,
+            waitMs: 700,
+          },
+        ],
+        crashAt: ['claim:booted'],
+        crashOccurrence: 1,
+      });
+      assert.equal(
+        dropper.signal,
+        'SIGKILL',
+        `seed ${String(seed)}: the claimer meant to leave a booted emulator behind never booted one\n${dropper.stdout}${dropper.stderr}`,
+      );
+    }
+    if (lead !== null) {
+      const exit = await runClaimer({
+        stateDir,
+        devicesDir,
+        emulatorsDir,
+        config,
+        ...(slow ? { slow } : {}),
         ownerPid: null,
         threadOwner: null,
         startMs: 0,
@@ -231,7 +285,7 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
         owner.kill('SIGKILL');
       }
     })();
-    const exits = await Promise.all(plans.map(run));
+    const exits = await Promise.all(plans.map(runClaimer));
     await killer;
 
     const reached: Partial<Record<Step, number>> = {};
@@ -249,6 +303,9 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
       }
       assert.ok(exit.code === 0 || exit.code === EXIT_REFUSED, detail);
     });
+    const claims = exits.reduce((n, exit) => n + (exit.stdout.match(/^claimed /gm)?.length ?? 0), 0);
+    const refusals = exits.filter(exit => exit.code === EXIT_REFUSED).length;
+    const timing = slow ? overlapsIn(slow.journal) : { calls: 0, overlaps: 0 };
 
     const settler: Owner = {
       kind: 'process',
@@ -371,6 +428,10 @@ async function runSeed(seed: number, idleMs: number, targets: readonly Step[], l
         ended: history.length,
         emulatorLanes,
         emulatorStops,
+        claims,
+        refusals,
+        slowCalls: timing.calls,
+        overlaps: timing.overlaps,
       };
     } finally {
       registry.close();
@@ -425,4 +486,44 @@ test(`stress: ${String(CLAIMERS)} parallel claimers per seed with crashes inject
   );
   assert.deepEqual(missed, [], 'every step had at least one injected crash');
   assert.ok(emulatorLanes > 0 && emulatorStops > 0, 'emulator lanes were in the mix');
+});
+
+test(`stress with a slow device backend (create ${String(SLOW_MS.create)} ms, shutdown ${String(SLOW_MS.shutdown)} ms, delete ${String(SLOW_MS.delete)} ms): other claims commit while devices are made and stopped, and no device in flight is ever held by a lane`, async () => {
+  const started = Date.now();
+  const crashes = new Map<Step, number>(STEPS.map(s => [s, 0]));
+  let claims = 0;
+  let refusals = 0;
+  let ended = 0;
+  let slowCalls = 0;
+  let overlaps = 0;
+  const seeds: number[] = [];
+  const seed = async (n: number, idleMs: number, lead: Step | null) => {
+    seeds.push(n);
+    const targets = [...DEVICE_WORK_STEPS].sort(
+      (a, b) => (crashes.get(a) ?? 0) - (crashes.get(b) ?? 0) || STEPS.indexOf(a) - STEPS.indexOf(b),
+    );
+    const result = await runSeed(n, idleMs, targets, lead, SLOW_MS);
+    for (const step of result.crashes) crashes.set(step, (crashes.get(step) ?? 0) + 1);
+    claims += result.claims;
+    refusals += result.refusals;
+    ended += result.ended;
+    slowCalls += result.slowCalls;
+    overlaps += result.overlaps;
+  };
+  for (let n = 101; n < 101 + SLOW_SEEDS; n++) await seed(n, n % 2 === 0 ? 300 : 3_600_000, null);
+  const leads = SLOW_LEASE_STEPS.filter(step => (crashes.get(step) ?? 0) === 0);
+  for (const [k, lead] of leads.entries()) await seed(101 + SLOW_SEEDS + k, 300, lead);
+  console.log(
+    `slow stress seeds ${seeds.join(',')} (each past ${String(100 + SLOW_SEEDS)} first runs one claimer alone on a full pool, crashing at a lease step the others missed: ${leads.join(' ') || 'none'}): ${String(claims)} claims granted, ${String(refusals)} claimers refused at least once, ${String(ended)} lanes ended; ${String(slowCalls)} slow device calls finished, ${String(overlaps)} commits by other processes landed during one; ${String(Date.now() - started)} ms`,
+  );
+  console.log(
+    `crashes injected per device-work step: ${DEVICE_WORK_STEPS.map(s => `${s}=${String(crashes.get(s) ?? 0)}`).join(' ')}`,
+  );
+  assert.ok(slowCalls > 0, 'devices were created and stopped');
+  assert.ok(overlaps > 0, 'other processes committed while a device call ran');
+  assert.deepEqual(
+    SLOW_LEASE_STEPS.filter(step => (crashes.get(step) ?? 0) === 0),
+    [],
+    'every lease step had an injected crash with the slow backend',
+  );
 });

@@ -45,8 +45,24 @@ CREATE TABLE IF NOT EXISTS process_alive (
   alive_at INTEGER NOT NULL,
   PRIMARY KEY (claim_id, service)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS device_leases (
+  reservation TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  device_type TEXT NOT NULL,
+  device_type_name TEXT NOT NULL,
+  runtime TEXT NOT NULL,
+  runtime_name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  work TEXT NOT NULL,
+  holder_pid INTEGER NOT NULL,
+  holder_start TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  console_port INTEGER
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers', 'process_alive'];
+const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases'];
 
 const SCHEMA = `
 CREATE TABLE claims (

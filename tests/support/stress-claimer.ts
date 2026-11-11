@@ -7,14 +7,48 @@ import { Refusal } from '../../src/registry/refusal.ts';
 import type { Step } from '../../src/registry/registry.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import type { Lane } from '../../src/registry/types.ts';
+import type { Platform } from '../../src/devices/backend.ts';
+import type { SlowCall } from './fakes.ts';
 import { FakeDevices } from './fakes.ts';
 import type { ClaimerPlan } from './stress-plan.ts';
 import { DEVICE_MEMORY_MB, poolCap } from '../../src/registry/config.ts';
-import { EXIT_DEVICE_MISSING, EXIT_LIVE_LANE_FREED, EXIT_OVER_BUDGET, EXIT_REFUSED } from './stress-plan.ts';
+import {
+  EXIT_DEVICE_MISSING,
+  EXIT_GATE_NEVER_OPENED,
+  EXIT_HELD_IN_FLIGHT,
+  EXIT_LIVE_LANE_FREED,
+  EXIT_OVER_BUDGET,
+  EXIT_REFUSED,
+  gateEntered,
+  gateOpen,
+} from './stress-plan.ts';
+
+const GATE_LIMIT_MS = 60_000;
+const COMMITS: ReadonlySet<Step> = new Set([
+  'claim:lease-committed',
+  'claim:reserve-committed',
+  'claim:committed',
+  'release:committed',
+]);
 
 function fail(code: number, message: string): never {
   fs.writeSync(2, `${message}\n`);
   process.exit(code);
+}
+
+const pauseCell = new Int32Array(new SharedArrayBuffer(4));
+
+function pause(ms: number): void {
+  Atomics.wait(pauseCell, 0, 0, ms);
+}
+
+function readRegistry<T>(stateDir: string, read: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(databasePath(stateDir), { readOnly: true });
+  try {
+    return read(db);
+  } finally {
+    db.close();
+  }
 }
 
 async function main(): Promise<void> {
@@ -30,6 +64,44 @@ async function main(): Promise<void> {
     ios: new FakeDevices(plan.devicesDir),
     android: new FakeDevices(plan.emulatorsDir, 'android'),
   };
+  const journal = (line: string) => {
+    if (plan.slow) fs.appendFileSync(plan.slow.journal, `${line} ${String(process.pid)} ${String(Date.now())}\n`);
+  };
+  const audit = (call: SlowCall, target: string) => {
+    readRegistry(plan.stateDir, db => {
+      if (call === 'create') {
+        const row = db.prepare('SELECT device_id, creator_pid, creator_start FROM devices WHERE name = ?').get(target);
+        if (row?.device_id !== null || row.creator_pid !== self.pid || row.creator_start !== self.start) {
+          fail(EXIT_HELD_IN_FLIGHT, `creating ${target} without holding its reservation: ${JSON.stringify(row)}`);
+        }
+        return;
+      }
+      const holder = db.prepare('SELECT d.claim_id FROM devices d WHERE d.device_id = ? AND d.claim_id IS NOT NULL').get(target);
+      if (holder) fail(EXIT_HELD_IN_FLIGHT, `${call} of ${target} while lane ${String(holder.claim_id)} holds it`);
+      const lease = db
+        .prepare('SELECT work FROM device_leases WHERE device_id = ? AND holder_pid = ? AND holder_start = ?')
+        .get(target, self.pid, self.start);
+      if (lease?.work !== call) fail(EXIT_HELD_IN_FLIGHT, `${call} of ${target} without a ${call} lease on it`);
+    });
+  };
+  const during = (call: SlowCall, target: string) => {
+    audit(call, target);
+    journal(`start ${call}`);
+    const gate = plan.gate;
+    if (gate?.calls.includes(call)) {
+      fs.writeFileSync(gateEntered(gate, call), target);
+      const deadline = Date.now() + GATE_LIMIT_MS;
+      while (!fs.existsSync(gateOpen(gate, call))) {
+        if (Date.now() > deadline) fail(EXIT_GATE_NEVER_OPENED, `the ${call} gate stayed shut`);
+        pause(10);
+      }
+    }
+    if (plan.slow) pause(plan.slow.ms[call]);
+    journal(`end ${call}`);
+    audit(call, target);
+  };
+  backends.ios.during = during;
+  backends.android.during = during;
   let seen = 0;
   const reached: Partial<Record<Step, number>> = {};
   const registry = Registry.open({
@@ -43,6 +115,7 @@ async function main(): Promise<void> {
     self,
     onStep: step => {
       reached[step] = (reached[step] ?? 0) + 1;
+      if (COMMITS.has(step)) journal('commit');
       if (plan.crashAt.includes(step) && ++seen === plan.crashOccurrence) {
         fs.writeSync(1, `crash ${step}\n`);
         process.kill(process.pid, 'SIGKILL');
@@ -53,15 +126,38 @@ async function main(): Promise<void> {
   let held: Lane | null = null;
   const selfOwned = plan.ownerPid === null && plan.threadOwner === null;
   const verifyBudget = () => {
-    const pool = registry.status().pool;
+    const { rows, deleting, context } = readRegistry(plan.stateDir, db => {
+      db.exec('BEGIN');
+      try {
+        return {
+          rows: db.prepare('SELECT name, platform, device_id, claim_id, creator_pid FROM devices').all(),
+          context: {
+            leases: db.prepare('SELECT reservation, work, holder_pid FROM device_leases').all(),
+            ended: db.prepare('SELECT claim_id, device, reason, by_label FROM history ORDER BY seq DESC LIMIT 6').all(),
+            me: process.pid,
+          },
+          deleting: new Set(
+            db
+              .prepare("SELECT reservation FROM device_leases WHERE work = 'delete'")
+              .all()
+              .map(r => String(r.reservation)),
+          ),
+        };
+      } finally {
+        db.exec('COMMIT');
+      }
+    });
     let used = 0;
-    for (const d of pool) if (d.laneId !== null || d.state === 'creating') used += DEVICE_MEMORY_MB[d.platform];
+    for (const row of rows) {
+      const busy = row.claim_id !== null || (row.device_id === null && !deleting.has(String(row.name)));
+      if (busy) used += DEVICE_MEMORY_MB[row.platform as Platform];
+    }
     if (used > plan.config.memoryBudgetMb)
-      fail(EXIT_OVER_BUDGET, `claimed devices use ${String(used)} MB: ${JSON.stringify(pool)}`);
+      fail(EXIT_OVER_BUDGET, `devices in use take ${String(used)} MB: ${JSON.stringify({ rows, ...context })}`);
     for (const platform of ['ios', 'android'] as const) {
-      const made = pool.filter(d => d.platform === platform && d.state !== 'creating');
+      const made = rows.filter(r => r.platform === platform && r.device_id !== null);
       if (made.length > poolCap(plan.config, platform)) {
-        fail(EXIT_OVER_BUDGET, `${String(made.length)} ${platform} pool devices: ${JSON.stringify(pool)}`);
+        fail(EXIT_OVER_BUDGET, `${String(made.length)} ${platform} pool devices: ${JSON.stringify(rows)}`);
       }
     }
   };
@@ -105,6 +201,10 @@ async function main(): Promise<void> {
           boot: op.boot,
         });
         held = outcome.lane;
+        fs.writeSync(
+          1,
+          `claimed ${JSON.stringify({ id: held.id, device: held.device?.id ?? null, serial: held.device?.serial ?? null })}\n`,
+        );
         if (op.device !== null && !held.device) fail(1, `lane ${held.id} asked for a device and got none`);
         if (held.device?.platform === 'android' && held.device.serial === null) {
           fail(1, `lane ${held.id} holds emulator ${held.device.id} with no console port`);
@@ -112,7 +212,9 @@ async function main(): Promise<void> {
       } else if (op.kind === 'touch' && held) {
         held = registry.touch({ id: held.id, token: held.token }, 'stress touch');
       } else if (op.kind === 'release' && held) {
-        registry.release({ id: held.id, token: held.token }, owner);
+        const notes: string[] = [];
+        registry.release({ id: held.id, token: held.token }, owner, notes);
+        fs.writeSync(1, `released ${JSON.stringify({ id: held.id, notes })}\n`);
         held = null;
       }
     } catch (error) {

@@ -50,7 +50,9 @@ export function tempDir(label: string): string {
 }
 
 export class FakeProcesses implements ProcessTable {
-  private readonly table = new Map<number, { start: string; ppid: number; command: string }>();
+  private readonly table = new Map<number, { start: string; ppid: number; command: string }>([
+    [1, { start: 'Sun Oct 11 07:00:00 2026', ppid: 0, command: '/sbin/launchd' }],
+  ]);
   private nextPid = 40_000;
   private generation = 0;
   blind = false;
@@ -163,12 +165,18 @@ export const ANDROID_IMAGES: SystemImage[] = [
   },
 ];
 
+export type SlowCall = 'create' | 'shutdown' | 'delete';
+
 export class FakeDevices implements DeviceBackend {
   readonly platform: Platform;
   readonly dir: string;
   failCreate = false;
   failBoot = false;
+  failShutdown = false;
+  failList = false;
+  readonly unnamedSerials = new Set<string>();
   readonly calls: string[] = [];
+  during: ((call: SlowCall, target: string) => void) | null = null;
 
   constructor(dir: string, platform: Platform = 'ios') {
     this.dir = dir;
@@ -216,6 +224,7 @@ export class FakeDevices implements DeviceBackend {
   }
 
   list(): BackendDevice[] {
+    if (this.failList) throw new DeviceBackendError('list failed (fake)');
     return this.all().map(({ id, name, deviceType, runtime, booted, port }) => ({
       id,
       name,
@@ -223,12 +232,13 @@ export class FakeDevices implements DeviceBackend {
       runtime,
       booted,
       stopped: !booted,
-      ...(booted && port !== undefined ? { serial: `emulator-${String(port)}` } : {}),
+      ...(booted && port !== undefined && !this.unnamedSerials.has(id) ? { serial: `emulator-${String(port)}` } : {}),
     }));
   }
 
   create(name: string, spec: DeviceSpec): string {
     this.record(`create ${name}`);
+    this.during?.('create', name);
     if (this.failCreate) throw new DeviceBackendError('create failed (fake)');
     const id = this.platform === 'ios' ? randomUUID().toUpperCase() : name;
     this.write({ id, name, deviceType: spec.deviceType, runtime: spec.runtime, booted: false, createdBy: 'registry' });
@@ -252,10 +262,15 @@ export class FakeDevices implements DeviceBackend {
   delete(id: string, whenRunning?: WhenRunning): void {
     if (whenRunning === 'refuse' && this.read(id)?.booted) throw new DeviceRunningError(id);
     this.record(`delete ${id}`);
+    this.during?.('delete', id);
     fs.rmSync(this.file(id), { force: true });
   }
 
   shutdown(id: string): void {
+    this.stop(id, false);
+  }
+
+  private stop(id: string, forBoot: boolean): void {
     const device = this.read(id);
     if (this.platform === 'android') {
       if (!device?.booted) return;
@@ -264,8 +279,11 @@ export class FakeDevices implements DeviceBackend {
     } else {
       this.record(`shutdown ${id}`);
     }
-    if (device) {
-      const stopped: StoredDevice = { ...device, booted: false };
+    if (!forBoot) this.during?.('shutdown', id);
+    if (!forBoot && this.failShutdown) throw new DeviceBackendError('shutdown failed (fake)');
+    const now = this.read(id);
+    if (now) {
+      const stopped: StoredDevice = { ...now, booted: false };
       delete stopped.port;
       this.write(stopped);
     }
@@ -279,7 +297,7 @@ export class FakeDevices implements DeviceBackend {
     if (!device) throw new DeviceBackendError(`no device ${id}`);
     if (this.platform === 'android') {
       if (consolePort === undefined) throw new DeviceBackendError(`no console port for ${id}`);
-      if (device.booted && device.port !== consolePort) this.shutdown(id);
+      if (device.booted && device.port !== consolePort) this.stop(id, true);
       this.write({ ...device, booted: true, port: consolePort });
       return;
     }

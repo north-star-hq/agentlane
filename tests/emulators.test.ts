@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { laneVariables } from '../src/hooks/env.ts';
-import { HOUR_MS, parseConfig, withProjectBlocks } from '../src/registry/config.ts';
+import { DEFAULT_CONFIG, HOUR_MS, parseConfig, withProjectBlocks } from '../src/registry/config.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { UsageError } from '../src/registry/refusal.ts';
 import type { LaneRequest } from '../src/registry/types.ts';
+import type { Lane } from '../src/registry/types.ts';
+import { FakeProbe } from './support/fakes.ts';
+import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
 import type { World } from './support/world.ts';
 import { world } from './support/world.ts';
 
@@ -273,4 +276,140 @@ test("the 'emulator' service name is reserved, and port blocks may not overlap t
   assert.deepEqual([base.emulatorPoolSize, base.memoryBudgetMb], [2, 12500]);
   assert.throws(() => parseConfig({ memoryBudgetGB: 2 }, 'config.json'), /at least 4/);
   assert.throws(() => withProjectBlocks(base, { admin: { first: 5500, last: 5560 } }, 'agentlane.json'), /emulator/);
+});
+
+test('an emulator still shutting down after its release keeps its console port pair, and its AVD, from the next Android lane', async () => {
+  const s = sharedRegistry({
+    ...DEFAULT_CONFIG,
+    blocks: { metro: { first: 47800, last: 47803 }, api: { first: 47900, last: 47903 } },
+  });
+  try {
+    const releaser = startClaimer(
+      s.plan(
+        [
+          {
+            kind: 'claim',
+            worktree: s.folder('releaser'),
+            platform: 'android',
+            device: 'pixel_8',
+            strict: false,
+            boot: true,
+            waitMs: 0,
+          },
+          { kind: 'release' },
+        ],
+        { gate: ['shutdown'] },
+      ),
+    );
+    const stopping = await s.reached('shutdown', releaser);
+    const serial = s.emulators.list().find(d => d.id === stopping)?.serial;
+    assert.ok(serial, 'the emulator is still running');
+
+    const next = await s.registry().claim({
+      owner: s.owner,
+      worktree: s.folder('next'),
+      projectRoot: s.folder('next'),
+      services: [{ name: 'metro', type: 'metro' }],
+      device: { platform: 'android' },
+      waitMs: 0,
+    });
+    assert.ok(next.lane.device?.serial);
+    assert.notEqual(next.lane.device.id, stopping);
+    assert.notEqual(next.lane.device.serial, serial);
+
+    s.open('shutdown');
+    const exit = await releaser.exited;
+    assert.equal(exit.code, 0, `${exit.stdout}${exit.stderr}`);
+    assert.equal(s.emulators.all().find(d => d.id === stopping)?.booted, false);
+  } finally {
+    s.close();
+  }
+});
+
+const PIXEL = (deviceType: string) => ({ device: { platform: 'android', deviceType } }) as const;
+
+async function freeEmulators(w: World, types: readonly string[]): Promise<void> {
+  const held: { owner: Owner; lane: Lane }[] = [];
+  for (const [i, type] of types.entries()) {
+    const owner = w.procs.owner();
+    held.push({ owner, lane: (await w.registry().claim(android(w, owner, `made-${String(i)}`, PIXEL(type)))).lane });
+  }
+  for (const { owner, lane } of held) w.registry().release({ id: lane.id, token: lane.token }, owner);
+  assert.deepEqual(
+    w.emulators
+      .all()
+      .map(d => [d.deviceType, d.booted])
+      .sort(),
+    types.map(t => [t, false]).sort(),
+  );
+}
+
+for (const shutdown of ['still running', 'failed'] as const) {
+  test(`an Android lane whose device listing predates another lane's emulator never takes that emulator's console pair after its release, while the shutdown is ${shutdown}`, async () => {
+    const w = world();
+    try {
+      await freeEmulators(w, ['pixel_8', 'pixel_9']);
+      let openProbe: () => void = () => undefined;
+      w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+      const late = w.registry().claim(android(w, w.procs.owner(), 'late', PIXEL('pixel_9')));
+
+      const owner = w.procs.owner();
+      const early = await w.registry({ ports: new FakeProbe() }).claim(android(w, owner, 'early', PIXEL('pixel_8')));
+      const running = early.lane.device;
+      assert.ok(running?.serial);
+      const ref = { id: early.lane.id, token: early.lane.token };
+      if (shutdown === 'failed') {
+        w.emulators.failShutdown = true;
+        const notes: string[] = [];
+        w.registry({ ports: new FakeProbe() }).release(ref, owner, notes);
+        assert.ok(
+          notes.some(n => n.startsWith('could not shut down')),
+          notes.join('\n'),
+        );
+      } else {
+        const stillStopping = (step: string) => {
+          if (step === 'release:committed') throw new Error('the shutdown is still running');
+        };
+        assert.throws(() => w.registry({ ports: new FakeProbe(), onStep: stillStopping }).release(ref, owner), /still running/);
+      }
+      assert.equal(w.emulators.list().find(d => d.id === running.id)?.serial, running.serial, 'that emulator still runs');
+
+      openProbe();
+      const got = (await late).lane.device;
+      assert.ok(got?.serial);
+      assert.equal(got.deviceType, 'pixel_9');
+      assert.equal(w.emulators.list().find(d => d.id === running.id)?.serial, running.serial, 'that emulator still runs');
+      assert.notEqual(got.serial, running.serial);
+      const serials = w.emulators.list().flatMap(d => (d.serial ? [d.serial] : []));
+      assert.equal(new Set(serials).size, serials.length, `two emulators on one port pair: ${serials.join(', ')}`);
+    } finally {
+      w.close();
+    }
+  });
+}
+
+test("a released emulator's console pair stays reserved until its shutdown settles, even when the device listing can't name the pair it runs on", async () => {
+  const w = world();
+  try {
+    await freeEmulators(w, ['pixel_8', 'pixel_9']);
+    const owner = w.procs.owner();
+    const early = await w.registry().claim(android(w, owner, 'early', PIXEL('pixel_8')));
+    const running = early.lane.device;
+    assert.ok(running?.serial);
+    const stillStopping = (step: string) => {
+      if (step === 'release:committed') throw new Error('the shutdown is still running');
+    };
+    assert.throws(
+      () => w.registry({ onStep: stillStopping }).release({ id: early.lane.id, token: early.lane.token }, owner),
+      /still running/,
+    );
+    w.emulators.unnamedSerials.add(running.id);
+    assert.equal(w.emulators.list().find(d => d.id === running.id)?.booted, true);
+
+    const late = await w.registry().claim(android(w, w.procs.owner(), 'late', PIXEL('pixel_9')));
+    assert.ok(late.lane.device?.serial);
+    assert.notEqual(late.lane.device.serial, running.serial);
+  } finally {
+    w.close();
+  }
 });
