@@ -12,7 +12,7 @@ A web lane's browser is Chrome for Testing with three things of its own:
 - a **debugging port** from the `browser` block, 41400–41439;
 - a **driver session** named after the lane, such as `agentlane-4b5850b6`.
 
-`up --platform web` starts it on the web app's page and prints the URL. `doctor`'s `browser` line checks that the browser on that port is the one on this lane's profile, not another lane's. At release the browser and its driver's daemons stop, and the profile and the saved login are deleted. The evidence folder stays.
+`up --platform web` starts it on the web app's page and prints the URL. `doctor`'s `browser` line checks that the browser on that port is the one on this lane's profile, not another lane's. When the lane parks, the browser and its driver's daemons stop and the saved login stays, so the next call opens the web app signed in. At release the browser and its driver's daemons stop, and the profile and the saved login are deleted. The evidence folder stays.
 
 ## Playwright or agent-browser
 

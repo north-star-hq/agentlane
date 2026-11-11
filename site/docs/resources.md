@@ -69,7 +69,9 @@ Each teardown runs when its lane ends, last created first:
 
 - at `agentlane release`;
 - when the agent's session ends and its hook releases the lane;
-- when another `claim` or `up` reaps a lane whose owner died, or takes over an idle one.
+- when the sweep ends a lane whose owner is gone, 30 minutes after it found the owner gone.
+
+A lane that is parked for going unused keeps its resources, so its next call finds the same database. A timer never drops a live owner's data.
 
 agentlane records what teardown will run when create starts: the command, its folder and its variables, including the values create exported. So teardown still works after `agentlane.json` changes, after the session that made the lane has died, and after its worktree is deleted, in which case it runs in the lane's log folder. A teardown gets 120 seconds unless `teardownTimeoutSeconds` says otherwise.
 

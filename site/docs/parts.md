@@ -26,7 +26,7 @@ The server finds the lane from the session that runs it, so the tools take no de
 
 `init` writes each agent's own files: the skills, the MCP server entry and two hooks. The guard hook runs before each shell command and denies one aimed at another lane's simulator, emulator or browser. The release hook frees the session's lanes when the session ends. [The device guard and session hooks](guard.md) has the details.
 
-Claude Code can load all of that as a plugin instead, which also puts `agentlane` on the Bash tool's PATH. Codex, Cursor and Gemini CLI can install the plugin's skills and MCP server from manifests in the same folder; their hooks still come from `init`. [Install for your agent](install.md) covers each agent.
+Claude Code can load the skills and the MCP server as a plugin instead, which also puts `agentlane` on the Bash tool's PATH. The hooks still go in `.claude/settings.json`, where Claude Code runs them whether or not the plugin is installed. Codex, Cursor and Gemini CLI can install the plugin's skills and MCP server from manifests in the same folder; their hooks come from `init` too. [Install for your agent](install.md) covers each agent.
 
 ## Skills
 

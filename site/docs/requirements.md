@@ -55,4 +55,8 @@ On first use, agentlane downloads pinned builds into its data folder, `~/.local/
 | agent-browser 0.39.0         | the same, when the project picks it    | the npm registry                    |
 | Chrome for Testing and ffmpeg | with the driver                       | Playwright's CDN                    |
 
+Once agentlane has installed and checked a newer pin of one of these, it removes the older versions of it that it installed itself, unless something still uses them: a running process, a lane whose files name them, another install in progress, or a Playwright link in the browsers folder, such as the one a project's own `npx playwright install` writes. It never removes a newer version, a folder without its install marker, or 0.2.x's `~/.local/share/agent-env`, which `prune` covers. If it can't read the process table or a registry, it removes nothing. A project still on an older agentlane downloads that version's tools again the next time it needs them.
+
+agentlane's own logs have limits too. A lane's recorded steps keep the newest 512 KiB once they pass 1 MiB. Each emulator's log moves to `<name>.1` when it passes 5 MiB at a boot, and `session-end.log` and `sweep.log` when they pass 1 MiB. `init` keeps its five newest backups per project. Evidence folders are never cut; each goes with its lane's folder, seven days after the lane ends.
+
 agentlane itself has no telemetry, and its Maestro build has Maestro's analytics, update check and error reporter taken out. The registry of lanes lives in `~/.local/state/agentlane/` (or `$XDG_STATE_HOME/agentlane`), and `AGENTLANE_STATE_DIR` moves it.

@@ -32,7 +32,7 @@ npx agentlane exec -- npx playwright test
 npx agentlane release
 ```
 
-Without an agent, a lane belongs to the shell that claimed it, and it is reaped once that shell is gone. So run the three commands in one script or CI step, or set `AGENTLANE_OWNER_PID` to a process that lives as long as the lane should. Browsers run headless by default, and emulators always run without a window. On a slim Linux image, install Chrome's system libraries first; [Troubleshooting](troubleshooting.md#linux-browser-libraries) shows how.
+Without an agent, a lane belongs to the shell that claimed it, and it is parked once that shell is gone and ended 30 minutes later. So run the three commands in one script or CI step, or set `AGENTLANE_OWNER_PID` to a process that lives as long as the lane should. Browsers run headless by default, and emulators always run without a window. On a slim Linux image, install Chrome's system libraries first; [Troubleshooting](troubleshooting.md#linux-browser-libraries) shows how.
 
 ## How many agents can run at once?
 
