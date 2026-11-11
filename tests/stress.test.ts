@@ -3,7 +3,6 @@ import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { Platform } from '../src/devices/backend.ts';
 import { EMULATOR_NAME_PREFIX, POOL_NAME_PREFIX } from '../src/name.ts';
@@ -11,7 +10,6 @@ import { identityOf, systemProcesses } from '../src/processes.ts';
 import type { RegistryConfig } from '../src/registry/config.ts';
 import { DEVICE_MEMORY_MB, poolCap } from '../src/registry/config.ts';
 import type { Owner } from '../src/registry/owner.ts';
-import { databasePath } from '../src/registry/paths.ts';
 import type { Step } from '../src/registry/registry.ts';
 import { Registry, STEPS } from '../src/registry/registry.ts';
 import { OWNER_CHECK_MS, RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
@@ -21,6 +19,7 @@ import { FakeDevices, tempDir } from './support/fakes.ts';
 import { parkNow } from './support/world.ts';
 import type { ClaimerPlan, SlowDevices, StressOp } from './support/stress-plan.ts';
 import { EXIT_REFUSED, runClaimer } from './support/stress-plan.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const CLAIMERS = 16;
 const SEEDS = Number(process.env.STRESS_SEEDS ?? 10);
@@ -226,7 +225,7 @@ async function runSeed(
         config,
       });
       try {
-        const db = new DatabaseSync(databasePath(stateDir), { readOnly: true });
+        const db = openRegistryReadOnly(stateDir);
         const lanes = db.prepare('SELECT id, token FROM claims').all();
         db.close();
         for (const lane of lanes) {
@@ -381,7 +380,7 @@ async function runSeed(
         }),
       );
 
-      const db = new DatabaseSync(databasePath(stateDir), { readOnly: true });
+      const db = openRegistryReadOnly(stateDir);
       const history = db.prepare('SELECT * FROM history').all();
       db.close();
       for (const h of history) {

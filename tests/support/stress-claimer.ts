@@ -1,8 +1,6 @@
 import fs from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import { identityOf, systemProcesses } from '../../src/processes.ts';
 import type { Owner } from '../../src/registry/owner.ts';
-import { databasePath } from '../../src/registry/paths.ts';
 import { Refusal } from '../../src/registry/refusal.ts';
 import type { Step } from '../../src/registry/registry.ts';
 import { Registry } from '../../src/registry/registry.ts';
@@ -23,6 +21,7 @@ import {
   gateEntered,
   gateOpen,
 } from './stress-plan.ts';
+import { openRegistryReadOnly, readRegistry } from './registry-read.ts';
 
 const GATE_LIMIT_MS = 60_000;
 const COMMITS: ReadonlySet<Step> = new Set([
@@ -42,15 +41,6 @@ const pauseCell = new Int32Array(new SharedArrayBuffer(4));
 
 function pause(ms: number): void {
   Atomics.wait(pauseCell, 0, 0, ms);
-}
-
-function readRegistry<T>(stateDir: string, read: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(databasePath(stateDir), { readOnly: true });
-  try {
-    return read(db);
-  } finally {
-    db.close();
-  }
 }
 
 async function main(): Promise<void> {
@@ -167,7 +157,7 @@ async function main(): Promise<void> {
     if (!held) return;
     const current = registry.find(owner, held.worktree);
     if (current?.id !== held.id) {
-      const db = new DatabaseSync(databasePath(plan.stateDir), { readOnly: true });
+      const db = openRegistryReadOnly(plan.stateDir);
       const ended = db.prepare('SELECT reason, last_used_at, ended_at FROM history WHERE claim_id = ?').get(held.id);
       db.close();
       const idle = ended ? Number(ended.ended_at) - Number(ended.last_used_at) : -1;

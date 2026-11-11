@@ -21,6 +21,7 @@ import { upWaker } from '../../src/up/waker.ts';
 import { FakeProbe } from '../support/fakes.ts';
 import { driverWorld, until, type DriverWorld, type WorldOptions } from '../support/driver-world.ts';
 import { toolchain } from '../support/up-world.ts';
+import { openRegistryReadOnly } from '../support/registry-read.ts';
 
 const CONFIG = { ...DEFAULT_CONFIG, blocks: { metro: { first: 47900, last: 47903 } } };
 
@@ -87,7 +88,7 @@ function booted(w: DriverWorld, id: string): boolean | undefined {
 }
 
 function lastUse(w: DriverWorld): { at: number; action: string } {
-  const db = new DatabaseSync(databasePath(w.stateDir), { readOnly: true, timeout: 5000 });
+  const db = openRegistryReadOnly(w.stateDir);
   try {
     const row = db.prepare('SELECT last_used_at AS at, last_action AS action FROM claims WHERE id = ?').get(w.lane.id);
     return { at: Number(row?.at), action: String(row?.action) };

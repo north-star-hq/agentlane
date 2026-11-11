@@ -21,6 +21,7 @@ import { FakeAdb } from './devices/fake-adb.ts';
 import { FakeClock, FakeProbe, tempDir } from './support/fakes.ts';
 import { driverWorld, sleeper, until, type DriverWorld } from './support/driver-world.ts';
 import { CONFIG, failures, OPTIONS, toolchain, world, type World } from './support/up-world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const FIXTURE = path.join(import.meta.dirname, 'fixtures', 'signin-site');
 const AGED = 1_000_000;
@@ -52,7 +53,7 @@ interface LastUse {
 }
 
 function lastUse(state: string, id: string): LastUse {
-  const db = new DatabaseSync(databasePath(state), { readOnly: true, timeout: 5000 });
+  const db = openRegistryReadOnly(state);
   try {
     const row = db.prepare('SELECT last_used_at AS at, last_action AS action FROM claims WHERE id = ?').get(id);
     assert.ok(row, `lane ${id} has no row`);
@@ -462,7 +463,7 @@ function execDeps(lane: OtherLane, over: Partial<EnvDeps> = {}): EnvDeps {
 
 function onlyLane(state: string): LaneRef | undefined {
   if (!fs.existsSync(databasePath(state))) return undefined;
-  const db = new DatabaseSync(databasePath(state), { readOnly: true, timeout: 5000 });
+  const db = openRegistryReadOnly(state);
   try {
     const rows = db.prepare('SELECT id, token FROM claims').all();
     const [row] = rows;

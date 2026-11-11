@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { agentOf, describeOwner, ownerKey, resolveOwner } from '../src/registry/owner.ts';
-import { databasePath } from '../src/registry/paths.ts';
 import { FakeProcesses } from './support/fakes.ts';
 import { world } from './support/world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const HOME = '/Users/someone';
 const SELF = 'node /usr/local/lib/node_modules/agentlane/dist/cli.js lane';
@@ -140,7 +139,7 @@ test('a new agent’s lane is stored with a kind toolkit 0.1.3 knows, reads back
     const owner = resolveOwner({ GEMINI_CLI: '1', HOME }, w.procs, self?.pid);
     const held = await w.registry().claim(w.request(owner, w.folder('gemini')));
 
-    const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+    const db = openRegistryReadOnly(w.dir);
     try {
       const row = db.prepare('SELECT owner_kind, owner_key, owner_session FROM claims').get();
       assert.deepEqual(

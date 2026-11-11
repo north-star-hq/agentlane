@@ -20,6 +20,7 @@ import { tempDir } from './support/fakes.ts';
 import { OWNER_CHECK_MS } from '../src/registry/owner-checks.ts';
 import type { World } from './support/world.ts';
 import { sawOwners, world } from './support/world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const PARK_MS = 30 * MINUTE_MS;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -93,7 +94,7 @@ function refOf(lane: Lane) {
 }
 
 function read<T>(w: World, body: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+  const db = openRegistryReadOnly(w.dir);
   try {
     return body(db);
   } finally {
