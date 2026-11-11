@@ -15,6 +15,7 @@ import {
   maestroBuild,
   maestroHome,
   type Downloader,
+  type JdkSearch,
 } from '../../src/driver/install.ts';
 import { JAVA_HOME_ENV } from '../../src/hooks/env.ts';
 import type { Lane } from '../../src/registry/types.ts';
@@ -24,6 +25,12 @@ import { tempDir } from '../support/fakes.ts';
 import { makeZip } from '../support/zip.ts';
 
 const VERSION = '9.9.9-agentenv.test';
+
+const noJdk17: JdkSearch = () => Promise.resolve(undefined);
+const finding =
+  (home: string): JdkSearch =>
+  () =>
+    Promise.resolve({ home, origin: `the search's ${home}` });
 
 function fakeJdk(root: string, spec = '17'): string {
   const home = path.join(root, `jdk-${spec}`);
@@ -186,14 +193,14 @@ test('a build whose --version is not the pinned version is refused', async () =>
   assert.equal(fs.existsSync(maestroHome(env, release)), false);
 });
 
-test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another version', async () => {
+test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another version, and one of another version is refused', async () => {
   const root = fs.realpathSync(tempDir('jdk'));
   const jdk17 = fakeJdk(root);
   const jdk21 = fakeJdk(root, '21');
   const found = await findJdk17({ AGENTLANE_JAVA_HOME: jdk17, JAVA_HOME: jdk21 });
   assert.equal(found.javaHome, path.join(root, 'jdk-17'));
   assert.equal(found.origin, `AGENTLANE_JAVA_HOME=${jdk17}`);
-  await assert.rejects(findJdk17({ AGENTLANE_JAVA_HOME: jdk21, JAVA_HOME: jdk17 }), (error: unknown) => {
+  await assert.rejects(findJdk17({ AGENTLANE_JAVA_HOME: jdk21, JAVA_HOME: jdk17 }, finding(jdk17)), (error: unknown) => {
     assert.ok(error instanceof DriverError);
     assert.match(error.message, /^AGENTLANE_JAVA_HOME=.* is Java 21, and Maestro runs on JDK 17/);
     assert.match(error.fix, /set AGENTLANE_JAVA_HOME to a JDK 17 home/);
@@ -201,21 +208,32 @@ test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another versi
   });
 });
 
-test('JDK 17 is required: a JAVA_HOME of another version or with no java is refused, naming the fix', async () => {
+test('a JAVA_HOME of another version or with no java is passed over, and named when no JDK 17 is found', async () => {
   const root = fs.realpathSync(tempDir('jdk'));
-  assert.equal((await findJdk17({ JAVA_HOME: fakeJdk(root) })).javaHome, path.join(root, 'jdk-17'));
-  await assert.rejects(findJdk17({ JAVA_HOME: fakeJdk(root, '21') }), (error: unknown) => {
+  const jdk17 = fakeJdk(root);
+  const jdk21 = fakeJdk(root, '21');
+  assert.equal((await findJdk17({ JAVA_HOME: jdk17 }, noJdk17)).javaHome, jdk17);
+  assert.deepEqual(await findJdk17({ JAVA_HOME: jdk21 }, finding(jdk17)), { javaHome: jdk17, origin: `the search's ${jdk17}` });
+  await assert.rejects(findJdk17({ JAVA_HOME: jdk21 }, noJdk17), (error: unknown) => {
     assert.ok(error instanceof DriverError);
-    assert.match(error.message, /is Java 21, and Maestro runs on JDK 17/);
+    assert.equal(error.message.split('\n')[0], `no JDK 17 found (JAVA_HOME=${jdk21} is Java 21); Maestro runs on JDK 17`);
     assert.match(error.fix, /brew install openjdk@17/);
     return true;
   });
-  await assert.rejects(findJdk17({ JAVA_HOME: path.join(root, 'nothing') }), /has no working bin\/java/);
+  await assert.rejects(
+    findJdk17({ JAVA_HOME: path.join(root, 'nothing') }, finding(jdk21)),
+    /the search's .*jdk-21 is Java 21 \(JAVA_HOME=.*nothing has no working bin\/java\), and Maestro runs on JDK 17\n/,
+  );
   const { env } = world();
   const { release, dir } = build(root);
   await assert.rejects(
-    ensureMaestro({ env: { ...env, JAVA_HOME: path.join(root, 'nothing') }, release, download: serving(dir) }),
-    /bin\/java/,
+    ensureMaestro({
+      env: { ...env, JAVA_HOME: path.join(root, 'nothing') },
+      release,
+      download: serving(dir),
+      searchJdk17: noJdk17,
+    }),
+    /no JDK 17 found \(JAVA_HOME=.*nothing has no working bin\/java\)/,
   );
 });
 
@@ -279,4 +297,34 @@ test('the driver starts on a JDK its caller already found, and searches for one 
   };
   assert.deepEqual(await resolveToolchain({ ...target, javaHome: found }), { maestro: '/fake/maestro', javaHome: found });
   await assert.rejects(resolveToolchain(target), /has no working bin\/java/);
+});
+
+test('the driver up starts and a later restart both run on JDK 17 when JAVA_HOME names another version', async () => {
+  const root = fs.realpathSync(tempDir('jdk'));
+  const jdk17 = fakeJdk(root);
+  const target = {
+    stateDir: root,
+    lane: {} as Lane,
+    env: { [MAESTRO_OVERRIDE_ENV]: '/fake/maestro', JAVA_HOME: fakeJdk(root, '21') },
+    install: { searchJdk17: finding(jdk17) },
+  };
+  assert.equal((await resolveToolchain({ ...target, javaHome: jdk17 })).javaHome, jdk17);
+  assert.equal((await resolveToolchain(target)).javaHome, jdk17);
+});
+
+test('a first-use install from a driver start runs on the JDK its caller found, not on JAVA_HOME', async () => {
+  const root = fs.realpathSync(tempDir('jdk'));
+  const jdk17 = fakeJdk(root);
+  const { release, dir } = build(root);
+  const toolchain = await resolveToolchain({
+    stateDir: root,
+    lane: {} as Lane,
+    env: { PATH: process.env.PATH, HOME: root, XDG_DATA_HOME: path.join(root, 'data'), JAVA_HOME: fakeJdk(root, '21') },
+    javaHome: jdk17,
+    install: { release, download: serving(dir), searchJdk17: noJdk17 },
+  });
+  assert.deepEqual(toolchain, {
+    maestro: path.join(root, 'data', 'agentlane', 'maestro', VERSION, 'maestro', 'bin', 'maestro'),
+    javaHome: jdk17,
+  });
 });
