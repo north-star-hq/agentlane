@@ -16,6 +16,7 @@ export interface HookMark {
   toolkit: string;
   version: string;
   probe: string | null;
+  node: string | null;
 }
 
 function marksDir(stateDir: string): string {
@@ -72,6 +73,7 @@ function parseMark(text: string): HookMark | null {
     toolkit: m.toolkit,
     version: m.version,
     probe: typeof m.probe === 'string' ? m.probe : null,
+    node: typeof m.node === 'string' ? m.node : null,
   };
 }
 

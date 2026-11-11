@@ -12,7 +12,7 @@ import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
 import { readHookInput } from '../../src/plugin/conventions.ts';
 import { runHookCommand } from '../../src/plugin/hook-cli.ts';
-import { writeHookMark } from '../../src/plugin/hook-mark.ts';
+import { readHookMark, writeHookMark } from '../../src/plugin/hook-mark.ts';
 import { systemProcesses } from '../../src/processes.ts';
 import type { Agent } from '../../src/registry/owner.ts';
 import { AGENTS } from '../../src/registry/owner.ts';
@@ -737,6 +737,7 @@ test('a mark left from a worktree nested in the project does not vouch for the p
       toolkit: bin,
       version: toolVersion(),
       probe: null,
+      node: fs.realpathSync(process.execPath),
     });
     const [line] = agentHookChecks(dir, ['codex'], f.env());
     assert.equal(line?.ok, false, line?.detail);
@@ -787,24 +788,93 @@ test('under pnpm’s layout, doctor fails a hook once the file the shim runs bre
   }
 });
 
-test('doctor fails a hook once a module the toolkit’s entry imports is removed after a good mark', async () => {
-  const f = fixture('hooks-entry-module');
+for (const [where, module] of [
+  ['in a folder below it', 'lib/dep.js'],
+  ['beside it', 'dep.js'],
+] as const) {
+  test(`doctor fails a hook once a module the toolkit’s entry imports ${where} is removed after a good mark`, async () => {
+    const f = fixture('hooks-entry-module');
+    try {
+      const dir = f.repo('app');
+      await init(dir, f.env(), '--agents', 'codex');
+      installToolkit(dir, path.join(f.root, 'calls.log'));
+      const entry = toolkitEntry(dir);
+      write(path.join(path.dirname(entry), module), 'export {};\n');
+      fs.writeFileSync(entry, `import './${module}';\n${fs.readFileSync(entry, 'utf8')}`);
+      const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+      assert.equal(check()?.ok, true, check()?.detail);
+      assert.match(check()?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /);
+
+      fs.rmSync(path.join(path.dirname(entry), module));
+      const broken = check();
+      assert.equal(broken?.ok, false, broken?.detail);
+      assert.match(broken.detail, /never reached the toolkit: it exited 1: /);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('doctor dates a folder a link in the toolkit’s folder points at without walking into it, and a link to its own folder ends the walk', async () => {
+  const f = fixture('hooks-entry-links');
   try {
     const dir = f.repo('app');
     await init(dir, f.env(), '--agents', 'codex');
-    installToolkit(dir, path.join(f.root, 'calls.log'));
-    const entry = toolkitEntry(dir);
-    const module = path.join(path.dirname(entry), 'lib/dep.js');
-    write(module, 'export {};\n');
-    fs.writeFileSync(entry, `import './lib/dep.js';\n${fs.readFileSync(entry, 'utf8')}`);
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const dist = path.dirname(toolkitEntry(dir));
+    const outside = path.join(f.root, 'outside');
+    write(path.join(outside, 'deep/file.js'), 'export {};\n');
+    fs.symlinkSync(outside, path.join(dist, 'outside'));
+    fs.symlinkSync('.', path.join(dist, 'self'));
     const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
     assert.equal(check()?.ok, true, check()?.detail);
-    assert.match(check()?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /);
+    const probes = calls(log).length;
 
-    fs.rmSync(module);
-    const broken = check();
-    assert.equal(broken?.ok, false, broken?.detail);
-    assert.match(broken.detail, /never reached the toolkit: it exited 1: /);
+    later(path.join(outside, 'deep/file.js'));
+    const line = check();
+    assert.match(line?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /, 'the walk went through a link');
+    assert.equal(calls(log).length, probes);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('doctor stops trusting a hook’s mark once the node the hook ran on changes or is gone', async () => {
+  const f = fixture('hooks-node');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+    assert.equal(check()?.ok, true, check()?.detail);
+    const mark = readHookMark(f.state, 'codex', dir);
+    assert.ok(mark);
+    assert.equal(mark.node, fs.realpathSync(process.execPath));
+
+    const node = path.join(f.root, 'node');
+    write(node, '');
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(node, hourAgo, hourAgo);
+    const markOn = (on: string | null) => {
+      writeHookMark(f.state, { ...mark, node: on });
+    };
+    const answered = (what: string) => {
+      const before = calls(log).length;
+      assert.equal(check()?.ok, true, check()?.detail);
+      return calls(log).length === before ? 'the mark' : `a run (${what})`;
+    };
+    markOn(node);
+    assert.equal(answered('an unchanged node'), 'the mark');
+    later(node);
+    markOn(node);
+    assert.equal(answered('a node changed after the mark'), 'a run (a node changed after the mark)');
+    fs.rmSync(node);
+    markOn(node);
+    assert.equal(answered('a node gone since the mark'), 'a run (a node gone since the mark)');
+    markOn(null);
+    assert.equal(answered('a mark that names no node'), 'a run (a mark that names no node)');
   } finally {
     f.cleanup();
   }
@@ -835,6 +905,7 @@ test('a mark left by another toolkit does not vouch for the project’s hook', a
       toolkit: toolkitEntry(other),
       version: toolVersion(),
       probe: null,
+      node: fs.realpathSync(process.execPath),
     });
     const [line] = agentHookChecks(dir, ['codex'], f.env());
     assert.equal(line?.ok, false, line?.detail);
