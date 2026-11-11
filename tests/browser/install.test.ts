@@ -41,6 +41,17 @@ function zip(root: string, name: string, executable: string): string {
 const sha256 = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const sha512 = (file: string) => crypto.createHash('sha512').update(fs.readFileSync(file)).digest('base64');
 
+/** The browsers a playwright-core pins, in the layout of its own `browsers.json`. */
+function browsersJson(chromium: string, ffmpeg: string): string {
+  return JSON.stringify({
+    browsers: [
+      { name: 'chromium', revision: chromium, installByDefault: true },
+      { name: 'chromium-headless-shell', revision: chromium, installByDefault: true },
+      { name: 'ffmpeg', revision: ffmpeg, installByDefault: true, revisionOverrides: { 'mac12-arm64': '1' } },
+    ],
+  });
+}
+
 interface Served {
   root: string;
   env: NodeJS.ProcessEnv;
@@ -53,7 +64,10 @@ interface Served {
 
 function served(): Served {
   const root = tempDir('browser-install');
-  const core = tgz(root, 'playwright-core-9.9.9.tgz', { 'lib/tools/cli-client/cli.js': 'console.log("cli")\n' });
+  const core = tgz(root, 'playwright-core-9.9.9.tgz', {
+    'lib/tools/cli-client/cli.js': 'console.log("cli")\n',
+    'browsers.json': browsersJson('1', '2'),
+  });
   const ab = tgz(root, 'agent-browser-1.1.1.tgz', { 'bin/agent-browser-test-host': '#!/bin/sh\n' });
   const chromium = zip(root, 'chrome.zip', 'chrome/chrome');
   const shell = zip(root, 'shell.zip', 'shell/shell');
@@ -95,6 +109,8 @@ function served(): Served {
     XDG_STATE_HOME: path.join(home, '.local', 'state'),
     XDG_CONFIG_HOME: path.join(home, '.config'),
     AGENTLANE_STATE_DIR: path.join(home, '.local', 'state', 'agentlane'),
+    CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+    CODEX_HOME: path.join(home, '.codex'),
     PATH: process.env.PATH,
   };
   const fetched: string[] = [];
@@ -274,7 +290,10 @@ function later(
   version: string,
   revision: string,
 ): { playwright: PlaywrightRelease; agentBrowser: AgentBrowserRelease } {
-  const core = tgz(s.root, `playwright-core-${version}.tgz`, { 'lib/tools/cli-client/cli.js': 'console.log("cli")\n' });
+  const core = tgz(s.root, `playwright-core-${version}.tgz`, {
+    'lib/tools/cli-client/cli.js': 'console.log("cli")\n',
+    'browsers.json': browsersJson(revision, revision),
+  });
   const ab = tgz(s.root, `agent-browser-${version}.tgz`, { 'bin/agent-browser-test-host': '#!/bin/sh\n' });
   const archive = (file: string, executable: string[]) => ({
     url: `https://cdn.example/${path.basename(file)}`,
@@ -382,4 +401,35 @@ test('newer pins keep a browser a running process uses, and folders the toolkit 
   assert.ok(lines.includes(`kept ${path.join(a.browsersPath, 'chromium-1')}, which a running process uses`), lines.join('\n'));
   assert.equal(fs.existsSync(path.join(a.browsersPath, 'ffmpeg-2')), false);
   assert.equal(fs.existsSync(path.dirname(a.playwrightCore)), false);
+});
+
+test('an older playwright-core kept by a running daemon keeps the browsers it pins, and an older agent-browser keeps them too', async () => {
+  for (const driver of ['playwright', 'agent-browser'] as const) {
+    const s = served();
+    const a = await ensureBrowserDriver(driver, s.options({ commandLines: nobodyRunning }));
+    const daemon =
+      driver === 'playwright'
+        ? `node ${path.join(a.playwrightCore, 'lib', 'tools', 'cli-client', 'cli.js')} daemon --session lane`
+        : `${a.cli[0] ?? ''} --session lane`;
+    const lines: string[] = [];
+    await ensureBrowserDriver(
+      driver,
+      s.options({ ...later(s, '9.10.0', '3'), commandLines: () => [daemon], log: line => lines.push(line) }),
+    );
+    assert.ok(fs.existsSync(a.chrome), lines.join('\n'));
+    assert.ok(fs.existsSync(a.headlessShell), lines.join('\n'));
+    assert.ok(fs.existsSync(a.ffmpeg), lines.join('\n'));
+    if (driver === 'playwright') assert.deepEqual(installState(s.env, driver, releases(s)), { kind: 'installed', driver: a });
+    assert.ok(lines.includes(`kept ${path.join(a.browsersPath, 'chromium-1')}, which a kept version runs`), lines.join('\n'));
+  }
+});
+
+test('a newer playwright-core keeps the browsers it pins from an install of older pins', async () => {
+  const s = served();
+  const next = later(s, '9.10.0', '3');
+  const b = await ensureBrowserDriver('playwright', s.options({ ...next, commandLines: nobodyRunning }));
+  const a = await ensureBrowserDriver('playwright', s.options({ commandLines: nobodyRunning }));
+  assert.equal(installState(s.env, 'playwright', { ...next, host: HOST }).kind, 'installed');
+  assert.ok(fs.existsSync(b.chrome));
+  assert.ok(fs.existsSync(a.chrome));
 });

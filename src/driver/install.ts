@@ -11,7 +11,15 @@ import { DriverError } from './errors.ts';
 import { runCommand, tail } from './exec.ts';
 import { tryLock, unlock } from './lock.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from './release.ts';
-import { compareVersions, removeOlderVersions, systemCommandLines, type CommandLines, type OlderVersion } from './superseded.ts';
+import {
+  compareVersions,
+  laneMaestrosOf,
+  removeOlderVersions,
+  systemCommandLines,
+  type CommandLines,
+  type LaneMaestros,
+  type OlderVersion,
+} from './superseded.ts';
 
 export interface Jdk {
   javaHome: string;
@@ -33,6 +41,7 @@ export interface InstallOptions {
   download?: Downloader;
   processes?: ProcessTable;
   commandLines?: CommandLines;
+  laneMaestros?: LaneMaestros;
   log?: (line: string) => void;
   lockWaitMs?: number;
 }
@@ -258,7 +267,7 @@ async function unpack(release: MaestroRelease, zip: string, into: string, jdk: J
 
 /**
  * Installs the pinned Maestro build on first use: download, check against the pinned sha256, unpack, check --version.
- * Then removes the older builds it installed that no running process uses.
+ * Then removes the older builds it installed that no running process or lane uses.
  */
 export async function ensureMaestro(options: InstallOptions): Promise<Installed> {
   const release = options.release ?? MAESTRO_RELEASE;
@@ -314,6 +323,7 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
       me,
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
+      laneMaestros: options.laneMaestros ?? laneMaestrosOf(options.env),
       log,
     });
     return { home, binary: binaryIn(home), version: release.version, installedNow: true, ms: Date.now() - started };

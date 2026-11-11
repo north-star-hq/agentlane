@@ -15,6 +15,10 @@ import {
   type Downloader,
 } from '../../src/driver/install.ts';
 import { describeMaestroBuild } from '../../src/up/doctor.ts';
+import { maestroShim } from '../../src/up/maestro-env.ts';
+import { FORMER, TOOL } from '../../src/name.ts';
+import { lanesRoot } from '../../src/registry/paths.ts';
+import { Store } from '../../src/registry/store.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from '../../src/driver/release.ts';
 import type { ProcessTable } from '../../src/processes.ts';
 import { tempDir } from '../support/fakes.ts';
@@ -75,6 +79,8 @@ function world() {
     XDG_STATE_HOME: path.join(root, 'state'),
     XDG_CONFIG_HOME: path.join(root, 'config'),
     AGENTLANE_STATE_DIR: path.join(root, 'state', 'agentlane'),
+    CLAUDE_CONFIG_DIR: path.join(root, 'claude'),
+    CODEX_HOME: path.join(root, 'codex'),
     JAVA_HOME: fakeJdk(root),
   };
   return { root, env };
@@ -304,6 +310,111 @@ test('a build a real running process was started from is kept', async () => {
   const again = build(path.join(root, 'again'), undefined, '9.9.10-agentenv.test');
   await ensureMaestro({ env, release: again.release, download: serving(again.dir) });
   assert.equal(fs.existsSync(a.home), false, 'once the process is gone the next install removes the build');
+});
+
+/** A lane recorded in the registry in `dir`, whose `bin/maestro` runs `binary`, as `up` writes it. */
+function laneUp(dir: string, id: string, binary: string): { end: () => void } {
+  const store = Store.open(dir, 5000);
+  try {
+    store.write(() => {
+      store.db
+        .prepare(
+          `INSERT INTO claims (id, token, owner_key, owner_kind, owner_pid, owner_start, owner_session, owner_thread,
+             project_root, worktree, created_at, last_used_at, last_action)
+           VALUES (?, 'token', ?, 'session', NULL, NULL, 's', NULL, '/w', '/w', 0, 0, 'up')`,
+        )
+        .run(id, `owner-${id}`);
+    });
+  } finally {
+    store.close();
+  }
+  const lane = path.join(lanesRoot(dir), id);
+  fs.mkdirSync(path.join(lane, 'bin'), { recursive: true });
+  fs.writeFileSync(
+    path.join(lane, 'bin', 'maestro'),
+    maestroShim({
+      maestro: binary,
+      device: 'UDID',
+      laneId: id,
+      evidence: path.join(lane, 'evidence'),
+      runs: path.join(lane, 'runs'),
+    }),
+    { mode: 0o755 },
+  );
+  return {
+    end: () => {
+      const ending = Store.open(dir, 5000);
+      try {
+        ending.write(() => {
+          ending.db.prepare('DELETE FROM claims WHERE id = ?').run(id);
+        });
+      } finally {
+        ending.close();
+      }
+    },
+  };
+}
+
+for (const registry of [TOOL, FORMER.tool]) {
+  test(`a build a lane recorded in the ${registry} registry runs is kept with no process running it, until the lane ends`, async () => {
+    const { root, env } = world();
+    const older = build(root, undefined, OLDER);
+    const a = await ensureMaestro({ env, release: older.release, download: serving(older.dir), commandLines: nobodyRunning });
+    const lane = laneUp(path.join(root, 'state', registry), '0a1b2c3d', a.binary);
+    const shim = path.join(lanesRoot(path.join(root, 'state', registry)), '0a1b2c3d', 'bin', 'maestro');
+    const current = build(root);
+    const lines: string[] = [];
+    await ensureMaestro({
+      env,
+      release: current.release,
+      download: serving(current.dir),
+      commandLines: nobodyRunning,
+      log: line => lines.push(line),
+    });
+    assert.equal(installedMaestro(env, older.release)?.binary, a.binary, lines.join('\n'));
+    assert.ok(lines.includes(`kept ${a.home}, which a lane that is up runs`), lines.join('\n'));
+    assert.equal(execFileSync(shim, ['--version'], { encoding: 'utf8' }).trim(), OLDER);
+
+    lane.end();
+    const later = build(path.join(root, 'later'), undefined, NEWER);
+    await ensureMaestro({ env, release: later.release, download: serving(later.dir), commandLines: nobodyRunning });
+    assert.equal(fs.existsSync(a.home), false, 'once the lane has ended the next install removes the build');
+  });
+}
+
+test('a registry that cannot be read keeps every build', async () => {
+  const { root, env } = world();
+  const older = build(root, undefined, OLDER);
+  const a = await ensureMaestro({ env, release: older.release, download: serving(older.dir), commandLines: nobodyRunning });
+  fs.mkdirSync(path.join(root, 'state', FORMER.tool), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', FORMER.tool, 'registry.sqlite'), 'not a database');
+  const current = build(root);
+  const lines: string[] = [];
+  await ensureMaestro({
+    env,
+    release: current.release,
+    download: serving(current.dir),
+    commandLines: nobodyRunning,
+    log: line => lines.push(line),
+  });
+  assert.equal(installedMaestro(env, older.release)?.binary, a.binary, lines.join('\n'));
+  assert.match(lines.join('\n'), /a registry could not say whether a lane uses them/);
+});
+
+test('an install removes a build of the former name and keeps a later build, across the two names', async () => {
+  const { root, env } = world();
+  const homes = new Map<string, string>();
+  for (const version of ['9.9.9-agentenv.3', '9.9.9-agentlane.2']) {
+    const served = build(path.join(root, version), undefined, version);
+    homes.set(
+      version,
+      (await ensureMaestro({ env, release: served.release, download: serving(served.dir), commandLines: () => undefined })).home,
+    );
+  }
+  const current = build(path.join(root, 'current'), undefined, '9.9.9-agentlane.1');
+  await ensureMaestro({ env, release: current.release, download: serving(current.dir), commandLines: nobodyRunning });
+  assert.equal(fs.existsSync(homes.get('9.9.9-agentenv.3') ?? ''), false);
+  assert.equal(fs.existsSync(homes.get('9.9.9-agentlane.2') ?? ''), true);
 });
 
 test('AGENTLANE_JAVA_HOME names the JDK 17 ahead of a JAVA_HOME of another version', async () => {

@@ -10,9 +10,11 @@ import { dataDir, namedDataDir, sha256Of } from '../driver/install.ts';
 import { tryLock, unlock } from '../driver/lock.ts';
 import {
   compareVersions,
+  laneMaestrosOf,
   removeOlderVersions,
   systemCommandLines,
   type CommandLines,
+  type LaneMaestros,
   type OlderVersion,
 } from '../driver/superseded.ts';
 import { CLI, envName, TOOL } from '../name.ts';
@@ -47,6 +49,7 @@ export interface BrowserInstallOptions {
   fetch?: Fetcher;
   processes?: ProcessTable;
   commandLines?: CommandLines;
+  laneMaestros?: LaneMaestros;
   log?: (line: string) => void;
   lockWaitMs?: number;
 }
@@ -93,7 +96,7 @@ function agentBrowserHome(env: NodeJS.ProcessEnv, release: AgentBrowserRelease):
   return path.join(dataDir(env), 'agent-browser', release.version);
 }
 
-export function browserFolder(build: Pick<BrowserBuild, 'name' | 'revision'>): string {
+export function browserFolder(build: { name: string; revision: string }): string {
   return `${build.name.replaceAll('-', '_')}-${build.revision}`;
 }
 
@@ -395,10 +398,28 @@ function installedFolders(parent: string): string[] {
   }
 }
 
-function olderPackages(parent: string, version: string): OlderVersion[] {
+function packagesBy(parent: string, version: string, order: (compared: number) => boolean): string[] {
   return installedFolders(parent)
-    .filter(name => readMarker(path.join(parent, name))?.version === name && compareVersions(name, version) < 0)
-    .map(name => ({ dir: path.join(parent, name) }));
+    .filter(name => readMarker(path.join(parent, name))?.version === name && order(compareVersions(name, version)))
+    .map(name => path.join(parent, name));
+}
+
+/** The browser folders a playwright-core runs, by its `browsers.json`; undefined when that can't be read. */
+function pinnedBrowsers(core: string, base: string): string[] | undefined {
+  try {
+    const pins = (
+      JSON.parse(fs.readFileSync(path.join(core, 'package', 'browsers.json'), 'utf8')) as {
+        browsers: { name: string; revision: string; revisionOverrides?: Record<string, string> }[];
+      }
+    ).browsers;
+    return pins.flatMap(pin =>
+      [pin.revision, ...Object.values(pin.revisionOverrides ?? {})].map(revision =>
+        path.join(base, browserFolder({ name: pin.name, revision })),
+      ),
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 function olderBrowsers(base: string, builds: readonly BrowserBuild[]): OlderVersion[] {
@@ -423,7 +444,7 @@ function linkPlaywright(base: string, core: string): void {
 
 /**
  * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
- * Then removes the older versions it installed that no running process uses.
+ * Then removes the older versions it installed that no running process, lane or kept version uses.
  */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
@@ -483,20 +504,30 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
     }
     const after = installState(options.env, driver, releases);
     if (after.kind !== 'installed') throw new DriverError(describeInstallState(driver, after), `retry ${INSTALL_FIX}`);
-    const older = olderPackages(path.dirname(core), playwright.version);
-    if (options.env[BROWSERS_OVERRIDE_ENV] === undefined)
-      older.push(...olderBrowsers(browsersPath(options.env), playwright.browsers));
-    if (driver === 'agent-browser')
-      older.push(...olderPackages(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version));
+    const base = browsersPath(options.env);
+    const cores = path.dirname(core);
+    const browsers = options.env[BROWSERS_OVERRIDE_ENV] === undefined ? olderBrowsers(base, playwright.browsers) : [];
+    const all = browsers.map(b => b.dir);
+    const newer = packagesBy(cores, playwright.version, order => order > 0).map(dir => pinnedBrowsers(dir, base) ?? all);
+    const older: OlderVersion[] = [
+      ...packagesBy(cores, playwright.version, order => order < 0).map(dir => ({ dir, needs: pinnedBrowsers(dir, base) ?? all })),
+      ...(driver === 'agent-browser'
+        ? packagesBy(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version, order => order < 0).map(
+            dir => ({ dir, needs: all }),
+          )
+        : []),
+      ...browsers.filter(b => !newer.flat().includes(b.dir)),
+    ];
     const removed = removeOlderVersions(older, {
       root: namedDataDir(options.env),
       me,
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
+      laneMaestros: options.laneMaestros ?? laneMaestrosOf(options.env),
       log: options.log ?? (() => undefined),
     });
-    for (const dir of removed.filter(d => path.dirname(d) === path.dirname(core))) {
-      fs.rmSync(linkOf(browsersPath(options.env), path.join(dir, 'package')), { force: true });
+    for (const dir of removed.filter(d => path.dirname(d) === cores)) {
+      fs.rmSync(linkOf(base, path.join(dir, 'package')), { force: true });
     }
     return after.driver;
   } finally {
