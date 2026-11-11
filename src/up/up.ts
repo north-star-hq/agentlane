@@ -494,7 +494,7 @@ async function deviceSteps(
       async () => {
         registry.touch(ctx.ref, 'up: driver');
         try {
-          await deps.startDriver(lane, stateDir(deps.env));
+          await deps.startDriver(lane, stateDir(deps.env), (await deps.toolchain.findJava17(deps.env))?.home);
           return 'started; the first look is warm';
         } catch (error) {
           return `not started (${(error instanceof Error ? error.message : String(error)).split('\n')[0] ?? ''}); the first look starts it`;
@@ -569,7 +569,7 @@ function describeResources(made: { created: string[]; kept: string[] }): string 
 }
 
 export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> {
-  const deps = rememberAnswers(given);
+  const { deps, forgetDeviceStates } = rememberAnswers(given);
   const started = deps.clock.now();
   const run = new Run(deps);
   const start = options.worktree ?? deps.cwd;
@@ -763,6 +763,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     const fresh = registry.find(owner, folder.worktree);
     if (!fresh) throw new Error(`lane ${lane.id} ended while up was running`);
     registry.touch(ctx.ref, 'up: doctor');
+    forgetDeviceStates();
     const doctor = await run.step(
       'doctor',
       () =>

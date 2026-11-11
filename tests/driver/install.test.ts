@@ -4,16 +4,20 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import { resolveToolchain } from '../../src/driver/client.ts';
 import { DriverError } from '../../src/driver/errors.ts';
 import {
   distributionVersion,
   ensureMaestro,
   findJdk17,
   installedMaestro,
+  MAESTRO_OVERRIDE_ENV,
   maestroBuild,
   maestroHome,
   type Downloader,
 } from '../../src/driver/install.ts';
+import { JAVA_HOME_ENV } from '../../src/hooks/env.ts';
+import type { Lane } from '../../src/registry/types.ts';
 import { describeMaestroBuild } from '../../src/up/doctor.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from '../../src/driver/release.ts';
 import { tempDir } from '../support/fakes.ts';
@@ -263,4 +267,16 @@ test('doctor names the Maestro the driver runs, and a local build reads as not t
     describeMaestroBuild(none).startsWith(`the pinned release ${MAESTRO_RELEASE.version}, not installed yet`),
     describeMaestroBuild(none),
   );
+});
+
+test('the driver starts on a JDK its caller already found, and searches for one only when given none', async () => {
+  const root = fs.realpathSync(tempDir('jdk'));
+  const found = fakeJdk(root);
+  const target = {
+    stateDir: root,
+    lane: {} as Lane,
+    env: { [MAESTRO_OVERRIDE_ENV]: '/fake/maestro', [JAVA_HOME_ENV]: path.join(root, 'nothing') },
+  };
+  assert.deepEqual(await resolveToolchain({ ...target, javaHome: found }), { maestro: '/fake/maestro', javaHome: found });
+  await assert.rejects(resolveToolchain(target), /has no working bin\/java/);
 });

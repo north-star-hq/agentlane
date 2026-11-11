@@ -67,7 +67,7 @@ const states = (sim: FakeSim) => sim.calls.filter(c => c.startsWith('device '));
 
 test('a simulator booted through the remembered tools reads back Booted, and its state is asked again only then', async () => {
   const { deps: given, sim } = deps();
-  const remembered = rememberAnswers(given);
+  const remembered = rememberAnswers(given).deps;
   const tools = remembered.sim;
   assert.ok(tools);
   assert.equal((await tools.device(UDID))?.state, 'Shutdown');
@@ -83,25 +83,70 @@ test('a simulator booted through the remembered tools reads back Booted, and its
   assert.equal(states(sim).length, 4);
 });
 
-test('a device the remembered backend creates makes the simulator state be asked again', async () => {
-  const { deps: given, sim } = deps();
-  const remembered = rememberAnswers(given);
+const CREATED = '7B0E1F22-3C4D-4E5F-8A9B-0C1D2E3F4A5B';
+
+test('a device the remembered backend creates is there for the next step that reads it', async () => {
+  const { deps: given, sim, devices } = deps();
+  const create = devices.create.bind(devices);
+  devices.create = (name, spec) => {
+    create(name, spec);
+    sim.addDevice(CREATED, 'Shutdown', name);
+    return CREATED;
+  };
+  const remembered = rememberAnswers(given).deps;
   const tools = remembered.sim;
   const backend = remembered.devices.ios;
   assert.ok(tools && backend);
-  await tools.device(UDID);
-  const id = backend.create('pool-1', backend.resolveSpec({}));
-  assert.ok(
-    backend.list().some(d => d.id === id),
-    'the list after a create shows the new device',
-  );
-  await tools.device(UDID);
+  assert.equal(await tools.device(CREATED), undefined);
+  assert.equal(backend.create('pool-1', backend.resolveSpec({})), CREATED);
+  assert.equal((await tools.device(CREATED))?.state, 'Shutdown');
+});
+
+test('a device create that finishes later still makes the state read during it be asked again', async () => {
+  const { deps: given, sim, devices } = deps();
+  const { promise: created, resolve: finish } = Promise.withResolvers<undefined>();
+  devices.create = ((name: string) =>
+    created.then(() => {
+      sim.addDevice(CREATED, 'Shutdown', name);
+      return CREATED;
+    })) as unknown as typeof devices.create;
+  const remembered = rememberAnswers(given).deps;
+  const tools = remembered.sim;
+  const backend = remembered.devices.ios;
+  assert.ok(tools && backend);
+  const creating = backend.create('pool-1', backend.resolveSpec({})) as unknown as Promise<string>;
+  assert.equal(await tools.device(CREATED), undefined);
+  finish(undefined);
+  assert.equal(await creating, CREATED);
+  assert.equal((await tools.device(CREATED))?.state, 'Shutdown');
+});
+
+test('a backend member the remembered backend does not know passes through to the backend', () => {
+  const { deps: given, devices } = deps();
+  const extra = Object.assign(devices, { disk: (id: string) => `disk of ${id}` });
+  const backend = rememberAnswers({ ...given, devices: { ios: extra } }).deps.devices.ios as typeof extra | undefined;
+  assert.equal(backend?.disk(UDID), `disk of ${UDID}`);
+  assert.equal(backend.platform, 'ios');
+});
+
+test("forgetting the devices' states makes the next read ask again, so it sees a simulator that stopped since", async () => {
+  const { deps: given, sim } = deps();
+  const { deps: remembered, forgetDeviceStates } = rememberAnswers(given);
+  const tools = remembered.sim;
+  assert.ok(tools);
+  assert.equal((await tools.device(OTHER_UDID))?.state, 'Booted');
+  const info = sim.devices.get(OTHER_UDID)?.info;
+  assert.ok(info);
+  info.state = 'Shutdown';
+  assert.equal((await tools.device(OTHER_UDID))?.state, 'Booted');
+  forgetDeviceStates();
+  assert.equal((await tools.device(OTHER_UDID))?.state, 'Shutdown');
   assert.equal(states(sim).length, 2);
 });
 
 test('a remembered answer is a copy, so a caller changing it does not change what the next caller reads', async () => {
   const { deps: given } = deps();
-  const tools = rememberAnswers(given).sim;
+  const tools = rememberAnswers(given).deps.sim;
   assert.ok(tools);
   const first = await tools.device(UDID);
   assert.ok(first);
@@ -112,7 +157,7 @@ test('a remembered answer is a copy, so a caller changing it does not change wha
 test('device specs, the Xcode version and the Java search are asked once per up, and again by the next up', async () => {
   const { deps: given, asked, devices } = deps();
   for (let run = 0; run < 2; run++) {
-    const remembered = rememberAnswers(given);
+    const remembered = rememberAnswers(given).deps;
     const backend = remembered.devices.ios;
     assert.ok(backend);
     assert.deepEqual(backend.resolveSpec({}), devices.resolveSpec({}));
@@ -139,7 +184,7 @@ test('a question that failed is asked again rather than remembered', async () =>
         return calls === 1 ? Promise.reject(new Error('xcodebuild -version failed')) : Promise.resolve('Xcode 26.6');
       },
     },
-  });
+  }).deps;
   await assert.rejects(remembered.toolchain.xcodeVersion(), /failed/);
   assert.equal(await remembered.toolchain.xcodeVersion(), 'Xcode 26.6');
   assert.equal(calls, 2);

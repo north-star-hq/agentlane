@@ -29,6 +29,8 @@ export interface EngineTarget {
   progress?: (line: string) => void;
   /** Skips the install and JDK lookup; for tests. */
   toolchain?: Toolchain;
+  /** A JDK 17 home the caller already found, which skips the JDK lookup. */
+  javaHome?: string;
   /** Engine timings; for tests. `idleMs` overrides the Mac's driver.json. */
   tuning?: Pick<EngineConfig, 'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'>;
   /** For judging whether a release in progress still runs; the system's process table when absent. */
@@ -117,13 +119,16 @@ function send(paths: EnginePaths, request: EngineRequest, timeoutMs: number): Pr
   });
 }
 
-async function resolveToolchain(target: EngineTarget): Promise<Toolchain> {
+export async function resolveToolchain(target: EngineTarget): Promise<Toolchain> {
   if (target.toolchain) return target.toolchain;
-  const jdk = await findJdk17(target.env);
+  const javaHome = target.javaHome ?? (await findJdk17(target.env)).javaHome;
   const override = target.env[MAESTRO_OVERRIDE_ENV];
-  if (override) return { maestro: override, javaHome: jdk.javaHome };
-  const installed = await ensureMaestro({ env: target.env, ...(target.progress ? { log: target.progress } : {}) });
-  return { maestro: installed.binary, javaHome: jdk.javaHome };
+  if (override) return { maestro: override, javaHome };
+  const installed = await ensureMaestro({
+    env: target.javaHome === undefined ? target.env : { ...target.env, JAVA_HOME: javaHome },
+    ...(target.progress ? { log: target.progress } : {}),
+  });
+  return { maestro: installed.binary, javaHome };
 }
 
 function refOf(lane: Lane): { id: string; token: string } {

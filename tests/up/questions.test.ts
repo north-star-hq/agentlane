@@ -89,7 +89,16 @@ function counting(t: TestContext, w: World): { deps: EnvDeps; events: string[] }
     return shutdown(udid);
   };
   return {
-    deps: { ...base, env: { ...base.env, AGENTLANE_MAESTRO: '/fake/maestro' }, devices, toolchain: countedTools },
+    deps: {
+      ...base,
+      env: { ...base.env, AGENTLANE_MAESTRO: '/fake/maestro' },
+      devices,
+      toolchain: countedTools,
+      startDriver: (lane, stateDir, javaHome) => {
+        events.push(`driver on ${javaHome ?? 'a JDK it searches for'}`);
+        return base.startDriver(lane, stateDir, javaHome);
+      },
+    },
     events,
   };
 }
@@ -108,17 +117,21 @@ function stretches(events: readonly string[]): Record<string, number>[] {
 
 const DRIVEN = { ...CONFIG, driver: { flows: '.maestro' } };
 
-test("one up on iOS asks each question of the system once, the simulator's state again only after it boots it, and the device list once in each of the claim's two transactions", async t => {
+const ONE_LIST_PER_TRANSACTION =
+  "a new lane's claim lists devices once in each of its two registry transactions: a listing reused across the released write lock would hide other processes' changes";
+
+test("one up on iOS asks each question of the system once, the simulator's state again after it boots it and for the closing doctor, and the device list once in each of the claim's two transactions", async t => {
   const w = world(t);
   w.write(DRIVEN);
   const { deps, events } = counting(t, w);
   const result = await up(deps, OPTIONS);
   assert.equal(result.doctor.ok, true, failures(result));
   assert.equal(result.build?.source, 'build');
+  assert.equal(counts(events)['device list'], 2, ONE_LIST_PER_TRANSACTION);
   assert.deepEqual(counts(events), {
     runtimes: 1,
     'device list': 2,
-    'simulator state': 2,
+    'simulator state': 3,
     'xcodebuild -version': 1,
     'java search': 1,
     'read app.json': 1,
@@ -127,10 +140,37 @@ test("one up on iOS asks each question of the system once, the simulator's state
     events.filter(e => CHANGES.has(e)),
     ['create', 'boot'],
   );
-  assert.deepEqual(stretches(events), [{ 'device list': 2 }, { 'simulator state': 1 }, { 'simulator state': 1 }]);
+  assert.deepEqual(stretches(events), [{ 'device list': 2 }, { 'simulator state': 1 }, { 'simulator state': 2 }]);
+  assert.deepEqual(
+    events.filter(e => e.startsWith('driver on ')),
+    ['driver on /jdk17'],
+  );
 });
 
-test('a second up on iOS, which changes no device, asks each question once', async t => {
+test("the closing doctor reads the simulator's state again, so it reports a simulator that stopped after the launch", async t => {
+  const w = world(t);
+  w.write(DRIVEN);
+  const { deps, events } = counting(t, w);
+  let readsBeforeStop = 0;
+  const result = await up(
+    {
+      ...deps,
+      startDriver: lane => {
+        readsBeforeStop = counts(events)['simulator state'] ?? 0;
+        const info = w.sim.devices.get(lane.device?.id ?? '')?.info;
+        assert.ok(info, 'the lane holds a simulator');
+        info.state = 'Shutdown';
+        return Promise.resolve();
+      },
+    },
+    OPTIONS,
+  );
+  assert.equal(result.doctor.ok, false);
+  assert.match(result.doctor.checks.find(c => c.name === 'device')?.detail ?? '', /is Shutdown$/);
+  assert.equal(counts(events)['simulator state'], readsBeforeStop + 1);
+});
+
+test("a second up on iOS, which changes no device, asks each question once, and the simulator's state again for the closing doctor", async t => {
   const w = world(t);
   w.write(DRIVEN);
   await up(counting(t, w).deps, OPTIONS);
@@ -141,7 +181,7 @@ test('a second up on iOS, which changes no device, asks each question once', asy
   assert.deepEqual(counts(events), {
     runtimes: 1,
     'device list': 1,
-    'simulator state': 1,
+    'simulator state': 2,
     'xcodebuild -version': 1,
     'java search': 1,
     'read app.json': 1,
@@ -163,6 +203,7 @@ test("one up on Android asks each question of the system once, and the device li
   const result = await up(deps, { ...OPTIONS, platform: 'android' });
   assert.equal(result.doctor.ok, true, failures(result));
   assert.equal(result.build?.source, 'build');
+  assert.equal(counts(events)['device list'], 2, ONE_LIST_PER_TRANSACTION);
   assert.deepEqual(counts(events), {
     runtimes: 1,
     'device list': 2,

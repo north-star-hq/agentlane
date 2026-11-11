@@ -136,11 +136,12 @@ async function main(args: string[]): Promise<number> {
         sim,
         system: realServiceSystem,
         toolchain: systemToolchain,
-        startDriver: async (lane, state) => {
+        startDriver: async (lane, state, javaHome) => {
           await prewarmEngine({
             stateDir: state,
             lane,
             env: process.env,
+            ...(javaHome === undefined ? {} : { javaHome }),
             progress: line => process.stderr.write(`${TOOL} up: driver: ${line}\n`),
           });
         },

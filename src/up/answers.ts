@@ -1,4 +1,4 @@
-import type { DeviceBackend, DeviceSpec, Platform } from '../devices/backend.ts';
+import type { DeviceBackend, DeviceSpec, Platform, SpecRequest } from '../devices/backend.ts';
 import type { DeviceInfo, SimTools } from '../devices/tools.ts';
 import { JAVA_HOME_ENV } from '../hooks/env.ts';
 import type { EnvDeps } from './deps.ts';
@@ -42,23 +42,27 @@ function rememberBackend(backend: DeviceBackend, changed: () => void): DeviceBac
     <A extends unknown[], R>(act: (...args: A) => R) =>
     (...args: A): R => {
       changed();
+      let result: R;
       try {
-        return act(...args);
-      } finally {
+        result = act(...args);
+      } catch (error) {
         changed();
+        throw error;
       }
+      if (result instanceof Promise) return result.finally(changed) as R;
+      changed();
+      return result;
     };
-  return {
-    platform: backend.platform,
-    resolveSpec: request => {
-      const key = JSON.stringify([request.deviceType ?? null, request.runtime ?? null]);
-      const known = specs.get(key);
-      if (known) return { ...known };
-      const spec = backend.resolveSpec(request);
-      specs.set(key, spec);
-      return { ...spec };
-    },
-    list: () => backend.list(),
+  const resolveSpec = (request: SpecRequest): DeviceSpec => {
+    const key = JSON.stringify([request.deviceType ?? null, request.runtime ?? null]);
+    const known = specs.get(key);
+    if (known) return { ...known };
+    const spec = backend.resolveSpec(request);
+    specs.set(key, spec);
+    return { ...spec };
+  };
+  const remembered: Partial<DeviceBackend> = {
+    resolveSpec,
     create: changing((name: string, spec: DeviceSpec) => backend.create(name, spec)),
     delete: changing((id: string) => {
       backend.delete(id);
@@ -66,11 +70,15 @@ function rememberBackend(backend: DeviceBackend, changed: () => void): DeviceBac
     shutdown: changing((id: string) => {
       backend.shutdown(id);
     }),
-    boot: (id, consolePort) => {
-      changed();
-      return backend.boot(id, consolePort).finally(changed);
-    },
+    boot: changing((id: string, consolePort?: number) => backend.boot(id, consolePort)),
   };
+  return new Proxy(backend, {
+    get(target, property) {
+      if (Object.hasOwn(remembered, property)) return remembered[property as keyof DeviceBackend];
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
 }
 
 function rememberSim(sim: SimTools, devices: Remembered<DeviceInfo | undefined>): SimTools {
@@ -99,19 +107,27 @@ function rememberSim(sim: SimTools, devices: Remembered<DeviceInfo | undefined>)
   });
 }
 
-export function rememberAnswers(deps: EnvDeps): EnvDeps {
+export interface Answers {
+  deps: EnvDeps;
+  forgetDeviceStates: () => void;
+}
+
+export function rememberAnswers(given: EnvDeps): Answers {
   const sims = new Remembered<DeviceInfo | undefined>();
-  const changed = () => {
+  const forgetDeviceStates = () => {
     sims.forget();
   };
   const devices: Partial<Record<Platform, DeviceBackend>> = {};
-  for (const [platform, backend] of Object.entries(deps.devices) as [Platform, DeviceBackend][]) {
-    devices[platform] = rememberBackend(backend, changed);
+  for (const [platform, backend] of Object.entries(given.devices) as [Platform, DeviceBackend][]) {
+    devices[platform] = rememberBackend(backend, forgetDeviceStates);
   }
   return {
-    ...deps,
-    toolchain: rememberToolchain(deps.toolchain),
-    devices,
-    sim: deps.sim && rememberSim(deps.sim, sims),
+    deps: {
+      ...given,
+      toolchain: rememberToolchain(given.toolchain),
+      devices,
+      sim: given.sim && rememberSim(given.sim, sims),
+    },
+    forgetDeviceStates,
   };
 }
