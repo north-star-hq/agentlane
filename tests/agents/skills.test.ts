@@ -136,6 +136,18 @@ test('setup says where a background build’s output goes, and create-verificati
   assert.match(create, /the project's dependencies are installed \(`test -d node_modules`, `before: build`/);
 });
 
+test('dev-loop and drive tell the agent to hold its lane with keep when it hands the running app to the user, and to say so in its message', () => {
+  const body = (name: string) => listSkills().find(s => s.name === name)?.body ?? '';
+  for (const name of ['dev-loop', 'drive']) {
+    assert.match(body(name), /hand the running app to the user to look at|leave the app running for the user to look at/, name);
+    assert.match(body(name), /`node_modules\/\.bin\/agentlane keep --for 2h --reason "<who is looking at what>"`/, name);
+    assert.match(body(name), /Say in your message that the lane is held and until when/, name);
+    assert.match(body(name), /parked 30 minutes after (your|its) last call/, name);
+  }
+  assert.match(body('dev-loop'), /The loop is done when you have run `release` in your folder, or held the lane with `keep`/);
+  assert.doesNotMatch(body('dev-loop'), /can be taken over/);
+});
+
 test('create- and maintain-verification-skill treat a wait that never matches in a sign-in or setup flow as a defect', () => {
   const body = (name: string) => listSkills().find(s => s.name === name)?.body ?? '';
   const create = body('create-verification-skill');
