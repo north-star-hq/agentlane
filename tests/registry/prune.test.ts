@@ -307,6 +307,30 @@ test('a pool device already gone loses only its record, a booted one is shut dow
   }
 });
 
+test('a free pool device simctl lists as neither booted nor shut down is shown as starting or stopping, and shut down before it is deleted', () => {
+  const w = world();
+  try {
+    const booting = w.devices.addByHand('agent-env-pool-0000dd', false);
+    formerDevice(w.dir, 'ios', 'agent-env-pool-0000dd', booting);
+    const listsBooting = over(w.devices, {
+      list: () => w.devices.list().map(d => (d.id === booting ? { ...d, booted: false, stopped: false } : d)),
+    });
+    const r = w.registry({ devices: { ios: listsBooting } });
+    const listing = r.prunable();
+    assert.deepEqual(
+      listing.free.map(d => [d.name, d.state]),
+      [['agent-env-pool-0000dd', 'changing']],
+    );
+    assert.deepEqual(
+      pruneAll(r, listing).map(x => [x.device.name, x.outcome]),
+      [['agent-env-pool-0000dd', 'deleted']],
+    );
+    assert.deepEqual(w.devices.calls, [`shutdown ${booting}`, `delete ${booting}`]);
+  } finally {
+    w.close();
+  }
+});
+
 interface Cli {
   root: string;
   env: NodeJS.ProcessEnv;
@@ -1156,6 +1180,86 @@ test('a 0.2.x lane found at either locked check gets back the copy an earlier pr
   }
 });
 
+function commitFailsOnce<T>(run: () => T): T {
+  const exec = Object.getOwnPropertyDescriptor(DatabaseSync.prototype, 'exec')?.value as (
+    this: DatabaseSync,
+    sql: string,
+  ) => void;
+  let armed = true;
+  DatabaseSync.prototype.exec = function (this: DatabaseSync, sql: string) {
+    if (armed && sql === 'COMMIT') {
+      armed = false;
+      throw new Error('database or disk is full');
+    }
+    exec.call(this, sql);
+  };
+  try {
+    const result = run();
+    assert.equal(armed, false, 'no COMMIT ran');
+    return result;
+  } finally {
+    DatabaseSync.prototype.exec = exec;
+  }
+}
+
+test('a prune whose lock fails to commit after it took a copy for removal still deletes it, and says so', () => {
+  const c = cli();
+  try {
+    const { share, downloads } = formerFolders(c);
+    write(c.former, () => undefined);
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+    const steps = moveLeftoversAside(c.ctx, c.report().leftovers);
+    asideOf(steps, downloads);
+    const results = commitFailsOnce(() => finishLeftovers(c.ctx, steps));
+    assert.deepEqual(
+      results.map(r => [r.leftover.path, r.outcome, r.detail]),
+      [[downloads, 'deleted', null]],
+    );
+    assert.deepEqual(fs.readdirSync(share), []);
+  } finally {
+    c.close();
+  }
+});
+
+test('a prune whose lock fails to commit after it moved a copy aside goes on to delete it', () => {
+  const c = cli();
+  try {
+    const { share, downloads } = formerFolders(c);
+    write(c.former, () => undefined);
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+    const steps = commitFailsOnce(() => moveLeftoversAside(c.ctx, c.report().leftovers));
+    asideOf(steps, downloads);
+    assert.deepEqual(
+      finishLeftovers(c.ctx, steps).map(r => [r.leftover.path, r.outcome, r.detail]),
+      [[downloads, 'deleted', null]],
+    );
+    assert.deepEqual(fs.readdirSync(share), []);
+  } finally {
+    c.close();
+  }
+});
+
+test('a prune whose lock fails to commit after it put a copy back for a 0.2.x lane says it put it back', () => {
+  const c = cli();
+  try {
+    const { share, downloads } = formerFolders(c);
+    fill(path.join(downloads, 'maestro', 'x'), 1000);
+    const aside = asideOf(moveLeftoversAside(c.ctx, c.report().leftovers), downloads);
+    formerLane(c.former, new FakeProcesses().owner(), c.repo);
+    const listed = c.report();
+    assert.ok(listed.leftoversKept);
+    const results = commitFailsOnce(() => putBackAsideCopies(c.ctx, listed.leftovers));
+    assert.deepEqual(
+      results.map(r => [r.leftover.path, r.outcome, r.detail]),
+      [[aside, 'kept', `${listed.leftoversKept}; put back at ${downloads}`]],
+    );
+    assert.deepEqual(fs.readdirSync(share), ['agent-env']);
+    assert.ok(fs.existsSync(path.join(downloads, 'maestro', 'x')));
+  } finally {
+    c.close();
+  }
+});
+
 test('a copy is put back only where its real path is the one 0.2.x reads', () => {
   const c = cli();
   try {
@@ -1658,7 +1762,7 @@ test('prune keeps a simulator while this version shuts it down, deletes it to ma
 const CLAIMER = path.join(import.meta.dirname, '..', 'support', 'stress-claimer.ts');
 
 function readRegistry<T>(dir: string, read: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  const db = new DatabaseSync(databasePath(dir), { readOnly: true, timeout: 5000 });
   try {
     return read(db);
   } finally {

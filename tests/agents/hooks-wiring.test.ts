@@ -12,7 +12,7 @@ import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
 import { readHookInput } from '../../src/plugin/conventions.ts';
 import { runHookCommand } from '../../src/plugin/hook-cli.ts';
-import { writeHookMark } from '../../src/plugin/hook-mark.ts';
+import { readHookMark, writeHookMark } from '../../src/plugin/hook-mark.ts';
 import { systemProcesses } from '../../src/processes.ts';
 import type { Agent } from '../../src/registry/owner.ts';
 import { AGENTS } from '../../src/registry/owner.ts';
@@ -182,6 +182,13 @@ const SPLIT_NAMES = [
   'xcrun sim\\\nctl boot booted',
   'a\\\ndb shell',
   `bash -c "a\\\ndb shell"`,
+  'a$"db" shell',
+  'xcrun sim$"ctl" boot booted',
+  `bash -c 'a$"db" shell'`,
+  'a{d,}b shell',
+  'a{d..d}b shell',
+  'xcrun sim{c,}tl boot booted',
+  'e{nv,mulator} -avd x',
 ];
 
 const PLAIN = [
@@ -189,6 +196,12 @@ const PLAIN = [
   `printf 'a\\nb\\n' | grep -c "$HOME"`,
   'cd src\ngit diff -- "it\'s.ts"',
   "echo $'tab\\there' \\\n  && ls",
+  'mkdir -p src/{api,web}',
+  "jq '{name,version}' package.json",
+  'cp app.json{,.bak}',
+  "awk '{print $1, $2}' list.txt",
+  'node -e "console.log({a: 1, b: 2})"',
+  'echo {1..3}',
 ];
 
 test('the guard hooks init writes start no node process for a command with no device or browser tool in it', async () => {
@@ -256,11 +269,20 @@ const GUARDED_COMMANDS: Record<(typeof GUARDED_WORDS)[number], (name: string) =>
 };
 
 function splitsOf(word: string): string[] {
-  const cuts = ["''", '""', "$''", '\\', '\\\n'];
+  const cuts = ["''", '""', "$''", '$""', '\\', '\\\n', '{,}'];
   const at = Array.from({ length: word.length }, (_, i) => i);
   const between = at.slice(1).flatMap(i => cuts.map(cut => word.slice(0, i) + cut + word.slice(i)));
-  const around = at.map(i => `${word.slice(0, i)}$'${word.slice(i, i + 1)}'${word.slice(i + 1)}`);
-  return [...between, ...around];
+  const around = at.flatMap(i => {
+    const [before, c, after] = [word.slice(0, i), word.slice(i, i + 1), word.slice(i + 1)];
+    return [
+      `${before}$'${c}'${after}`,
+      `${before}$"${c}"${after}`,
+      `${before}{${c},}${after}`,
+      ...(/[A-Za-z0-9]/.test(c) ? [`${before}{${c}..${c}}${after}`] : []),
+    ];
+  });
+  const firstOfTwo = at.slice(2).map(i => `{${word.slice(0, i)},}${word.slice(i)}`);
+  return [...between, ...around, ...firstOfTwo];
 }
 
 /** The `case` statement that decides whether a guard hook starts the toolkit, and the variable it reads the input from. */
@@ -281,7 +303,7 @@ function encodingOf(shape: HookInputShape, cwd: string): (command: string) => st
   return command => JSON.stringify(shape(command, cwd)).slice(before.length, -after.length || undefined);
 }
 
-test('every way of splitting a guarded tool name with quotes, backslashes or line continuations passes all seven guard filters, in every input shape the agents send, under /bin/sh and /bin/dash', async () => {
+test('every way of splitting a guarded tool name with quotes, backslashes, line continuations or brace expansion passes all seven guard filters, in every input shape the agents send, under /bin/sh and /bin/dash', async () => {
   const f = fixture('hooks-split-names');
   try {
     const bare = GUARDED_WORDS.flatMap(word => splitsOf(word).map(split => GUARDED_COMMANDS[word](split)));
@@ -715,6 +737,7 @@ test('a mark left from a worktree nested in the project does not vouch for the p
       toolkit: bin,
       version: toolVersion(),
       probe: null,
+      node: fs.realpathSync(process.execPath),
     });
     const [line] = agentHookChecks(dir, ['codex'], f.env());
     assert.equal(line?.ok, false, line?.detail);
@@ -765,24 +788,93 @@ test('under pnpm’s layout, doctor fails a hook once the file the shim runs bre
   }
 });
 
-test('doctor fails a hook once a module the toolkit’s entry imports is removed after a good mark', async () => {
-  const f = fixture('hooks-entry-module');
+for (const [where, module] of [
+  ['in a folder below it', 'lib/dep.js'],
+  ['beside it', 'dep.js'],
+] as const) {
+  test(`doctor fails a hook once a module the toolkit’s entry imports ${where} is removed after a good mark`, async () => {
+    const f = fixture('hooks-entry-module');
+    try {
+      const dir = f.repo('app');
+      await init(dir, f.env(), '--agents', 'codex');
+      installToolkit(dir, path.join(f.root, 'calls.log'));
+      const entry = toolkitEntry(dir);
+      write(path.join(path.dirname(entry), module), 'export {};\n');
+      fs.writeFileSync(entry, `import './${module}';\n${fs.readFileSync(entry, 'utf8')}`);
+      const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+      assert.equal(check()?.ok, true, check()?.detail);
+      assert.match(check()?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /);
+
+      fs.rmSync(path.join(path.dirname(entry), module));
+      const broken = check();
+      assert.equal(broken?.ok, false, broken?.detail);
+      assert.match(broken.detail, /never reached the toolkit: it exited 1: /);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('doctor dates a folder a link in the toolkit’s folder points at without walking into it, and a link to its own folder ends the walk', async () => {
+  const f = fixture('hooks-entry-links');
   try {
     const dir = f.repo('app');
     await init(dir, f.env(), '--agents', 'codex');
-    installToolkit(dir, path.join(f.root, 'calls.log'));
-    const entry = toolkitEntry(dir);
-    const module = path.join(path.dirname(entry), 'lib/dep.js');
-    write(module, 'export {};\n');
-    fs.writeFileSync(entry, `import './lib/dep.js';\n${fs.readFileSync(entry, 'utf8')}`);
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const dist = path.dirname(toolkitEntry(dir));
+    const outside = path.join(f.root, 'outside');
+    write(path.join(outside, 'deep/file.js'), 'export {};\n');
+    fs.symlinkSync(outside, path.join(dist, 'outside'));
+    fs.symlinkSync('.', path.join(dist, 'self'));
     const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
     assert.equal(check()?.ok, true, check()?.detail);
-    assert.match(check()?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /);
+    const probes = calls(log).length;
 
-    fs.rmSync(module);
-    const broken = check();
-    assert.equal(broken?.ok, false, broken?.detail);
-    assert.match(broken.detail, /never reached the toolkit: it exited 1: /);
+    later(path.join(outside, 'deep/file.js'));
+    const line = check();
+    assert.match(line?.detail ?? '', /^the pre-tool-use hook in \.codex\/hooks\.json reached /, 'the walk went through a link');
+    assert.equal(calls(log).length, probes);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('doctor stops trusting a hook’s mark once the node the hook ran on changes or is gone', async () => {
+  const f = fixture('hooks-node');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const check = () => agentHookChecks(dir, ['codex'], f.env())[0];
+    assert.equal(check()?.ok, true, check()?.detail);
+    const mark = readHookMark(f.state, 'codex', dir);
+    assert.ok(mark);
+    assert.equal(mark.node, fs.realpathSync(process.execPath));
+
+    const node = path.join(f.root, 'node');
+    write(node, '');
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(node, hourAgo, hourAgo);
+    const markOn = (on: string | null) => {
+      writeHookMark(f.state, { ...mark, node: on });
+    };
+    const answered = (what: string) => {
+      const before = calls(log).length;
+      assert.equal(check()?.ok, true, check()?.detail);
+      return calls(log).length === before ? 'the mark' : `a run (${what})`;
+    };
+    markOn(node);
+    assert.equal(answered('an unchanged node'), 'the mark');
+    later(node);
+    markOn(node);
+    assert.equal(answered('a node changed after the mark'), 'a run (a node changed after the mark)');
+    fs.rmSync(node);
+    markOn(node);
+    assert.equal(answered('a node gone since the mark'), 'a run (a node gone since the mark)');
+    markOn(null);
+    assert.equal(answered('a mark that names no node'), 'a run (a mark that names no node)');
   } finally {
     f.cleanup();
   }
@@ -813,6 +905,7 @@ test('a mark left by another toolkit does not vouch for the project’s hook', a
       toolkit: toolkitEntry(other),
       version: toolVersion(),
       probe: null,
+      node: fs.realpathSync(process.execPath),
     });
     const [line] = agentHookChecks(dir, ['codex'], f.env());
     assert.equal(line?.ok, false, line?.detail);

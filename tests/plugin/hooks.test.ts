@@ -3,11 +3,13 @@ import type { ChildProcess } from 'node:child_process';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { HookDeps } from '../../src/plugin/hook-cli.ts';
 import { runHookCommand, SESSION_END_OWNER_ENV } from '../../src/plugin/hook-cli.ts';
 import { claudeSessionName } from '../../src/plugin/session-name.ts';
 import { identityOf, systemProcesses } from '../../src/processes.ts';
+import { databasePath } from '../../src/registry/paths.ts';
 import { tcpProbe } from '../../src/registry/ports.ts';
 import { laneDir, lastCallFile } from '../../src/up/lane-files.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
@@ -232,7 +234,7 @@ test('session-end --codex releases the ended thread’s lanes by the hook’s se
   }
 });
 
-test('the plugin’s session-end hook hands the release to a detached worker and returns within a second', async () => {
+test('the plugin’s session-end hook hands the release to a detached worker and returns within Claude Code’s budget, taking little longer than a hook that returns at once', async () => {
   const s = setup('hook-detached');
   const me = sleeper();
   try {
@@ -243,16 +245,32 @@ test('the plugin’s session-end hook hands the release to a detached worker and
     fs.mkdirSync(path.dirname(bin), { recursive: true });
     fs.writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${CLI}" "$@"\n`);
     fs.chmodSync(bin, 0o755);
-    const started = Date.now();
-    const result = spawnSync(path.join(ROOT, 'plugin', 'scripts', 'hook.sh'), ['session-end'], {
-      cwd: project,
-      input: JSON.stringify({ hook_event_name: 'SessionEnd', reason: 'other' }),
-      encoding: 'utf8',
-      env: hermeticEnv(s.root, { AGENTLANE_STATE_DIR: s.stateDir, CLAUDE_PROJECT_DIR: project, ...env }),
-    });
-    const hookMs = Date.now() - started;
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stderr, /releasing 1 lane\(s\) .* in the background/);
+    const sessionEnd = (reason: string) => {
+      const started = Date.now();
+      const result = spawnSync(path.join(ROOT, 'plugin', 'scripts', 'hook.sh'), ['session-end'], {
+        cwd: project,
+        input: JSON.stringify({ hook_event_name: 'SessionEnd', reason }),
+        encoding: 'utf8',
+        env: hermeticEnv(s.root, { AGENTLANE_STATE_DIR: s.stateDir, CLAUDE_PROJECT_DIR: project, ...env }),
+        timeout: 10_000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return { stderr: result.stderr, ms: Date.now() - started };
+    };
+    sessionEnd('clear');
+    const atOnce = sessionEnd('clear');
+    assert.equal(atOnce.stderr, '');
+    const db = new DatabaseSync(databasePath(s.stateDir), { timeout: 5000 });
+    db.exec('BEGIN IMMEDIATE');
+    let hook: { stderr: string; ms: number };
+    try {
+      hook = sessionEnd('other');
+      assert.match(hook.stderr, /releasing 1 lane\(s\) .* in the background/);
+      assert.deepEqual(laneIds(s), [project], 'the hook released the lane itself, or waited for the worker');
+    } finally {
+      db.exec('COMMIT');
+      db.close();
+    }
     const log = path.join(s.stateDir, 'session-end.log');
     const released = () => /released lane \w+ of process/.test(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '');
     const deadline = Date.now() + 10_000;
@@ -260,8 +278,12 @@ test('the plugin’s session-end hook hands the release to a detached worker and
     assert.deepEqual(laneIds(s), []);
     assert.match(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '(no log)', /released lane \w+ of process/);
     assert.ok(
-      hookMs < 1_000,
-      `the hook returned in ${String(hookMs)} ms; Claude Code gives a plugin's session-end hook ${String(PLUGIN_SESSION_END_BUDGET_MS)} ms`,
+      hook.ms < PLUGIN_SESSION_END_BUDGET_MS,
+      `the hook returned in ${String(hook.ms)} ms; Claude Code gives a plugin's session-end hook ${String(PLUGIN_SESSION_END_BUDGET_MS)} ms`,
+    );
+    assert.ok(
+      hook.ms - atOnce.ms < 500,
+      `the hook took ${String(hook.ms)} ms, ${String(hook.ms - atOnce.ms)} ms longer than one that returns at once`,
     );
   } finally {
     me.kill('SIGKILL');

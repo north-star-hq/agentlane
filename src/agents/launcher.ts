@@ -28,9 +28,10 @@ export const GUARDED_WORDS = [
 
 /**
  * The hook's input arrives as JSON, which writes a backslash as `\\` and a newline as `\n`, and Copilot's `toolArgs` is
- * JSON inside that JSON, which doubles each of those backslashes again.
+ * JSON inside that JSON, which doubles each of those backslashes again. Bash and zsh run `a{d,}b` as `adb ab` and
+ * `a{d..d}b` as `adb`.
  */
-export const UNSPLIT_SED = String.raw`sed -e h -e 's/\\\\//g' -e 's/\\n//g' -e x -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e G -e 's/\\//g' -e "s/[\$'\"]//g"`;
+export const UNSPLIT_SED = String.raw`sed -e h -e 's/\\\\//g' -e 's/\\n//g' -e x -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e G -e 's/\\//g' -e "s/[\$'\"]//g" -e p -e :x -e h -e 's/{\([-+0-9A-Za-z]*\)\.\.[-+0-9A-Za-z.]*}/\1/g' -e 's/{\([^{},]*\)\(,[^{},]*\)\{0,8\}}/\1/g' -e p -e g -e ty -e :y -e 's/{[^{},]*,\([^{},]*\(,[^{},]*\)\{0,7\}\)}/{\1}/g' -e tx -e d`;
 
 const UNSPLIT_INPUT = `$(printf %s "$i" | ${UNSPLIT_SED})`;
 

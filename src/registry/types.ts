@@ -177,7 +177,10 @@ export type DeviceState = 'booted' | 'shutdown' | 'missing' | 'unknown';
 export type ProcessState = 'running' | 'gone' | 'unknown';
 
 export interface ProcessStatus extends ServiceProcess {
-  /** gone when no process has this pid, or another process has taken it since. */
+  /**
+   * running while a process with this pid and the recorded start time runs; gone when no process has this pid, or
+   * another process has taken it since; unknown when ps could not tell.
+   */
   state: ProcessState;
 }
 

@@ -11,9 +11,11 @@ import {
   ensureMaestro,
   findJdk17,
   installedMaestro,
+  JAVA_HOME_TOOL,
   MAESTRO_OVERRIDE_ENV,
   maestroBuild,
   maestroHome,
+  registeredJdk17,
   type Downloader,
   type JdkSearch,
 } from '../../src/driver/install.ts';
@@ -471,6 +473,56 @@ test('a JAVA_HOME of another version or with no java is passed over, and named w
     }),
     /no JDK 17 found \(JAVA_HOME=.*nothing has no working bin\/java\)/,
   );
+});
+
+/** A java_home that, like macOS's, prints the default JDK when no JDK 17 is registered, unless it is passed -F. */
+function fakeJavaHome(root: string, registered: string | null, fallback: string): string {
+  const tool = path.join(root, `java_home-${registered === null ? 'none' : 'jdk17'}`);
+  const none = `echo 'Unable to find any JVMs matching version "17".' >&2\ncase " $* " in *" -F "*) exit 1 ;; esac\necho "${fallback}"`;
+  fs.writeFileSync(tool, `#!/bin/sh\n${registered === null ? none : `echo "${registered}"`}\n`, { mode: 0o755 });
+  return tool;
+}
+
+test('a JDK 17 macOS has registered is found, and with none registered the default JDK java_home falls back to is not', async () => {
+  const root = fs.realpathSync(tempDir('java-home'));
+  try {
+    const jdk17 = fakeJdk(root);
+    const jdk21 = fakeJdk(root, '21');
+    assert.equal(await registeredJdk17(fakeJavaHome(root, jdk17, jdk21)), jdk17);
+    assert.equal(await registeredJdk17(fakeJavaHome(root, null, jdk21)), undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('maestro/build.sh takes Homebrew’s JDK 17 when macOS has none registered, not the default JDK java_home falls back to', () => {
+  const root = fs.realpathSync(tempDir('build-jdk'));
+  try {
+    const jdk = (name: string, spec: string) => {
+      const home = path.join(root, name);
+      fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+      const java = `#!/bin/sh\necho "    java.specification.version = ${spec}" >&2\necho "    java.home = ${home}" >&2\n`;
+      fs.writeFileSync(path.join(home, 'bin', 'java'), java, { mode: 0o755 });
+      fs.writeFileSync(path.join(home, 'bin', 'javac'), '#!/bin/sh\n', { mode: 0o755 });
+      return home;
+    };
+    const brew17 = jdk('brew-openjdk17', '17');
+    const default21 = jdk('jdk-21', '21');
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'brew'), `#!/bin/sh\necho "${brew17}"\n`, { mode: 0o755 });
+    const script = fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'maestro', 'build.sh'), 'utf8');
+    const find = /^find_jdk17\(\) \{\n.*?\n\}\n/ms.exec(script)?.[0] ?? '';
+    assert.ok(find.includes(JAVA_HOME_TOOL), 'build.sh asks java_home');
+    const run = `set -euo pipefail\ndie() { echo "die: $*"; exit 1; }\n${find.replaceAll(JAVA_HOME_TOOL, fakeJavaHome(root, null, default21))}find_jdk17\necho "$JAVA_HOME from $java_origin"\n`;
+    const found = execFileSync('bash', ['-c', run], {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: root },
+    });
+    assert.equal(found.trim(), `${brew17} from Homebrew's openjdk@17 (${brew17})`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('doctor names the Maestro the driver runs, and a local build reads as not the release', async () => {

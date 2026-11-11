@@ -151,12 +151,18 @@ export interface JdkCandidate {
 
 export type JdkSearch = () => Promise<JdkCandidate | undefined>;
 
-/** The way maestro/build.sh looks: java_home -v 17, then Homebrew's openjdk@17. */
+export const JAVA_HOME_TOOL = '/usr/libexec/java_home';
+
+/** The JDK 17 macOS has registered. Without -F, java_home prints the default JDK when none matches. */
+export async function registeredJdk17(tool = JAVA_HOME_TOOL): Promise<string | undefined> {
+  const found = await runCommand(tool, ['-F', '-v', '17'], { timeoutMs: 10_000 });
+  return found.code === 0 && found.stdout.trim() ? found.stdout.trim() : undefined;
+}
+
+/** The way maestro/build.sh looks: java_home -F -v 17, then Homebrew's openjdk@17. */
 export const systemJdk17: JdkSearch = async () => {
-  const javaHome = await runCommand('/usr/libexec/java_home', ['-v', '17'], { timeoutMs: 10_000 });
-  if (javaHome.code === 0 && javaHome.stdout.trim()) {
-    return { home: javaHome.stdout.trim(), origin: '/usr/libexec/java_home -v 17' };
-  }
+  const registered = await registeredJdk17();
+  if (registered !== undefined) return { home: registered, origin: `${JAVA_HOME_TOOL} -F -v 17` };
   const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
   if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
     const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
@@ -172,10 +178,6 @@ function javaProblem(origin: string, spec: string | undefined): string | undefin
   return undefined;
 }
 
-/**
- * Finds JDK 17: AGENTLANE_JAVA_HOME, which must be one; then JAVA_HOME if it is one, as preflight's findJava17 does;
- * then the search, java_home -v 17 and Homebrew's openjdk@17 unless a test passes another.
- */
 export async function findJdk17(env: NodeJS.ProcessEnv, search: JdkSearch = systemJdk17): Promise<Jdk> {
   const pinned = env[JAVA_HOME_ENV];
   if (pinned) {

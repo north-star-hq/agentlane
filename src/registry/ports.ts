@@ -14,7 +14,11 @@ function answers(host: string, port: number, timeoutMs: number): Promise<boolean
       resolve(listening);
     };
     socket.setTimeout(timeoutMs, () => {
-      done(true);
+      // libuv runs expired timers before the I/O that arrived while the event loop was busy, so a refusal that came in
+      // during a stall is only read after this timeout fires; setImmediate runs after that I/O.
+      setImmediate(() => {
+        done(true);
+      });
     });
     socket.once('connect', () => {
       done(true);

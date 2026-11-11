@@ -237,6 +237,7 @@ function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
       toolkit: realEntry(deps.toolkit ?? process.argv[1] ?? ''),
       version: toolVersion(),
       probe: deps.env[HOOK_PROBE_ENV] ?? null,
+      node: realEntry(process.execPath),
     });
   } catch {
     return;

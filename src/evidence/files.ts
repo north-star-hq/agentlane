@@ -112,8 +112,9 @@ export interface StepsMark {
 
 /**
  * The recorded runs, one JSON line each, that were recorded since `mark`. While the file is the one the trace saw,
- * those are the lines past its offset; once it was replaced (a cut, a clear), only the lines whose `at` is at or after
- * the trace's start, since a cut keeps runs from before it.
+ * those are the lines past its offset. Once it was replaced (a cut, a clear), they are the whole lines after the last
+ * one whose `at` is before the trace's start; with none before it, the lines from the first that has an `at`, or every
+ * line when none has one, since a 0.4.1 engine of the lane records no `at`.
  */
 export function runsSince(file: string, mark: StepsMark): string {
   let data: Buffer;
@@ -134,21 +135,31 @@ export function runsSince(file: string, mark: StepsMark): string {
     data.length >= mark.bytes &&
     (mark.bytes === 0 || data[mark.bytes - 1] === NEWLINE);
   if (same) return data.subarray(mark.bytes).toString('utf8');
-  return data
+  const runs = data
     .toString('utf8')
     .split('\n')
     .slice(0, -1)
-    .filter(line => (recordedAt(line) ?? -Infinity) >= mark.startedAt)
-    .map(line => `${line}\n`)
+    .flatMap(line => {
+      const at = recordedAt(line);
+      return at === null ? [] : [{ line, at }];
+    });
+  const before = runs.findLastIndex(run => run.at !== undefined && run.at < mark.startedAt);
+  const timed = runs.findIndex(run => run.at !== undefined);
+  const from = before !== -1 ? before + 1 : Math.max(timed, 0);
+  return runs
+    .slice(from)
+    .map(run => `${run.line}\n`)
     .join('');
 }
 
-function recordedAt(line: string): number | undefined {
+function recordedAt(line: string): number | undefined | null {
   try {
-    const at = (JSON.parse(line) as { at?: unknown }).at;
+    const run = JSON.parse(line) as unknown;
+    if (typeof run !== 'object' || run === null) return null;
+    const { at } = run as { at?: unknown };
     return typeof at === 'number' ? at : undefined;
   } catch {
-    return undefined;
+    return null;
   }
 }
 
