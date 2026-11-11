@@ -7,7 +7,7 @@ import { buildSite, pageMarkdown } from '../site/build/build.ts';
 import { checkSite } from '../site/build/check.ts';
 import { loadSections, SITE } from '../site/build/content.ts';
 import { checkFacts, undocumentedVariables } from '../site/build/facts.ts';
-import { referenceGaps } from '../site/build/reference.ts';
+import { expandGenerated, referenceGaps } from '../site/build/reference.ts';
 import { MAESTRO_RELEASE } from '../src/driver/release.ts';
 
 function source(name: string): string {
@@ -208,6 +208,18 @@ describe('the docs site', () => {
         ),
         ['the config section hygiene', 'the config table driver'],
       );
+    });
+
+    test('write each command example in the help text as one code span, and stop it where the command ends', () => {
+      const cli = expandGenerated(source('cli'));
+      for (const example of [
+        '`agentlane keep --for 2h --reason "the user is reviewing the checkout screen"`.',
+        "`run <flow.yaml>`, `run --yaml '<yaml>'`, or `run -` (stdin).",
+        '`bench compare <a.json> <b.json>`: the two runs',
+        'as `up --platform` builds it',
+      ]) {
+        assert.ok(cli.includes(example), example);
+      }
     });
 
     test('find a variable the environment page leaves out', () => {
