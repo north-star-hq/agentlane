@@ -33,7 +33,11 @@ import {
   requireHome,
 } from './registry/prune.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
+import type { Kept } from './registry/registry.ts';
 import { readRegistryStatus, Registry } from './registry/registry.ts';
+import type { LaneHold } from './registry/holds.ts';
+import { DEFAULT_HOLD_MS, parseHoldTime } from './registry/holds.ts';
+import { recordCall } from './registry/touch.ts';
 import { describeRestarts } from './registry/parks.ts';
 import type { Lane, LaneOutcome, LaneStatus, EndedLane, ParkStatus, ServiceRequest, StatusReport } from './registry/types.ts';
 import type { ServiceSystem } from './services/system.ts';
@@ -65,7 +69,7 @@ export interface CliDeps {
   evidence?: EvidenceSystem;
 }
 
-export const REGISTRY_COMMANDS = ['claim', 'release', 'status', 'lanes', 'touch', 'prune'] as const;
+export const REGISTRY_COMMANDS = ['claim', 'release', 'keep', 'status', 'lanes', 'touch', 'prune'] as const;
 
 export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
   title: 'Lanes:',
@@ -96,7 +100,18 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
                --force               with an id: release it even if its owner is alive or can't be judged;
                                      for an ended lane, drop the record of a teardown that fails again
 `,
-    status: `  status     Every lane on this Mac: owner, folder, start, idle time, last action.
+    keep: `  keep       Hold this session's lane for this folder up while a person looks at the running
+             app, so it is not parked until the hold ends, however long since its last call:
+             ${TOOL} keep --for 2h --reason "the user is reviewing the checkout screen".
+             Running keep again replaces the hold. The hold ends with the lane, at release or when
+             the session ends, and status shows it with its reason and its end.
+               --for <time>          how long: minutes or hours, such as 45m, 2h or 1h30m (default 1h,
+                                     at most 24h)
+               --reason <text>       who is looking at what; status shows it (required)
+               --worktree <dir>      the folder whose lane to hold (default: this git worktree)
+`,
+    status: `  status     Every lane on this Mac: owner, folder, start, idle time, last action, and whether
+             it is held or parked.
 `,
     lanes: `  lanes      --json: the same as status, as JSON for tools.
 `,
@@ -213,6 +228,23 @@ function renderOutcome(outcome: LaneOutcome, now: number, deps: CliDeps, json: b
   for (const [key, value] of Object.entries(laneEnv(lane))) deps.stdout(`export ${key}=${shellQuote(value)}\n`);
 }
 
+function renderKept(kept: Kept, deps: CliDeps): void {
+  const { lane, hold, replaced, park } = kept;
+  deps.stderr(
+    `${TOOL}: holding lane ${lane.id} until ${formatTime(hold.until)} (${formatAge(hold.until - hold.since)}): ${hold.reason}\n`,
+  );
+  if (replaced) deps.stderr(`${TOOL}: this replaces its hold until ${formatTime(replaced.until)}: ${replaced.reason}\n`);
+  if (park?.state === 'parked') {
+    deps.stderr(
+      `${TOOL}: lane ${lane.id} is parked; its next call brings back ${describeRestarts(park.restarts)}, and the hold keeps it up from then\n`,
+    );
+  } else if (park?.state === 'parking') {
+    deps.stderr(
+      `${TOOL}: lane ${lane.id} is being parked by pid ${String(park.holder?.pid ?? 'unknown')}; if it parks, its next call brings it back, and the hold keeps it up from then\n`,
+    );
+  }
+}
+
 export type SessionNames = (lane: LaneStatus) => string | null;
 
 function parkLines(park: ParkStatus, now: number): string[] {
@@ -224,6 +256,10 @@ function parkLines(park: ParkStatus, now: number): string[] {
   return [head, ...park.problems.map(p => `      problem      ${p}`)];
 }
 
+function holdLine(hold: LaneHold, now: number): string {
+  return `      held         until ${formatTime(hold.until)} (${formatAge(hold.until - now)} left): ${hold.reason}`;
+}
+
 function laneLines(c: LaneStatus, sessionName: SessionNames, now: number): string[] {
   const state = c.ownerState === 'alive' ? 'alive' : describeState(c.ownerState).toUpperCase();
   const name = sessionName(c);
@@ -231,6 +267,7 @@ function laneLines(c: LaneStatus, sessionName: SessionNames, now: number): strin
     `  ${c.id}  ${describeOwner(c.owner)}${name ? ` "${name}"` : ''}  [${state}]`,
     `      folder       ${c.worktree}${c.projectRoot !== c.worktree ? `  (project ${c.projectRoot})` : ''}`,
     `      started      ${formatTime(c.createdAt)}   idle ${formatAge(c.idleMs)}   last action: ${c.lastAction}`,
+    ...(c.hold ? [holdLine(c.hold, now)] : []),
     ...(c.park ? parkLines(c.park, now) : []),
   ];
   if (c.device) {
@@ -273,7 +310,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
   const { config } = report;
   const lines = [
     `${TOOL} registry: ${report.stateDir}`,
-    `pool: ${poolLine(report)}; a lane is parked ${formatAge(config.parkMs)} after its last call, giving its device back`,
+    `pool: ${poolLine(report)}; a lane is parked ${formatAge(config.parkMs)} after its last call, giving its device back, unless a hold keeps it up`,
     `ports: ${Object.entries(config.blocks)
       .map(([type, b]) => `${type} ${String(b.first)}-${String(b.last)}`)
       .join(', ')}`,
@@ -625,6 +662,39 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
           : renderStatus(report, names),
       );
       return 0;
+    }
+    case 'keep': {
+      const { values } = parseArgs({
+        args,
+        strict: true,
+        options: { for: { type: 'string' }, reason: { type: 'string' }, worktree: { type: 'string' } },
+      });
+      const forMs = values.for === undefined ? DEFAULT_HOLD_MS : parseHoldTime(values.for);
+      const reason = values.reason?.trim() ?? '';
+      if (reason === '') {
+        throw new UsageError(
+          'keep needs --reason',
+          `say who is looking at what: ${CLI} keep --reason "the user is reviewing the checkout screen"`,
+        );
+      }
+      const who = owner();
+      const worktree = resolveFolder(values.worktree ?? deps.cwd).worktree;
+      const registry = open(deps);
+      try {
+        const lane = registry.find(who, worktree);
+        if (!lane) {
+          throw new NotClaimed(
+            `${describeOwner(who)} holds no lane in ${worktree}`,
+            `${CLI} up   (run in ${worktree}; keep holds a lane that is up)`,
+          );
+        }
+        const ref = { id: lane.id, token: lane.token };
+        recordCall(stateDir(deps.env), ref, now(deps));
+        renderKept(registry.keep(ref, reason, forMs), deps);
+        return 0;
+      } finally {
+        registry.close();
+      }
     }
     case 'touch': {
       const { values } = parseArgs({

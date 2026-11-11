@@ -55,6 +55,10 @@ Prove a behaviour with an assertion: the committed flow or test above, checking 
 
 Each prints the file it wrote in the lane's evidence folder, `$AGENTLANE_EVIDENCE`, which outlives `release` by seven days; `node_modules/.bin/agentlane evidence list` shows what is there. A failed run, and a failed command under exec on a browser lane, keep their own bundle there (the trace, a screenshot, the page or screen, the console or driver log) without being asked. `maestro test` under exec or in a hook keeps its whole output there, its `takeScreenshot` files included, in a folder per run: `<stamp>-maestro-test-<pid>`, ending `-failed` when the test failed. Read that bundle before you retry, and name the files you cite in your report.
 
+## When a person looks at the app
+
+When you leave the app running for the user to look at, rather than sending them a video or a screenshot, hold your lane first: `node_modules/.bin/agentlane keep --for 2h --reason "<who is looking at what>"`. A lane nobody holds is parked 30 minutes after its last call, which shuts its simulator or emulator down and stops its web app. The hold lasts one hour when `--for` is left out and 24 hours at most. Say in your message that the lane is held and until when; `release` ends the hold once they are done.
+
 ## Device controls
 
 Settings that aren't taps live in the CLI, on the same claimed device: `node_modules/.bin/agentlane device location <lat>,<lon> | clear`, `device permission grant|revoke|reset <service> [<bundle id>]`, `device appearance light|dark`, `device push <bundle id> <payload.json | ->`, `device clipboard set <text> | get` and `device open <url>`. On an emulator, `location clear`, `push` and `clipboard` have no adb equivalent and refuse with the reason; `permission` takes the package name and grants the Android permissions behind the service that the app declares.

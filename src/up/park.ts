@@ -138,7 +138,7 @@ export async function parkLane(
     if (laneHasEnded(error)) return { kind: 'left', lane: ref.id, reason: 'it has ended' };
     throw error;
   }
-  if (!lane) return { kind: 'left', lane: ref.id, reason: 'it was used, or another call is parking or waking it' };
+  if (!lane) return { kind: 'left', lane: ref.id, reason: 'it was used or held, or another call is parking or waking it' };
   if (laneLastCall(dir, { ...ref, lastUsedAt: lane.lastUsedAt }) > idleSince) {
     registry.abortPark(ref, attempt);
     return { kind: 'left', lane: ref.id, reason: 'it was used' };
