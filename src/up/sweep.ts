@@ -8,7 +8,7 @@ import { messageOf } from '../driver/errors.ts';
 import type { ProcessIdentity, ProcessTable } from '../processes.ts';
 import { systemProcesses } from '../processes.ts';
 import type { RegistryConfig } from '../registry/config.ts';
-import { isProven, judgeProcess, ownerState, worktreeState } from '../registry/owner.ts';
+import { describeState, isProven, judgeProcess, ownerState, worktreeState } from '../registry/owner.ts';
 import { describeRestarts } from '../registry/parks.ts';
 import { databasePath } from '../registry/paths.ts';
 import type { PortProbe } from '../registry/ports.ts';
@@ -76,8 +76,9 @@ function unused(dir: string, candidate: ParkCandidate, idleSince: number): boole
 }
 
 /**
- * Whether the sweep has work: a lane to park, or one a park or wake left partway. One read of the registry, plus the
- * lane-folder call record of each lane the registry has as unused for the park window; no process starts.
+ * Whether the sweep has work: a lane no hold keeps up to park, or one a park or wake left partway. One read of the
+ * registry, plus the lane-folder call record of each lane the registry has as unused for the park window; no process
+ * starts.
  */
 export function sweepDue(site: SweepSite): boolean {
   if (!fs.existsSync(databasePath(site.dir))) return false;
@@ -95,7 +96,7 @@ export function sweepDue(site: SweepSite): boolean {
     const idleSince = now - registry.config.parkMs;
     return registry
       .parkCandidates(idleSince, now - PARK_RETRY_MS)
-      .some(c => !left.has(c.ref.id) && unused(site.dir, c, idleSince));
+      .some(c => c.hold === null && !left.has(c.ref.id) && unused(site.dir, c, idleSince));
   } finally {
     registry.close();
   }
@@ -145,14 +146,16 @@ export interface SweepDeps extends ParkDeps {
 
 export interface SweepReport {
   outcomes: ParkOutcome[];
-  /** Lanes left to a claim's sweep because their owner is dead. */
+  /** Lanes left to a claim's sweep because their owner is dead; a hold such a lane had is ended. */
   leftAlone: string[];
+  /** Lanes left up because their owner holds them. */
+  held: string[];
 }
 
-/** The sweep's work, in the process that does it: parks each lane whose owner is alive and left it unused. */
+/** The sweep's work, in the process that does it: parks each lane whose owner is alive, left it unused, and holds it no more. */
 export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   const say = deps.log ?? (() => undefined);
-  const report: SweepReport = { outcomes: [], leftAlone: [] };
+  const report: SweepReport = { outcomes: [], leftAlone: [], held: [] };
   const registry = Registry.open({
     dir: deps.dir,
     processes: deps.processes,
@@ -171,7 +174,14 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
     for (const candidate of candidates) {
       const state = ownerState(judgeProcess(candidate.owner.process, table), worktreeState(candidate.worktree));
       if (isProven(state)) {
+        if (candidate.hold && registry.endHold(candidate.ref.id, candidate.ownerKey)) {
+          say(`ended the hold on lane ${candidate.ref.id}, "${candidate.hold.reason}": ${describeState(state)}`);
+        }
         report.leftAlone.push(candidate.ref.id);
+        continue;
+      }
+      if (candidate.hold) {
+        report.held.push(candidate.ref.id);
         continue;
       }
       try {

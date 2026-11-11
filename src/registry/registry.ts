@@ -24,6 +24,8 @@ import {
 } from './leases.ts';
 import type { Owner } from './owner.ts';
 import { describeOwner, describeState, isProven, judgeProcess, ownerKey, ownerState, worktreeState } from './owner.ts';
+import type { LaneHold } from './holds.ts';
+import { dropHold, readHold, writeHold } from './holds.ts';
 import type { LanePark, ParkRestarts } from './parks.ts';
 import { dropPark, NOTHING_TO_RESTART, readPark, writePark } from './parks.ts';
 import { configPath, diskNames } from './paths.ts';
@@ -181,7 +183,18 @@ export interface ParkCandidate {
   ref: LaneRef;
   lastUsedAt: number;
   owner: Owner;
+  ownerKey: string;
   worktree: string;
+  park: LanePark | null;
+  /** The hold that keeps the lane up now, if its owner is alive; null when nothing holds it. */
+  hold: LaneHold | null;
+}
+
+export interface Kept {
+  lane: Lane;
+  hold: LaneHold;
+  /** The hold this one replaced, while it still held the lane. */
+  replaced: LaneHold | null;
   park: LanePark | null;
 }
 
@@ -1804,9 +1817,11 @@ export class Registry {
   /**
    * The lanes the sweep looks at: last used, by the registry's record, at or before `idleSince`, and either awake, or
    * last parked or woken at or before `retrySince` and left holding a device or a service, or left mid-park or mid-wake.
+   * A held lane is listed with its hold, so the sweep can judge its owner: a hold keeps only a live owner's lane up.
    */
   parkCandidates(idleSince: number, retrySince: number): ParkCandidate[] {
     const db = this.store.db;
+    const now = this.clock.now();
     return db
       .prepare(
         `SELECT c.* FROM claims c LEFT JOIN parks p ON p.claim_id = c.id
@@ -1821,9 +1836,36 @@ export class Registry {
         ref: { id: text(row, 'id'), token: text(row, 'token') },
         lastUsedAt: int(row, 'last_used_at'),
         owner: ownerFromRow(row),
+        ownerKey: text(row, 'owner_key'),
         worktree: text(row, 'worktree'),
         park: readPark(db, text(row, 'id')),
+        hold: readHold(db, text(row, 'id'), text(row, 'owner_key'), now),
       }));
+  }
+
+  /**
+   * Holds the lane up past the park window for `forMs`, in place of any hold before, and counts as a call on it. A
+   * parked lane stays parked: its next call brings it back, and the hold keeps it up from then.
+   */
+  keep(ref: LaneRef, reason: string, forMs: number): Kept {
+    return this.store.write(() => {
+      const row = this.requireLane(ref);
+      const db = this.store.db;
+      const now = this.clock.now();
+      const owner = text(row, 'owner_key');
+      const replaced = readHold(db, ref.id, owner, now);
+      const hold = { reason, since: now, until: now + forMs };
+      writeHold(db, ref.id, owner, hold);
+      db.prepare('UPDATE claims SET last_used_at = ?, last_action = ? WHERE id = ?').run(now, 'keep', ref.id);
+      const lane = loadLane(db, ref.id);
+      if (!lane) throw new Error(`lane ${ref.id} vanished inside its own transaction`);
+      return { lane, hold, replaced, park: readPark(db, ref.id) };
+    });
+  }
+
+  /** Ends the hold the owner keyed `ownerKey` placed on the lane, as the sweep does once it finds that owner dead. */
+  endHold(laneId: string, ownerKey: string): boolean {
+    return this.store.write(() => dropHold(this.store.db, laneId, ownerKey));
   }
 
   private parkActor(row: Row, doing: string): void {
@@ -1836,8 +1878,8 @@ export class Registry {
 
   /**
    * Starts parking the lane as attempt `attempt` of this process, if the registry's record still has it unused since
-   * `idleSince` and nobody else is parking or waking it; `dead` is the holder of an earlier park or wake that was
-   * proven gone before this call. Null when the lane is not to be parked now.
+   * `idleSince`, no hold keeps it up, and nobody else is parking or waking it; `dead` is the holder of an earlier park
+   * or wake that was proven gone before this call. Null when the lane is not to be parked now.
    */
   beginPark(ref: LaneRef, idleSince: number, attempt: string, dead: ProcessIdentity | null): Lane | null {
     const me = this.self();
@@ -1846,6 +1888,7 @@ export class Registry {
       this.parkActor(row, 'parking');
       if (int(row, 'last_used_at') > idleSince) return null;
       const db = this.store.db;
+      if (readHold(db, ref.id, text(row, 'owner_key'), this.clock.now())) return null;
       const park = readPark(db, ref.id);
       if (park && park.state !== 'parked' && !this.heldByDead(park, dead)) return null;
       writePark(db, ref.id, {

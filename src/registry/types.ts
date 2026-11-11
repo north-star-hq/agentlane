@@ -2,6 +2,7 @@ import type { BrowserDriverName } from '../browser/kinds.ts';
 import type { Platform } from '../devices/backend.ts';
 import type { RegistryConfig } from './config.ts';
 import type { Owner, OwnerState, ProvenState } from './owner.ts';
+import type { LaneHold } from './holds.ts';
 import type { ParkRestarts, ParkState } from './parks.ts';
 
 export interface ServiceRequest {
@@ -198,6 +199,8 @@ export interface LaneStatus extends LaneInfo {
   deviceState: DeviceState | null;
   /** Null while the lane is awake. */
   park: ParkStatus | null;
+  /** What keeps the lane up past the park window, and until when; null when nothing does, or its owner is gone. */
+  hold: LaneHold | null;
 }
 
 export interface PoolDeviceStatus {

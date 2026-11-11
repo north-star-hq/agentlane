@@ -75,8 +75,16 @@ CREATE TABLE IF NOT EXISTS parks (
   CHECK ((holder_pid IS NULL) = (state = 'parked') AND (holder_pid IS NULL) = (holder_start IS NULL)
     AND (holder_pid IS NULL) = (attempt IS NULL))
 ) STRICT;
+CREATE TABLE IF NOT EXISTS holds (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+  owner_key TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  until INTEGER NOT NULL,
+  CHECK (until > since)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks'];
+const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds'];
 
 const SCHEMA = `
 CREATE TABLE claims (

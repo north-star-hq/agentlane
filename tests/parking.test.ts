@@ -225,7 +225,7 @@ test("a lane whose owner is dead is left to a claim's sweep, and the commands pa
     await w.clock.advance(PARK_MS);
     w.procs.kill(owner.process?.pid ?? 0);
     const report = await runSweep(sweepDeps(w));
-    assert.deepEqual(report, { outcomes: [], leftAlone: [a.lane.id] });
+    assert.deepEqual(report, { outcomes: [], leftAlone: [a.lane.id], held: [] });
     assert.equal(parkOf(w, a.lane), null);
     assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false);
   } finally {
