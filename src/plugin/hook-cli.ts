@@ -11,10 +11,14 @@ import { readRegistryStatus } from '../registry/registry.ts';
 import type { CliDeps } from '../registry-cli.ts';
 import { releaseEveryLaneOf, resolveFolder } from '../registry-cli.ts';
 import { commandUsage, groupUsage, type UsageGroup } from '../usage.ts';
+import type { HookEvent } from '../agents/launcher.ts';
+import { toolVersion } from '../agents/package.ts';
 import { aimsOf } from './aims.ts';
 import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
 import { guard } from './guard.ts';
+import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
+import { claimOnce } from './hook-once.ts';
 import { claudeSessionName } from './session-name.ts';
 
 export const HOOK_COMMANDS = ['hook'] as const;
@@ -36,12 +40,16 @@ export const HOOK_USAGE = groupUsage(HOOK_HELP);
 
 export const SESSION_END_OWNER_ENV = envName('SESSION_END_OWNER');
 export const SESSION_END_WAIT_ENV = envName('SESSION_END_WAIT_MS');
+export const SESSION_END_ONCE_ENV = envName('SESSION_END_ONCE');
 const OWNER_EXIT_WAIT_MS = 30_000;
 const OWNER_EXIT_POLL_MS = 250;
+const PLUGIN_AND_SETTINGS: ReadonlySet<Agent> = new Set(['claude']);
 
 export interface HookDeps extends CliDeps {
   stdin: string;
   startWorker: (env: NodeJS.ProcessEnv, log: string) => void;
+  /** The toolkit's entry point, recorded in the hook's mark. */
+  toolkit?: string;
 }
 
 function selfOwner(deps: HookDeps): Owner | null {
@@ -133,12 +141,14 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
   const key = ownerKey(owner);
   const held = readRegistryStatus({ dir, processes: deps.processes, devices: {} }).lanes.filter(c => c.ownerKey === key);
   if (held.length === 0) return 0;
+  const once = PLUGIN_AND_SETTINGS.has(agent) ? ['session-end', input.sessionId ?? '', key] : null;
   const log = path.join(dir, 'session-end.log');
   const waits = convention.release !== 'at-once' && convention.release !== 'by-thread' && owner.process !== null;
   deps.startWorker(
     {
       ...deps.env,
       [SESSION_END_OWNER_ENV]: JSON.stringify(owner),
+      [SESSION_END_ONCE_ENV]: once ? JSON.stringify(once) : undefined,
       ...(waits ? { [SESSION_END_WAIT_ENV]: String(OWNER_EXIT_WAIT_MS) } : {}),
     },
     log,
@@ -167,6 +177,40 @@ export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: strin
   };
 }
 
+const PROJECT_ENV: Partial<Record<Agent, string>> = { claude: 'CLAUDE_PROJECT_DIR', cursor: 'CURSOR_PROJECT_DIR' };
+
+function realEntry(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
+  try {
+    let cwd: string | null = null;
+    try {
+      cwd = readHookInput(deps.stdin).cwd;
+    } catch {
+      cwd = null;
+    }
+    const named = PROJECT_ENV[agent];
+    const project = named ? deps.env[named] : undefined;
+    writeHookMark(stateDir(deps.env), {
+      agent,
+      event,
+      project: project !== undefined && project !== '' ? project : (cwd ?? deps.cwd),
+      at: (deps.clock ?? systemClock).now(),
+      toolkit: realEntry(deps.toolkit ?? process.argv[1] ?? ''),
+      version: toolVersion(),
+      probe: deps.env[HOOK_PROBE_ENV] ?? null,
+    });
+  } catch {
+    return;
+  }
+}
+
 async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promise<boolean> {
   const identity = owner.process;
   if (identity === null) return true;
@@ -180,10 +224,23 @@ async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promis
   }
 }
 
+function onceParts(raw: string | undefined): string[] | null {
+  if (raw === undefined) return null;
+  const parts: unknown = JSON.parse(raw);
+  if (!Array.isArray(parts) || !parts.every(part => typeof part === 'string'))
+    throw new Error(`${SESSION_END_ONCE_ENV} is not a list of strings`);
+  return parts;
+}
+
 async function releaseWorker(raw: string, deps: HookDeps): Promise<number> {
   const owner = parseOwner(raw);
   const clock = deps.clock ?? systemClock;
   const stamp = () => new Date(clock.now()).toISOString();
+  const once = onceParts(deps.env[SESSION_END_ONCE_ENV]);
+  if (once && !claimOnce(stateDir(deps.env), once, clock.now())) {
+    deps.stderr(`${stamp()} session end: another copy of this hook is already releasing the lanes of ${describeOwner(owner)}\n`);
+    return 0;
+  }
   const waitMs = Number(deps.env[SESSION_END_WAIT_ENV] ?? 0);
   if (waitMs > 0 && !(await ownerExited(owner, waitMs, deps))) {
     deps.stderr(
@@ -224,9 +281,13 @@ export async function runHookCommand(args: string[], deps: HookDeps): Promise<nu
   if (event === 'session-end') {
     const owner = deps.env[SESSION_END_OWNER_ENV];
     if (owner) return releaseWorker(owner, deps);
+    leaveMark(agent, event, deps);
     return sessionEnd(readHookInput(deps.stdin), agent, deps);
   }
-  if (event === 'pre-tool-use') return preToolUse(deps.stdin, agent, deps);
+  if (event === 'pre-tool-use') {
+    leaveMark(agent, event, deps);
+    return preToolUse(deps.stdin, agent, deps);
+  }
   deps.stderr(`${TOOL} hook: '${event ?? ''}' is not a hook\n\n${HOOK_USAGE}`);
   return 2;
 }

@@ -9,7 +9,9 @@ import { agentWiringChecks } from '../../src/agents/wiring-check.ts';
 import type { EnvDeps } from '../../src/up/deps.ts';
 import { diagnose, renderDoctor } from '../../src/up/doctor.ts';
 import { tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
+import { toolkitEntry, writeToolkit } from '../support/toolkit.ts';
 
 const PLUGIN = path.resolve(import.meta.dirname, '..', '..', 'plugin');
 const TOOLKIT = listSkills().map(skill => skill.name);
@@ -37,7 +39,7 @@ function project(): Project {
   fs.mkdirSync(dir);
   assert.equal(spawnSync('git', ['init', '-q', dir]).status, 0);
   write(path.join(dir, '.agents/skills/run/SKILL.md'), '---\nname: run\ndescription: Run the app.\n---\n\nRun it.\n');
-  const base = { AGENTLANE_STATE_DIR: path.join(root, 'state'), CLAUDE_CONFIG_DIR: path.join(root, 'claude-config') };
+  const base = hermeticEnv(root, { CLAUDE_CONFIG_DIR: path.join(root, 'claude-config') });
   return {
     root,
     dir,
@@ -69,7 +71,9 @@ async function init(
 function wiredThroughThePluginOnly(p: Project, otherAgents: boolean): void {
   assert.equal(fs.existsSync(path.join(p.dir, '.mcp.json')), false, 'no second MCP server');
   const settings = json(path.join(p.dir, '.claude/settings.json'));
-  assert.equal(settings.hooks, undefined, 'no second set of hooks');
+  const hooks = JSON.stringify(settings.hooks);
+  assert.match(hooks, /"PreToolUse".*hook pre-tool-use --agent claude/, 'the hooks go in the settings beside the plugin');
+  assert.match(hooks, /"SessionEnd".*hook session-end --agent claude/);
   assert.deepEqual(settings.disabledMcpjsonServers, ['agentlane']);
   assert.deepEqual(fs.readdirSync(path.join(p.dir, '.claude/skills')), ['run'], "only the project's own skill");
   assert.equal(fs.readlinkSync(path.join(p.dir, '.claude/skills/run')), '../../.agents/skills/run');
@@ -85,7 +89,7 @@ const SOURCES: { label: string; arrange: (p: Project) => NodeJS.ProcessEnv; says
   {
     label: 'the session loads it with --plugin-dir',
     arrange: p => p.env(SESSION),
-    says: /this Claude Code session loads the agentlane plugin from .*\/plugin, which brings the skills, the MCP server and the hooks, so init wrote none of them for Claude Code.*run node_modules\/\.bin\/agentlane init again outside a session that loads the plugin/,
+    says: /this Claude Code session loads the agentlane plugin from .*\/plugin, which brings the skills and the MCP server, so init wrote neither for Claude Code.*It wrote the hooks into \.claude\/settings\.json.*run node_modules\/\.bin\/agentlane init again outside a session that loads the plugin/,
   },
   {
     label: "the user's settings enable it",
@@ -140,7 +144,7 @@ test('doctor warns when the plugin and an earlier init both wire Claude Code, an
     assert.equal(wired?.warning, true);
     assert.match(
       wired.detail,
-      /^this Claude Code session loads the agentlane plugin from .*\/plugin, and the project's own MCP server in \.mcp\.json, hooks in \.claude\/settings\.json and 6 toolkit skills in \.claude\/skills wire Claude Code a second time, so a session gets each of them twice$/,
+      /^this Claude Code session loads the agentlane plugin from .*\/plugin, and the project's own MCP server in \.mcp\.json and 6 toolkit skills in \.claude\/skills wire Claude Code a second time, so a session gets each of them twice$/,
     );
     assert.equal(wired.fix, 'node_modules/.bin/agentlane init --agents claude');
     const report = await diagnose({ env: p.env(SESSION) } as EnvDeps, {
@@ -171,7 +175,14 @@ test('doctor warns when the plugin and an earlier init both wire Claude Code, an
     assert.match(fs.readFileSync(path.join(backups, '.claude/settings.json'), 'utf8'), /hook pre-tool-use --agent claude/);
 
     const after = json(file);
-    assert.deepEqual(after.hooks, { PreToolUse: [{ matcher: 'Edit', hooks: [own] }] }, 'the project’s own hook stays');
+    const kept = after.hooks as Record<string, unknown[]>;
+    assert.deepEqual(
+      kept.PreToolUse?.find(entry => JSON.stringify(entry).includes('lint-staged')),
+      { matcher: 'Edit', hooks: [own] },
+      'the project’s own hook stays',
+    );
+    assert.match(JSON.stringify(kept.PreToolUse), /hook pre-tool-use --agent claude/, 'and so does the guard');
+    assert.match(JSON.stringify(kept.SessionEnd), /hook session-end --agent claude/);
     assert.deepEqual(after.permissions, { allow: ['Bash(pnpm test)'] });
     assert.deepEqual(after.disabledMcpjsonServers, ['agentlane']);
     assert.deepEqual(fs.readdirSync(path.join(p.dir, '.claude/skills')), ['run']);
@@ -217,7 +228,26 @@ test('a project left to a plugin that is not loaded says so, and init without th
   }
 });
 
-test('a project that enables the plugin from a GitHub marketplace, with no init files, has no wiring warnings and nothing for init to write', async () => {
+function installToolkit(dir: string): void {
+  writeToolkit(dir, `exec "${process.execPath}" "${toolkitEntry(dir)}" "$@"`);
+}
+
+type Line = [ok: boolean, warning: boolean, detail: string, fix: string];
+
+async function claudeLines(p: Project, env: NodeJS.ProcessEnv): Promise<Record<string, Line | undefined>> {
+  const report = await diagnose({ env } as EnvDeps, {
+    config: null,
+    configProblem: 'no config',
+    lane: null,
+    ownerState: null,
+    folder: p.dir,
+  });
+  return Object.fromEntries(
+    report.checks.filter(c => c.name.endsWith(' claude')).map(c => [c.name, [c.ok, c.warning ?? false, c.detail, c.fix]]),
+  );
+}
+
+test('a project that enables the plugin from a GitHub marketplace without installing it fails doctor until init writes the hooks', async () => {
   const p = project();
   try {
     fs.rmSync(path.join(p.dir, '.agents'), { recursive: true });
@@ -233,25 +263,57 @@ test('a project that enables the plugin from a GitHub marketplace, with no init 
     write(path.join(p.dir, '.claude/settings.json'), `${JSON.stringify(settings, null, 2)}\n`);
     write(path.join(p.dir, '.mcp.json'), JSON.stringify({ mcpServers: { context7: { command: 'npx', args: ['context7'] } } }));
     write(path.join(p.dir, 'agentlane.json'), JSON.stringify({ web: { path: '/' }, services: {} }));
+    installToolkit(p.dir);
 
-    for (const env of [p.env(), p.env(SESSION)]) {
-      const report = await diagnose({ env } as EnvDeps, {
-        config: null,
-        configProblem: 'no config',
-        lane: null,
-        ownerState: null,
-        folder: p.dir,
-      });
-      const wiring = report.checks.filter(c => c.name.startsWith('wiring'));
-      assert.deepEqual(
-        wiring.map(c => [c.name, c.warning, c.detail]),
-        [['wiring claude', false, 'through the plugin: the project enables the agentlane plugin in .claude/settings.json']],
-      );
-    }
+    const before = await claudeLines(p, p.env());
+    assert.equal(before['wiring claude']?.[1], true);
+    assert.match(
+      before['wiring claude'][2],
+      /^the project enables the agentlane plugin in \.claude\/settings\.json, but Claude Code hasn't installed it on this Mac \(agentlane@agentlane\), so its MCP server and skills don't load; and stale \.claude\/settings\.json \(plugin, guard hook, release hook\)$/,
+    );
+    assert.match(before['wiring claude'][3], /^in Claude Code, \/plugin install agentlane@agentlane /);
+    assert.deepEqual(before['hooks claude'], [
+      false,
+      false,
+      'no agentlane hook runs in Claude Code here: .claude/settings.json has none, and the plugin it leaves them to (agentlane@agentlane) is enabled but not installed on this Mac',
+      'node_modules/.bin/agentlane init --agents claude writes the hooks into .claude/settings.json',
+    ]);
     const check = await init(p, p.env(), '--agents', 'claude', '--check');
-    assert.equal(check.code, 0, check.stdout + check.stderr);
-    assert.doesNotMatch(check.stdout, /would (create|update|remove)/);
-    assert.equal(fs.existsSync(path.join(p.dir, '.agents')), false);
+    assert.equal(check.code, 1, check.stdout + check.stderr);
+    assert.match(check.stdout, /would update \.claude\/settings\.json .*guard hook \(claude\); release hook \(claude\)/);
+
+    assert.equal((await init(p, p.env(), '--agents', 'claude')).code, 0);
+    assert.equal(fs.existsSync(path.join(p.dir, '.agents')), false, 'the plugin still brings the skills');
+    const after = await claudeLines(p, p.env());
+    assert.equal(after['hooks claude']?.[0], true, after['hooks claude']?.[2]);
+    assert.match(
+      after['hooks claude'][2],
+      /^doctor ran the guard hook in \.claude\/settings\.json on a command it allows, and it reached .*node_modules\/agentlane\/dist\/cli\.js \(\d+\.\d+\.\d+.*\) at /,
+    );
+    assert.equal(after['wiring claude']?.[0], true);
+    const marked = await claudeLines(p, p.env());
+    assert.match(marked['hooks claude']?.[2] ?? '', /^the pre-tool-use hook in \.claude\/settings\.json reached /);
+  } finally {
+    p.cleanup();
+  }
+});
+
+test('with the plugin installed and no hooks in the settings, doctor runs the plugin’s own guard hook', async () => {
+  const p = project();
+  try {
+    write(path.join(p.dir, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }));
+    write(
+      path.join(p.root, 'claude-config/plugins/installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { 'agentlane@agentlane': [{ scope: 'user', installPath: PLUGIN }] } }),
+    );
+    installToolkit(p.dir);
+    const lines = await claudeLines(p, p.env());
+    assert.match(lines['wiring claude']?.[2] ?? '', /^stale \.claude\/settings\.json \(plugin, guard hook, release hook\)/);
+    assert.equal(lines['hooks claude']?.[0], true, lines['hooks claude']?.[2]);
+    assert.match(
+      lines['hooks claude'][2],
+      /^doctor ran the guard hook in the plugin in .*\/plugin on a command it allows, and it reached /,
+    );
   } finally {
     p.cleanup();
   }

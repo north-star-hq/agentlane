@@ -10,7 +10,7 @@
     "SessionEnd": [
       {
         "matcher": "prompt_input_exit|logout|other",
-        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" session-end", "timeout": 10 }]
+        "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh\" session-end" }]
       }
     ]
   }

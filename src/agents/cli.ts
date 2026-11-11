@@ -49,8 +49,9 @@ export const AGENT_HELP: UsageGroup<AgentCommand> = {
                        private package.json when there is none, because the hooks and the MCP server
                        run ${CLI}.
                        Where Claude Code loads the ${TOOL} plugin (the project's or your settings,
-                       or the session running init), Claude Code is left to the plugin, and init
-                       removes the copies of its skills and hooks an earlier init wrote.
+                       or the session running init), the plugin brings Claude Code's skills and MCP
+                       server, and init removes the copies of its skills an earlier init wrote. The
+                       hooks always go in each agent's project settings, plugin or not.
                        A second run changes nothing; a changed file is backed up first, and a file
                        init can't parse is refused, with nothing written. --check writes and
                        installs nothing, and exits 1 when a file would change. The folder defaults
@@ -77,7 +78,7 @@ export interface AgentCliDeps {
 }
 
 function throughPlugin(source: PluginSource): string {
-  const done = `${describePluginSource(source)}, which brings the skills, the MCP server and the hooks, so init wrote none of them for Claude Code: it mirrored only the project's own skills and kept Claude Code from loading the .mcp.json server a second time`;
+  const done = `${describePluginSource(source)}, which brings the skills and the MCP server, so init wrote neither for Claude Code: it mirrored only the project's own skills and kept Claude Code from loading the .mcp.json server a second time. It wrote the hooks into .claude/settings.json, where Claude Code runs them whether or not the plugin loads and gives the session-end hook its full timeout. Where the plugin's hooks run too, both guards give the same answer and the session's lanes are released once`;
   if (source.kind === 'project') return done;
   const others = `Claude Code without the plugin gets none of them from this project's files; to wire it the same for everyone, enable the plugin in the project's .claude/settings.json`;
   return source.kind === 'session'
