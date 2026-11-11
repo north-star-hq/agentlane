@@ -64,10 +64,7 @@ export function recordCall(stateDir: string, ref: LaneRef, at: number): void {
   }
 }
 
-/**
- * The time of a lane's last call: the later of the registry's `last_used_at` and the call recorded in the lane's folder
- * while the registry was busy.
- */
+/** The time of a lane's last call: the later of the registry's `last_used_at` and the last call recorded in the lane's folder. */
 export function laneLastCall(stateDir: string, lane: LaneRef & { lastUsedAt: number }): number {
   let recorded: CallRecord | null;
   try {
@@ -80,6 +77,11 @@ export function laneLastCall(stateDir: string, lane: LaneRef & { lastUsedAt: num
 
 function isBusy(error: unknown): boolean {
   return error instanceof Refusal && error.code === 'registry-busy';
+}
+
+/** Whether a touch failed because its lane has ended: the lane is gone, or its id now names another lane. */
+export function laneHasEnded(error: unknown): boolean {
+  return error instanceof Refusal && (error.code === 'lane-gone' || error.code === 'token-mismatch');
 }
 
 function whenFree(site: TouchSite, body: (registry: Registry) => void): boolean {
@@ -140,14 +142,15 @@ export function touchOwnLane(site: TouchSite, owner: Owner, worktree: string, ac
 
 /**
  * Touches the lane every `everyMs` until the returned function is called, so a call that runs for long keeps counting
- * while it runs. It never waits on a busy registry, and stops once the lane has ended.
+ * while it runs. It never waits on a busy registry, records the call in the lane's folder even when the registry can't
+ * be opened, and stops early only once the lane has ended.
  */
 export function keepTouching(site: TouchSite, ref: LaneRef, action: string, everyMs = HEARTBEAT_MS): () => void {
   const timer = setInterval(() => {
     try {
       touchLane({ ...site, waitMs: 0 }, ref, action);
-    } catch {
-      clearInterval(timer);
+    } catch (error) {
+      if (laneHasEnded(error)) clearInterval(timer);
     }
   }, everyMs);
   timer.unref();
@@ -157,9 +160,9 @@ export function keepTouching(site: TouchSite, ref: LaneRef, action: string, ever
 }
 
 /**
- * Touches for a long-lived caller, such as the MCP server: the call is recorded at once, and a touch the busy registry
- * refused is tried again every `retryMs`, never waiting on the lock, until it lands, the lane ends, or a later touch
- * takes its place.
+ * Touches for a long-lived caller, such as the MCP server: the call is recorded at once, and a touch the registry
+ * refused or couldn't take is tried again every `retryMs`, never waiting on the lock, until it lands, the lane ends, or
+ * a later touch takes its place.
  */
 export class LaneToucher {
   private readonly site: TouchSite;
@@ -180,11 +183,11 @@ export class LaneToucher {
   private later(ref: LaneRef, action: string): void {
     this.retry = setTimeout(() => {
       this.retry = undefined;
-      let landed: boolean;
+      let landed = false;
       try {
         landed = landTouch(this.site, ref, action);
-      } catch {
-        return;
+      } catch (error) {
+        if (laneHasEnded(error)) return;
       }
       if (!landed) this.later(ref, action);
     }, this.retryMs);

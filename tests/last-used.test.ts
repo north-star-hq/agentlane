@@ -9,9 +9,9 @@ import { runDriverCommand, type DriverCliDeps } from '../src/driver-cli.ts';
 import { callEngine } from '../src/driver/client.ts';
 import { createToolHandler, type ToolResult } from '../src/mcp/tools.ts';
 import { identityOf, systemProcesses, type ProcessIdentity } from '../src/processes.ts';
-import { databasePath } from '../src/registry/paths.ts';
+import { configPath, databasePath } from '../src/registry/paths.ts';
 import { LaneToucher, laneLastCall, recordCall, TOUCH_WAIT_MS } from '../src/registry/touch.ts';
-import type { Lane } from '../src/registry/types.ts';
+import type { Lane, LaneRef } from '../src/registry/types.ts';
 import { runRegistryCommand } from '../src/registry-cli.ts';
 import { realServiceSystem } from '../src/services/system.ts';
 import type { EnvDeps } from '../src/up/deps.ts';
@@ -20,7 +20,7 @@ import { runUpCommand } from '../src/up-cli.ts';
 import { FakeAdb } from './devices/fake-adb.ts';
 import { FakeClock, FakeProbe, tempDir } from './support/fakes.ts';
 import { driverWorld, sleeper, until, type DriverWorld } from './support/driver-world.ts';
-import { failures, OPTIONS, toolchain, world, type World } from './support/up-world.ts';
+import { CONFIG, failures, OPTIONS, toolchain, world, type World } from './support/up-world.ts';
 
 const FIXTURE = path.join(import.meta.dirname, 'fixtures', 'signin-site');
 const AGED = 1_000_000;
@@ -78,6 +78,17 @@ function holdRegistry(state: string): () => void {
   return () => {
     db.exec('COMMIT');
     db.close();
+  };
+}
+
+/** Makes the registry's config.json invalid, so opening the registry fails, until the returned function is called. */
+function breakConfig(state: string): () => void {
+  const file = configPath(state);
+  const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined;
+  fs.writeFileSync(file, '{');
+  return () => {
+    if (before === undefined) fs.rmSync(file);
+    else fs.writeFileSync(file, before);
   };
 }
 
@@ -320,6 +331,25 @@ test('a busy registry neither fails nor stalls a device lane call, and the engin
     await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's retried touch");
   }));
 
+test("a touch that can't open the registry leaves the warm engine running, and lands once the registry opens", () =>
+  withDevice('ios', async w => {
+    const warm = await callEngine(w.target(), { op: 'look', args: {} });
+    assert.equal(warm.ok, true);
+    age(w.stateDir, w.lane.id);
+    const fix = breakConfig(w.stateDir);
+    try {
+      const looked = await callEngine(w.target(), { op: 'look', args: {} });
+      assert.equal(looked.ok, true);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      leavesAlone(w.stateDir, w.lane.id);
+    } finally {
+      fix();
+    }
+    await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, 'the touch tried again once the registry opens');
+    const after = await callEngine(w.target(), { op: 'look', args: {} });
+    assert.equal(after.pid, warm.pid, 'the engine restarted');
+  }));
+
 test('a run still in flight has already moved the last use, so a long run never looks idle', () =>
   withDevice(
     'ios',
@@ -400,8 +430,40 @@ function execDeps(lane: OtherLane, over: Partial<EnvDeps> = {}): EnvDeps {
   };
 }
 
-function lastCallOf(state: string, lane: Lane): number {
+function onlyLane(state: string): LaneRef | undefined {
+  if (!fs.existsSync(databasePath(state))) return undefined;
+  const db = new DatabaseSync(databasePath(state), { readOnly: true });
+  try {
+    const rows = db.prepare('SELECT id, token FROM claims').all();
+    const [row] = rows;
+    return rows.length === 1 && row ? { id: String(row.id), token: String(row.token) } : undefined;
+  } finally {
+    db.close();
+  }
+}
+
+function lastCallOf(state: string, lane: LaneRef): number {
   return laneLastCall(state, { id: lane.id, token: lane.token, lastUsedAt: lastUse(state, lane.id).at });
+}
+
+/** Runs `exec` on a command that runs until `end` is called; `end` waits for exec to return, so the command never outlives the test. */
+function execUntilEnded(lane: OtherLane, flag: string, over: Partial<EnvDeps>) {
+  let settled = false;
+  const running = runUpCommand(
+    'exec',
+    ['--', 'sh', '-c', 'while [ ! -e "$1" ]; do sleep 0.02; done', 'sh', flag],
+    execDeps(lane, over),
+    () => undefined,
+  ).finally(() => {
+    settled = true;
+  });
+  return {
+    running: () => !settled,
+    end: (): Promise<number> => {
+      fs.writeFileSync(flag, '');
+      return running;
+    },
+  };
 }
 
 test('an exec whose command runs past the park window counts as a call within one heartbeat of now while it runs, and stops counting once it exits', () =>
@@ -409,17 +471,9 @@ test('an exec whose command runs past the park window counts as a call within on
     const b = await another('exec-lane');
     const clock = new FakeClock(Date.now());
     const heartbeatMs = 20;
-    const flag = path.join(w.root, 'exec-may-end');
-    let settled = false;
-    const running = runUpCommand(
-      'exec',
-      ['--', 'sh', '-c', 'while [ ! -e "$1" ]; do sleep 0.02; done', 'sh', flag],
-      execDeps(b, { clock, heartbeatMs }),
-      () => undefined,
-    ).finally(() => {
-      settled = true;
-    });
+    const exec = execUntilEnded(b, path.join(w.root, 'exec-may-end'), { clock, heartbeatMs });
     const started = clock.now();
+    let code: number;
     try {
       await until(() => lastUse(w.stateDir, b.lane.id).action === 'exec: sh', 5000, "exec's first touch");
       await clock.advance(PARK_WINDOW_MS + 60_000);
@@ -428,18 +482,96 @@ test('an exec whose command runs past the park window counts as a call within on
         5000,
         `a heartbeat while the command runs (last call ${String(clock.now() - lastCallOf(w.stateDir, b.lane))} ms ago)`,
       );
-      assert.equal(settled, false, 'the command ended before the heartbeat was seen');
+      assert.equal(exec.running(), true, 'the command ended before the heartbeat was seen');
       assert.equal(lastUse(w.stateDir, b.lane.id).at, clock.now(), 'the heartbeat reached the registry too');
       assert.ok(clock.now() - started > PARK_WINDOW_MS);
     } finally {
-      fs.writeFileSync(flag, '');
+      code = await exec.end();
     }
-    assert.equal(await running, 0);
+    assert.equal(code, 0);
     const ended = lastCallOf(w.stateDir, b.lane);
     await clock.advance(PARK_WINDOW_MS);
     await new Promise(resolve => setTimeout(resolve, heartbeatMs * 10));
     assert.equal(lastCallOf(w.stateDir, b.lane), ended, 'the heartbeat outlived the command');
   }));
+
+test("an exec's heartbeat keeps counting through a beat that can't open the registry", () =>
+  withWorld('ios', async (w, another) => {
+    const b = await another('exec-lane');
+    const clock = new FakeClock(Date.now());
+    const exec = execUntilEnded(b, path.join(w.root, 'exec-may-end'), { clock, heartbeatMs: 20 });
+    let code: number;
+    try {
+      await clock.advance(1);
+      await until(() => lastUse(w.stateDir, b.lane.id).at === clock.now(), 5000, 'the heartbeat to start');
+
+      const fix = breakConfig(w.stateDir);
+      try {
+        await clock.advance(60_000);
+        await until(
+          () => lastCallOf(w.stateDir, b.lane) === clock.now(),
+          5000,
+          "a beat to record the call in the lane's folder while the registry can't be opened",
+        );
+        assert.ok(lastUse(w.stateDir, b.lane.id).at < clock.now(), 'the registry opened with an invalid config.json');
+      } finally {
+        fix();
+      }
+
+      await clock.advance(PARK_WINDOW_MS);
+      await until(
+        () => lastUse(w.stateDir, b.lane.id).at === clock.now(),
+        5000,
+        `the heartbeat once the registry opens again (last call ${String(clock.now() - lastCallOf(w.stateDir, b.lane))} ms ago)`,
+      );
+      assert.equal(exec.running(), true, 'the command ended before the heartbeat was seen');
+    } finally {
+      code = await exec.end();
+    }
+    assert.equal(code, 0);
+  }));
+
+test('an up hook that runs past the park window counts as a call within one heartbeat of now while it runs', async t => {
+  const w = world(t);
+  const flag = path.join(w.root, 'build-may-end');
+  w.write({
+    ...CONFIG,
+    app: { ...CONFIG.app, launch: 'hook' },
+    services: {},
+    hooks: {
+      ...CONFIG.hooks,
+      build: `while [ ! -e '${flag}' ]; do sleep 0.02; done; ${CONFIG.hooks.build}`,
+      launch: 'true',
+    },
+  });
+  const clock = new FakeClock(Date.now());
+  const heartbeatMs = 20;
+  const running = up(w.deps({ env: webEnv(w), clock, heartbeatMs }), OPTIONS);
+  let lane: LaneRef | undefined;
+  try {
+    await until(
+      () => (lane = onlyLane(w.state)) !== undefined && lastUse(w.state, lane.id).action === 'up: build',
+      10_000,
+      "the build hook's first touch",
+    );
+    assert.ok(lane);
+    const building = lane;
+    const started = clock.now();
+    await clock.advance(PARK_WINDOW_MS + 60_000);
+    await until(
+      () => lastCallOf(w.state, building) >= clock.now() - heartbeatMs,
+      5000,
+      `a heartbeat while the build hook runs (last call ${String(clock.now() - lastCallOf(w.state, building))} ms ago)`,
+    );
+    assert.equal(lastUse(w.state, building.id).at, clock.now(), 'the heartbeat reached the registry too');
+    assert.equal(lastUse(w.state, building.id).action, 'up: build');
+    assert.ok(clock.now() - started > PARK_WINDOW_MS);
+  } finally {
+    fs.writeFileSync(flag, '');
+    await running.catch(() => undefined);
+  }
+  assert.equal((await running).lane.id, lane.id);
+});
 
 test("a CLI call on a busy registry still counts: its time is in the lane's folder, the last call reads it with nothing replayed, and another lane's call leaves it alone", () =>
   withWorld('android', async (w, another) => {
