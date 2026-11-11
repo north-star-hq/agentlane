@@ -833,14 +833,12 @@ export class Registry {
     this.step('claim:locked');
     const db = this.store.db;
     const now = this.clock.now();
-    const unlisted = request.device !== null && this.devicesEndedSince(verdicts.ended);
     const retiring = this.landLeftovers(settling, listings, me, keeper, progress.notes);
-    const swept = this.sweep(verdicts, now, caller);
-    progress.freed.push(...swept);
+    progress.freed.push(...this.sweep(verdicts, now, caller));
     const { listed, leases } = this.reconcileAll(verdicts, backend, listings, me, keeper, now, stopped, progress.notes);
     this.step('claim:swept');
     if (retiring.length + leases.length > 0) return { kind: 'leased', leases: [...retiring, ...leases] };
-    if (unlisted || (request.device !== null && swept.some(lane => lane.device !== null))) return { kind: 'relist' };
+    if (request.device !== null && this.freedSinceListing(verdicts.ended, listings)) return { kind: 'relist' };
 
     const existing = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(caller.key, caller.worktree);
     const existingId = existing ? text(existing, 'id') : null;
@@ -1263,8 +1261,17 @@ export class Registry {
     return { add: pick, drop: current };
   }
 
-  private devicesEndedSince(seq: number): boolean {
-    return this.store.db.prepare('SELECT 1 FROM history WHERE seq > ? AND device IS NOT NULL LIMIT 1').get(seq) !== undefined;
+  private freedSinceListing(seq: number, listings: Listings): boolean {
+    const db = this.store.db;
+    for (const end of db.prepare('SELECT DISTINCT device FROM history WHERE seq > ? AND device IS NOT NULL').all(seq)) {
+      const row = db
+        .prepare('SELECT platform, device_id FROM devices WHERE name = ? AND claim_id IS NULL AND device_id IS NOT NULL')
+        .get(text(end, 'device'));
+      if (!row || !this.backends[text(row, 'platform') as Platform]) continue;
+      const listed = listings.get(text(row, 'platform') as Platform);
+      if (!listed || listed instanceof Error || !listed.some(d => d.id === text(row, 'device_id') && d.booted)) return true;
+    }
+    return false;
   }
 
   private emulatorPortsExhausted(listening: ReadonlySet<number>, now: number): Refusal {
@@ -1623,7 +1630,6 @@ export class Registry {
 
   private poolChanging(request: LaneRequest, since: number, started: number): Refusal {
     const now = this.clock.now();
-    const noun = NOUN[request.device?.platform ?? 'ios'];
     const ends = this.store.db
       .prepare('SELECT * FROM history WHERE seq > ? AND device IS NOT NULL ORDER BY seq')
       .all(since)
@@ -1634,10 +1640,12 @@ export class Registry {
         detail: `ended ${formatTime(int(row, 'ended_at'))} (${text(row, 'reason')}) by ${text(row, 'by_label')}`,
       }));
     const waited =
-      request.waitMs > 0 ? `its --timeout of ${formatAge(request.waitMs)} has passed` : 'it did not wait (--timeout 0)';
+      request.waitMs > 0
+        ? `its --timeout has passed, ${formatAge(now - started)} after it started`
+        : 'it did not wait (--timeout 0)';
     return new Refusal(
       'pool-busy',
-      `the ${noun} pool kept changing while this claim looked at it: a lane holding a device ended during each of its last two listings, ${formatAge(now - started)} after it started, and ${waited}`,
+      `the device pool kept changing while this claim looked at it: during each of its last two listings a lane ended and left a device that listing may show in an old state; ${waited}`,
       ends.length > 0 ? ends : [{ who: 'no lane the registry can see', folder: this.dir, since: formatTime(now) }],
       [
         `${CLI} claim --timeout 1800   (keep looking for up to 30 minutes)`,

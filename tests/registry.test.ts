@@ -2095,3 +2095,43 @@ test('a kept settlement that is handed over to delete its simulator is worked on
     w.close();
   }
 });
+
+test("a claim plans on its first listing when the lanes that ended meanwhile left nothing that listing could misreport: a device still under its shutdown lease, or one on a platform it can't list", async () => {
+  const w = world({ poolSize: 4, emulatorPoolSize: 4, memoryBudgetMb: 40_000 });
+  try {
+    const ends: (() => void)[] = [];
+    for (let i = 0; i < 2; i++) {
+      const ios = w.procs.owner();
+      const held = (await w.registry().claim(w.request(ios, w.folder(`ios${String(i)}`), { boot: true }))).lane;
+      const android = w.procs.owner();
+      const emulator = (
+        await w.registry().claim(w.request(android, w.folder(`android${String(i)}`), { device: { platform: 'android' } }))
+      ).lane;
+      ends.push(() => {
+        assert.throws(() => w.registry({ onStep: cutShort('release:committed') }).release(refOf(held), ios), /stopped at/);
+        w.registry().release(refOf(emulator), android);
+      });
+    }
+    const spare = w.procs.owner();
+    const free = (await w.registry().claim(w.request(spare, w.folder('spare')))).lane;
+    w.registry().release(refOf(free), spare);
+    let listings = 0;
+    const churn: PortProbe = {
+      listening: async () => {
+        listings++;
+        ends.shift()?.();
+        await w.clock.advance(400);
+        return new Set();
+      },
+    };
+    const got = await w
+      .registry({ ports: churn, devices: { ios: w.devices } })
+      .claim(w.request(w.procs.owner(), w.folder('late')));
+    assert.equal(got.lane.device?.id, free.device?.id);
+    assert.equal(listings, 1, 'it planned on its first listing');
+    assert.equal(leaseRows(w.dir), 1, "the released simulator's shutdown lease is still held");
+    assert.equal(w.emulators.all().filter(d => !d.booted).length, 1, 'the released emulator is back in its pool');
+  } finally {
+    w.close();
+  }
+});
