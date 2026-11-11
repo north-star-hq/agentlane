@@ -3,10 +3,15 @@ import { spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { DeviceBackend, DeviceDisk, Platform } from '../../src/devices/backend.ts';
 import { DeviceBackendError } from '../../src/devices/backend.ts';
 import { simctlBackend } from '../../src/devices/simctl.ts';
+import type { ProcessIdentity } from '../../src/processes.ts';
+import { DEFAULT_CONFIG } from '../../src/registry/config.ts';
+import type { DeviceWork } from '../../src/registry/leases.ts';
+import { handOver, KEEPER_PID, leaseDevice } from '../../src/registry/leases.ts';
 import { ownerKey, type Owner } from '../../src/registry/owner.ts';
 import { databasePath, stateDir } from '../../src/registry/paths.ts';
 import type {
@@ -28,12 +33,14 @@ import {
   reportPrunable,
 } from '../../src/registry/prune.ts';
 import { Refusal, UsageError } from '../../src/registry/refusal.ts';
-import type { Registry } from '../../src/registry/registry.ts';
+import type { Step } from '../../src/registry/registry.ts';
+import { Registry } from '../../src/registry/registry.ts';
 import { Store } from '../../src/registry/store.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { fakeXcrun, xcrunsOn, type FakeSimulator } from '../support/fake-xcrun.ts';
 import { FakeDevices, FakeProbe, FakeProcesses, tempDir } from '../support/fakes.ts';
 import { isolatedEnv, withProcessEnv } from '../support/isolated-env.ts';
+import { sharedRegistry, startClaimer, type StressOp } from '../support/stress-plan.ts';
 import { world, type World } from '../support/world.ts';
 
 const SPEC: Readonly<Record<Platform, readonly string[]>> = {
@@ -1390,5 +1397,360 @@ test('a prune that puts copies back never restores one another prune is deleting
     } finally {
       c.close();
     }
+  }
+});
+
+const HOLDER: ProcessIdentity = { pid: 4242, start: 'Tue Nov 10 09:00:00 2026' };
+const KEEPER: ProcessIdentity = { pid: KEEPER_PID, start: 'Sun Oct 11 07:00:00 2026' };
+
+function lease(dir: string, name: string, works: readonly DeviceWork[], keeper: ProcessIdentity | null): void {
+  write(dir, store => {
+    const terms = (work: DeviceWork) => ({
+      reservation: `${name}.${work}.${randomBytes(2).toString('hex')}`,
+      work,
+      holder: HOLDER,
+      keeper,
+      consolePort: null,
+      now: Date.now(),
+    });
+    const [first, ...then] = works;
+    assert.ok(first);
+    let held = leaseDevice(store.db, name, terms(first));
+    assert.ok(held, `${name} could not be leased`);
+    for (const work of then) held = handOver(store.db, held, terms(work));
+  });
+}
+
+interface Leased {
+  dir: string;
+  platform: Platform;
+  name: string;
+  listedAs: string;
+  works: DeviceWork[];
+  keeper: ProcessIdentity | null;
+}
+
+test('a device a lease holds, for any work and in any registry prune reads, is kept at the listing and under the locks, and prune --yes deletes nothing', async () => {
+  const c = cli();
+  try {
+    const cases: Leased[] = [
+      {
+        dir: c.own,
+        platform: 'ios',
+        name: 'agentlane-pool-a00001',
+        listedAs: 'agentlane-pool-a00001',
+        works: ['shutdown'],
+        keeper: KEEPER,
+      },
+      {
+        dir: c.own,
+        platform: 'android',
+        name: 'agentlane-emu-a00002',
+        listedAs: 'agentlane-emu-a00002',
+        works: ['delete'],
+        keeper: null,
+      },
+      {
+        dir: c.own,
+        platform: 'ios',
+        name: 'agentlane-pool-a00003',
+        listedAs: 'agentlane-pool-a00004',
+        works: ['shutdown', 'delete'],
+        keeper: KEEPER,
+      },
+      {
+        dir: c.former,
+        platform: 'ios',
+        name: 'agent-env-pool-b00001',
+        listedAs: 'agent-env-pool-b00001',
+        works: ['delete'],
+        keeper: KEEPER,
+      },
+      {
+        dir: c.former,
+        platform: 'android',
+        name: 'agent-env-emu-b00002',
+        listedAs: 'agent-env-emu-b00002',
+        works: ['shutdown'],
+        keeper: null,
+      },
+      {
+        dir: c.former,
+        platform: 'ios',
+        name: 'agent-env-pool-b00003',
+        listedAs: 'agent-env-pool-b00004',
+        works: ['shutdown', 'delete'],
+        keeper: KEEPER,
+      },
+    ];
+    const fakes = { ios: c.sims, android: c.emus };
+    const leased = cases.map(x => {
+      const id = fakes[x.platform].addByHand(x.listedAs, false);
+      formerDevice(x.dir, x.platform, x.name, id);
+      lease(x.dir, x.name, x.works, x.keeper);
+      return { ...x, id };
+    });
+    const holder = (x: Leased) => `a process ${x.works.at(-1) === 'delete' ? 'deleting it' : 'shutting it down'} (pid 4242)`;
+
+    const report = c.report();
+    assert.deepEqual(names(report.orphans), []);
+    const kept = report.kept.map(d => [d.name, d.platform, d.id, d.laneId, d.registry, d.reason]);
+    assert.deepEqual(
+      kept.sort(),
+      leased
+        .map(x =>
+          x.dir === c.own
+            ? [x.name, x.platform, x.id, null, c.own, `held by ${holder(x)}`]
+            : [x.listedAs, x.platform, x.id, null, c.former, `held by ${holder(x)} in the registry in ${c.former}`],
+        )
+        .sort(),
+    );
+
+    assert.deepEqual(
+      leased.map(x => {
+        const checked = deleteOrphan(c.ctx, c.devices[x.platform], {
+          name: x.listedAs,
+          platform: x.platform,
+          id: x.id,
+          paths: [],
+          bytes: null,
+        });
+        return [x.listedAs, checked.outcome, checked.detail];
+      }),
+      leased.map(x => [x.listedAs, 'kept', `the registry in ${x.dir} now records it as held by ${holder(x)}`]),
+    );
+
+    const pruned = await c.run('--yes');
+    assert.equal(pruned.code, 0, pruned.stderr);
+    const [shutdown] = leased;
+    assert.ok(shutdown);
+    assert.match(
+      pruned.stdout,
+      new RegExp(`^  ${shutdown.name}  simulator  ${shutdown.id}  held by a process shutting it down \\(pid 4242\\)$`, 'm'),
+    );
+    assert.doesNotMatch(pruned.stdout, /no registry on this Mac|^deleted/m);
+    const done = JSON.parse((await c.run('--yes', '--json')).stdout) as PruneReport & {
+      results: PruneResult[];
+      orphanResults: OrphanResult[];
+    };
+    assert.deepEqual([done.free, done.orphans, done.results, done.orphanResults], [[], [], [], []]);
+    assert.deepEqual(names(done.kept), names(report.kept));
+
+    assert.deepEqual([...c.sims.calls, ...c.emus.calls], []);
+    assert.deepEqual([...c.sims.all(), ...c.emus.all()].map(d => d.id).sort(), leased.map(x => x.id).sort());
+  } finally {
+    c.close();
+  }
+});
+
+interface Probe {
+  work: string;
+  offered: boolean;
+  kept: string | null;
+  checked: [string, string | null];
+}
+
+test('prune keeps a simulator while this version shuts it down, deletes it to make room or creates one outside the registry lock', async () => {
+  const c = cli();
+  const procs = new FakeProcesses();
+  const self = procs.spawn();
+  let stepped: (step: Step) => void = () => undefined;
+  const r = Registry.open({
+    dir: c.own,
+    processes: procs,
+    ports: new FakeProbe(),
+    devices: c.devices,
+    config: { ...DEFAULT_CONFIG, poolSize: 1 },
+    self,
+    onStep: step => {
+      stepped(step);
+    },
+  });
+  try {
+    const probes: Probe[] = [];
+    const probe = (work: string, name: string, id: string) => {
+      const report = c.report();
+      const checked = deleteOrphan(c.ctx, c.backend, { name, platform: 'ios', id, paths: [], bytes: null });
+      probes.push({
+        work,
+        offered: report.orphans.some(d => d.id === id),
+        kept: report.kept.find(d => d.id === id || d.name === name)?.reason ?? null,
+        checked: [checked.outcome, checked.detail],
+      });
+    };
+    const lane = (folder: string, deviceType: string, strict: boolean) => {
+      const worktree = path.join(c.root, 'worktrees', folder);
+      fs.mkdirSync(worktree, { recursive: true });
+      return {
+        owner: procs.owner(),
+        worktree,
+        projectRoot: worktree,
+        services: [],
+        device: { platform: 'ios' as const, deviceType, strict },
+        waitMs: 0,
+      };
+    };
+
+    const released = lane('released', 'iPhone 17', false);
+    const held = (await r.claim(released)).lane;
+    const device = held.device;
+    assert.ok(device);
+    let work: 'shutdown' | 'delete' = 'shutdown';
+    const probed = new Set<string>();
+    c.sims.during = (call, target) => {
+      if (call !== work || target !== device.id || probed.has(call)) return;
+      probed.add(call);
+      probe(call, device.name, device.id);
+    };
+    r.release({ id: held.id, token: held.token }, released.owner);
+    assert.ok(
+      c.sims.all().some(d => d.id === device.id),
+      'the released simulator is gone',
+    );
+    assert.equal(r.status().pool.find(d => d.name === device.name)?.laneId, null);
+
+    work = 'delete';
+    stepped = step => {
+      if (step !== 'claim:created-device') return;
+      const name =
+        c.sims.calls
+          .filter(call => call.startsWith('create '))
+          .at(-1)
+          ?.slice('create '.length) ?? '';
+      probe('create', name, c.sims.all().find(d => d.name === name)?.id ?? '');
+    };
+    const strict = (await r.claim(lane('strict', 'iPhone 17 Pro', true))).lane;
+
+    const by = `a process shutting it down (pid ${String(self.pid)})`;
+    const retiring = `a process deleting it (pid ${String(self.pid)})`;
+    assert.deepEqual(probes, [
+      {
+        work: 'shutdown',
+        offered: false,
+        kept: `held by ${by}`,
+        checked: ['kept', `the registry in ${c.own} now records it as held by ${by}`],
+      },
+      {
+        work: 'delete',
+        offered: false,
+        kept: `held by ${retiring}`,
+        checked: ['kept', `the registry in ${c.own} now records it as held by ${retiring}`],
+      },
+      {
+        work: 'create',
+        offered: false,
+        kept: 'a claim is creating it',
+        checked: ['kept', `the registry in ${c.own} records it now`],
+      },
+    ]);
+    assert.equal(strict.device?.deviceTypeName, 'iPhone 17 Pro');
+    assert.deepEqual(names(c.sims.all()), [strict.device.name]);
+    assert.deepEqual(
+      c.sims.calls.filter(call => call.startsWith('delete ')),
+      [`delete ${device.id}`],
+    );
+  } finally {
+    r.close();
+    c.close();
+  }
+});
+
+const CLAIMER = path.join(import.meta.dirname, '..', 'support', 'stress-claimer.ts');
+
+function readRegistry<T>(dir: string, read: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  try {
+    return read(db);
+  } finally {
+    db.close();
+  }
+}
+
+function waitUntil(done: () => boolean, what: string): void {
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 30_000;
+  while (!done()) {
+    if (Date.now() > deadline) throw new Error(what);
+    Atomics.wait(cell, 0, 0, 10);
+  }
+}
+
+test("a release's lease that ends, and a claim that takes the simulator, between prune's locked check and its delete leave the new lane its simulator", async () => {
+  const s = sharedRegistry({ ...DEFAULT_CONFIG, poolSize: 1 });
+  const root = fs.realpathSync(tempDir('prune-race'));
+  try {
+    const env = { ...isolatedEnv(root), PATH: process.env.PATH, AGENTLANE_STATE_DIR: s.stateDir };
+    const ctx: PruneContext = { env, cwd: root, lockWaitMs: 5000 };
+    const claim = (folder: string): StressOp => ({
+      kind: 'claim',
+      worktree: s.folder(folder),
+      platform: 'ios',
+      device: 'iPhone 17',
+      strict: false,
+      boot: false,
+      waitMs: 0,
+    });
+    const releaser = startClaimer(s.plan([claim('released'), { kind: 'release' }], { gate: ['shutdown'] }));
+    const id = await s.reached('shutdown', releaser);
+    const name = s.sims.all().find(d => d.id === id)?.name ?? '';
+    const store = Store.openExisting(s.stateDir, 5000);
+    let listing: PruneReport;
+    try {
+      listing = reportPrunable(listPrunable(store, s.stateDir, { ios: s.sims, android: s.emulators }), ctx);
+    } finally {
+      store?.close();
+    }
+
+    const next: { lane: { id: string; device: string | null } | null } = { lane: null };
+    const settleAndClaim = () => {
+      if (next.lane) return;
+      s.open('shutdown');
+      waitUntil(
+        () => readRegistry(s.stateDir, db => db.prepare('SELECT COUNT(*) AS n FROM device_leases').get()?.n === 0),
+        'the release never ended its lease',
+      );
+      const claimed = spawnSync(process.execPath, [CLAIMER, JSON.stringify(s.plan([claim('next')]))], {
+        encoding: 'utf8',
+        timeout: 60_000,
+      });
+      assert.equal(claimed.status, 0, claimed.stderr);
+      const line = /^claimed (.*)$/m.exec(claimed.stdout)?.[1];
+      assert.ok(line, claimed.stdout);
+      next.lane = JSON.parse(line) as { id: string; device: string | null };
+    };
+    const racing = over(s.sims, {
+      delete: (target, whenRunning) => {
+        settleAndClaim();
+        s.sims.delete(target, whenRunning);
+      },
+    });
+    const checked = deleteOrphan(ctx, racing, { name, platform: 'ios', id, paths: [], bytes: null });
+    settleAndClaim();
+    const ended = await releaser.exited;
+
+    assert.ok(
+      s.sims.all().some(d => d.id === id),
+      'prune deleted the simulator the next lane claimed',
+    );
+    assert.equal(next.lane?.device, id);
+    assert.equal(
+      readRegistry(s.stateDir, db => db.prepare('SELECT claim_id FROM devices WHERE device_id = ?').get(id)?.claim_id),
+      next.lane.id,
+    );
+    const by = `a process shutting it down (pid ${String(releaser.pid)})`;
+    assert.deepEqual(
+      [checked.outcome, checked.detail],
+      ['kept', `the registry in ${s.stateDir} now records it as held by ${by}`],
+    );
+    assert.equal(
+      listing.orphans.some(d => d.id === id),
+      false,
+      'prune offered the simulator the release was shutting down',
+    );
+    assert.equal(listing.kept.find(d => d.id === id)?.reason, `held by ${by}`);
+    assert.equal(ended.code, 0, ended.stderr);
+  } finally {
+    s.close();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
