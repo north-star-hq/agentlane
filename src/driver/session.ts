@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { keepNewestLinesAsSoleWriter, type LineLimit } from '../disk-limits.ts';
 import { checkAbsent, readIn, treeBound } from './absence.ts';
 import { diffScreens, renderDiff, volatileBetween, type VolatileSet } from './diff.ts';
 import { messageOf } from './errors.ts';
@@ -57,6 +58,7 @@ export interface RecordArgs {
 export const PIXEL_CHECK_WIDTH = 200;
 const VOLATILE_TTL_MS = 5 * 60_000;
 const RECENT_READ_MS = 5000;
+export const RECORDED_STEPS_LIMIT: LineLimit = { maxBytes: 1024 * 1024, keepBytes: 512 * 1024 };
 const RESPAWN_NOTE = "Maestro's session was rebuilt for this call";
 
 interface MaestroOutcome {
@@ -394,7 +396,8 @@ export class DriverSession {
   private record(run: RecordedRun): void {
     if (run.passed === 0) return;
     fs.mkdirSync(path.dirname(this.stepsFile), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(this.stepsFile, `${JSON.stringify(run)}\n`);
+    fs.appendFileSync(this.stepsFile, `${JSON.stringify({ ...run, at: Date.now() })}\n`);
+    keepNewestLinesAsSoleWriter(this.stepsFile, RECORDED_STEPS_LIMIT);
   }
 
   async run(args: RunArgs): Promise<OpResult> {

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { DeviceBackendError } from '../../src/devices/backend.ts';
 import {
   createEmulatorBackend,
+  EMULATOR_LOG_MAX_BYTES,
   deviceProfileName,
   findAndroidSdk,
   parseAdbDevices,
@@ -150,3 +151,36 @@ test(
     assert.ok(names.length > 0, 'at least one AVD on this Mac');
   },
 );
+
+test("a pool emulator's log past its limit moves to .1 at the next boot, and the boot's error still quotes the new log", async () => {
+  const root = fakeSdk();
+  for (const [tool, body] of [
+    ['emulator/emulator', 'echo "fake emulator for $2"\nexit 3'],
+    ['platform-tools/adb', 'exit 1'],
+  ] as const) {
+    fs.writeFileSync(path.join(root, tool), `#!/bin/sh\n${body}\n`);
+    fs.chmodSync(path.join(root, tool), 0o755);
+  }
+  const home = tempDir('emulator-home');
+  const sdk = findAndroidSdk({ ANDROID_HOME: root, HOME: home });
+  assert.ok(sdk);
+  const logDir = tempDir('emulator-logs');
+  const name = 'agentlane-emu-c0ffee';
+  const log = path.join(logDir, `${name}.log`);
+  const earlier = `earlier boots\n${'x'.repeat(EMULATOR_LOG_MAX_BYTES)}\n`;
+  fs.writeFileSync(log, earlier);
+  const backend = createEmulatorBackend({ env: { HOME: home }, logDir, sdk });
+  try {
+    await assert.rejects(backend.boot(name, 5584), (error: unknown) => {
+      assert.ok(error instanceof DeviceBackendError);
+      assert.match(error.message, /exited before it booted \(exit code 3\)/);
+      assert.match(error.message, /fake emulator for agentlane-emu-c0ffee/);
+      assert.doesNotMatch(error.message, /xxxx/);
+      return true;
+    });
+    assert.equal(fs.readFileSync(`${log}.1`, 'utf8'), earlier);
+    assert.equal(fs.readFileSync(log, 'utf8'), 'fake emulator for agentlane-emu-c0ffee\n');
+  } finally {
+    for (const dir of [root, home, logDir]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

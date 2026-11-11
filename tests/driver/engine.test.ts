@@ -6,6 +6,10 @@ import { callEngine, engineStatus, stopEngine } from '../../src/driver/client.ts
 import { messageOf } from '../../src/driver/errors.ts';
 import { enginePaths } from '../../src/driver/paths.ts';
 import { lockHolder } from '../../src/driver/lock.ts';
+import { RECORDED_STEPS_LIMIT } from '../../src/driver/session.ts';
+import { laneEvidence } from '../../src/evidence/evidence.ts';
+import { tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { alive, driverWorld, until, type DriverWorld } from '../support/driver-world.ts';
 
 async function withWorld(options: Parameters<typeof driverWorld>[0], body: (world: DriverWorld) => Promise<void>): Promise<void> {
@@ -121,6 +125,46 @@ test('run returns what changed on screen, and its passing steps become a flow th
       'appId: com.apple.Preferences\n---\n- tapOn:\n    id: com.apple.settings.general\n- assertVisible: About\n',
     );
   }));
+
+test('recorded steps past their limit keep the newest runs, record save still writes them, and evidence stays', async () => {
+  const home = tempDir('engine-home');
+  const env = hermeticEnv(home);
+  delete env.AGENTLANE_STATE_DIR;
+  try {
+    await withWorld({ env: env as Record<string, string> }, async world => {
+      const paths = enginePaths(world.stateDir, world.lane.id);
+      fs.mkdirSync(path.dirname(paths.steps), { recursive: true, mode: 0o700 });
+      const old = (n: number) =>
+        `${JSON.stringify({ yaml: `appId: com.apple.Preferences\n---\n- assertVisible: Old ${String(n)}\n`, passed: 1 })}\n`;
+      const n = Math.ceil(RECORDED_STEPS_LIMIT.maxBytes / old(0).length) + 1;
+      fs.writeFileSync(paths.steps, Array.from({ length: n }, (_, i) => old(i)).join(''));
+      assert.ok(fs.statSync(paths.steps).size > RECORDED_STEPS_LIMIT.maxBytes);
+      const evidence = laneEvidence(world.stateDir, world.lane.id);
+      const kept = path.join(evidence, '2026-10-13T09-00-00-000Z-trace-device', 'flows.jsonl');
+      fs.mkdirSync(path.dirname(kept), { recursive: true });
+      fs.copyFileSync(paths.steps, kept);
+      const evidenceBytes = fs.readFileSync(kept);
+
+      const ran = await callEngine(world.target(), { op: 'run', args: { yaml: '- assertVisible: General\n' } });
+      assert.equal(ran.ok, true, ran.text);
+      assert.ok(fs.statSync(paths.steps).size <= RECORDED_STEPS_LIMIT.keepBytes, String(fs.statSync(paths.steps).size));
+      const lines = fs.readFileSync(paths.steps, 'utf8').split('\n').filter(Boolean);
+      const runs = lines.map(line => JSON.parse(line) as { yaml: string; at?: number });
+      assert.match(runs[0]?.yaml ?? '', /^appId: com\.apple\.Preferences\n---\n- assertVisible: Old \d+\n$/);
+      assert.doesNotMatch(runs[0]?.yaml ?? '', /Old 0\n/, 'the oldest runs went');
+      assert.match(runs.at(-1)?.yaml ?? '', /- assertVisible: General\n$/, 'the newest run stays');
+      assert.equal(typeof runs.at(-1)?.at, 'number', 'a recorded run carries when it was recorded, for a device trace');
+
+      const shown = await callEngine(world.target(), { op: 'record', args: { action: 'show' } });
+      assert.equal(shown.ok, true, shown.text);
+      assert.match(shown.text ?? '', /^appId: com\.apple\.Preferences\n---\n- assertVisible: Old \d+\n/);
+      assert.match(shown.text ?? '', new RegExp(`- assertVisible: Old ${String(n - 1)}\\n- assertVisible: General\\n$`));
+      assert.deepEqual(fs.readFileSync(kept), evidenceBytes, 'the evidence folder is untouched');
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test("a restarted engine takes the app for YAML without a header from the lane's recorded steps", () =>
   withWorld({}, async world => {

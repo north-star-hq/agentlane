@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { backupProject, keepNewestBackups } from '../disk-limits.ts';
 import { CLI, CONFIG_FILE, TOOL } from '../name.ts';
 import { findConfigFile } from '../project/config.ts';
 import type { Agent } from '../registry/owner.ts';
@@ -32,6 +33,7 @@ import {
 import { listSkills, SKILLS_DIR } from './skills.ts';
 
 export const AGENT_COMMANDS = ['init', 'skills'] as const;
+export const INIT_BACKUPS_KEPT = 5;
 type AgentCommand = (typeof AGENT_COMMANDS)[number];
 
 export const AGENT_HELP: UsageGroup<AgentCommand> = {
@@ -264,7 +266,11 @@ async function init(args: string[], deps: AgentCliDeps): Promise<number> {
     return changes.length > 0 ? 1 : 0;
   }
   const stamp = new Date((deps.now ?? Date.now)()).toISOString().replace(/[:.]/g, '-');
-  const { backups } = applyInit(plan, path.join(stateDir(deps.env), 'init-backups', `${stamp}-${path.basename(root)}`));
+  const backupsDir = path.join(stateDir(deps.env), 'init-backups');
+  const project = backupProject(root);
+  const backup = `${stamp}-${project}`;
+  const { backups } = applyInit(plan, path.join(backupsDir, backup));
+  keepNewestBackups(backupsDir, project, INIT_BACKUPS_KEPT, backup);
   const toolkit = await provideToolkit(
     root,
     deps.env,
