@@ -123,12 +123,39 @@ test('a version kept for any reason keeps the folders it needs, and one removed 
       ...options(root, lines),
       processes: { startTimes: () => new Map([[999_999, 'other']]), info: () => undefined, cwd: () => undefined },
       commandLines: () => [`node ${used ?? ''}/package/cli.js daemon`],
-      laneTools: () => [`#!/bin/sh\nmaestro='${shim}/bin/tool'\n`],
+      laneTools: () => [[`#!/bin/sh\nmaestro='${shim}/bin/tool'\n`]],
     },
   );
   assert.deepEqual(removed.sort(), [unused, forUnused].sort(), lines.join('\n'));
   assert.ok(lines.includes(`kept ${forUsed ?? ''}, which a kept version runs`), lines.join('\n'));
   assert.ok(lines.includes(`kept ${shim}, which a lane that is up runs`), lines.join('\n'));
+});
+
+test("a launcher's needs stay while a process or lane runs it without naming what it launches, judged for each", () => {
+  const root = fs.realpathSync(tempDir('superseded-launcher'));
+  const [launched, other] = ['shell-1', 'shell-0'].map(name => version(path.join(root, 'browsers'), name));
+  const tool = path.join(root, 'tool');
+  const binary = path.join(tool, '1.0.0', 'bin', 'tool');
+  const launcher = { dir: tool, launches: [launched ?? ''], needs: [launched ?? '', other ?? ''] };
+  const run = (commands: string[], lanes: string[][]) => {
+    const lines: string[] = [];
+    const removed = removeOlderVersions([{ dir: launched ?? '' }, { dir: other ?? '' }], {
+      ...options(root, lines),
+      commandLines: () => commands,
+      laneTools: () => lanes,
+      launchers: [launcher],
+      log: line => lines.push(line),
+    });
+    for (const dir of removed) fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+    return { removed, lines };
+  };
+  const naming = `exec ${binary}\nEXECUTABLE=${launched ?? ''}/bin/tool`;
+  assert.deepEqual(run([], [[naming]]).removed, [other], 'a lane that names what it launches keeps only that');
+  assert.deepEqual(run([], [[naming], [`exec ${binary}`]]).removed, [], 'another lane that names nothing keeps both');
+  assert.deepEqual(run([`${binary} daemon`], [[naming]]).removed, [], 'so does a running process');
+  assert.deepEqual(run([`exec ${binary}`, `${launched ?? ''}/bin/tool --headless`], []).removed, [], 'judged per process');
+  const { lines } = run([`${binary} daemon`], []);
+  assert.ok(lines.includes(`kept ${other ?? ''}, which tool may run`), lines.join('\n'));
 });
 
 test('a registry that cannot say whether a lane uses a version keeps every version', () => {

@@ -36,10 +36,10 @@ export const systemCommandLines: CommandLines = () => {
 };
 
 /**
- * What every lane recorded in a registry runs: the text and link target of each file in its `bin/`, and where its
- * `browser/ffmpeg/ffmpeg` points; undefined when a registry or a lane's files can't be read.
+ * What each lane recorded in a registry runs, one list a lane: the text, link target and real path of each file in its
+ * `bin/`, and where its `browser/ffmpeg/ffmpeg` points; undefined when a registry or a lane's files can't be read.
  */
-export type LaneTools = () => readonly string[] | undefined;
+export type LaneTools = () => readonly (readonly string[])[] | undefined;
 
 function registryDirs(env: NodeJS.ProcessEnv): string[] {
   const xdg = env.XDG_STATE_HOME;
@@ -79,6 +79,19 @@ function linkTarget(link: string): string | undefined {
   }
 }
 
+function realPath(file: string): string | undefined {
+  try {
+    return fs.realpathSync(file);
+  } catch (error) {
+    if (absent(error)) return undefined;
+    throw error;
+  }
+}
+
+function targetsOf(file: string): string[] {
+  return [linkTarget(file), realPath(file)].filter(target => target !== undefined);
+}
+
 function laneNames(lane: string): string[] {
   const names: string[] = [];
   const bin = path.join(lane, 'bin');
@@ -90,16 +103,14 @@ function laneNames(lane: string): string[] {
   }
   for (const name of files) {
     const file = path.join(bin, name);
-    const target = linkTarget(file);
-    if (target !== undefined) names.push(target);
+    names.push(...targetsOf(file));
     try {
       names.push(fs.readFileSync(file, 'utf8'));
     } catch (error) {
       if (!absent(error)) throw error;
     }
   }
-  const ffmpeg = linkTarget(path.join(lane, 'browser', 'ffmpeg', 'ffmpeg'));
-  if (ffmpeg !== undefined) names.push(ffmpeg);
+  names.push(...targetsOf(path.join(lane, 'browser', 'ffmpeg', 'ffmpeg')));
   return names;
 }
 
@@ -109,19 +120,19 @@ function laneNames(lane: string): string[] {
  */
 export function laneToolsOf(env: NodeJS.ProcessEnv): LaneTools {
   return () => {
-    const names: string[] = [];
+    const lanes: string[][] = [];
     for (const dir of registryDirs(env)) {
       const ids = recordedLaneIds(dir);
       if (ids === undefined) return undefined;
       for (const id of ids) {
         try {
-          names.push(...laneNames(path.join(lanesRoot(dir), id)));
+          lanes.push(laneNames(path.join(lanesRoot(dir), id)));
         } catch {
           return undefined;
         }
       }
     }
-    return names;
+    return lanes;
   };
 }
 
@@ -196,6 +207,19 @@ export interface OlderVersion {
   needs?: readonly string[];
 }
 
+/**
+ * A tool whose versions find what they launch outside their command line and files, as agent-browser finds its browser
+ * through a variable. A running process or recorded lane that names one of its versions and none of `launches` keeps
+ * everything in `needs`.
+ */
+export interface Launcher {
+  /** The folder the tool's versions are installed in. */
+  dir: string;
+  /** Folders the tool can launch; a user that names one of them has said what it runs. */
+  launches: readonly string[];
+  needs: readonly string[];
+}
+
 export interface RemoveOptions {
   /** The folder every removal must sit inside; undefined when the environment doesn't name one, which removes nothing. */
   root: string | undefined;
@@ -203,17 +227,39 @@ export interface RemoveOptions {
   processes: ProcessTable;
   commandLines: CommandLines;
   laneTools: LaneTools;
+  launchers?: readonly Launcher[];
   log: (line: string) => void;
 }
 
 const REMOVING = '.removing-';
 
-function inUse(dir: string, commands: readonly string[]): boolean {
+function spellingsOf(dir: string): string[] {
   const names = new Set([dir]);
   bestEffort(() => {
     names.add(fs.realpathSync(dir));
   });
-  return commands.some(command => [...names].some(name => command.includes(`${name}${path.sep}`) || command.endsWith(name)));
+  return [...names];
+}
+
+function mentions(spellings: readonly string[], texts: readonly string[]): boolean {
+  return texts.some(text => spellings.some(name => text.includes(`${name}${path.sep}`) || text.endsWith(name)));
+}
+
+function inUse(dir: string, texts: readonly string[]): boolean {
+  return mentions(spellingsOf(dir), texts);
+}
+
+/** What the launchers' users that don't name what they launch keep, with why. */
+function launched(launchers: readonly Launcher[], users: readonly (readonly string[])[]): Map<string, string> {
+  const needed = new Map<string, string>();
+  for (const launcher of launchers) {
+    const tool = spellingsOf(launcher.dir);
+    const launches = launcher.launches.map(spellingsOf);
+    if (users.some(user => mentions(tool, user) && !launches.some(dir => mentions(dir, user)))) {
+      for (const dir of launcher.needs) needed.set(dir, `which ${path.basename(launcher.dir)} may run`);
+    }
+  }
+  return needed;
 }
 
 /** Folders a removal was interrupted in, under the folders the versions sit in. */
@@ -261,7 +307,7 @@ function inside(root: string, dir: string): boolean {
 
 /**
  * Removes the older versions that no running process names on its command line, no recorded lane's files name,
- * no other process is installing and no kept version needs. Returns the folders removed.
+ * no other process is installing, no kept version needs and no launcher may run. Returns the folders removed.
  */
 export function removeOlderVersions(candidates: readonly OlderVersion[], options: RemoveOptions): string[] {
   if (candidates.length === 0) return [];
@@ -283,22 +329,27 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
     options.log(`kept ${older.map(v => v.dir).join(', ')}: a registry could not say whether a lane uses them`);
     return [];
   }
-  const needed = new Set<string>();
+  const needed = launched(options.launchers ?? [], [...commands.map(command => [command]), ...lanes]);
+  const neededBy = (version: OlderVersion) => {
+    for (const dir of version.needs ?? []) needed.set(dir, 'which a kept version runs');
+  };
   const keep = (version: OlderVersion, why: string) => {
-    for (const dir of version.needs ?? []) needed.add(dir);
+    neededBy(version);
     options.log(`kept ${version.dir}, ${why}`);
   };
+  const laneTexts = lanes.flat();
   const removed: string[] = [];
   for (const version of [...older.filter(v => v.needs), ...older.filter(v => !v.needs)]) {
-    if (needed.has(version.dir)) {
-      options.log(`kept ${version.dir}, which a kept version runs`);
+    const why = needed.get(version.dir);
+    if (why !== undefined) {
+      options.log(`kept ${version.dir}, ${why}`);
       continue;
     }
     if (inUse(version.dir, commands)) {
       keep(version, 'which a running process uses');
       continue;
     }
-    if (inUse(version.dir, lanes)) {
+    if (inUse(version.dir, laneTexts)) {
       keep(version, 'which a lane that is up runs');
       continue;
     }
@@ -312,7 +363,7 @@ export function removeOlderVersions(candidates: readonly OlderVersion[], options
     });
     if (version.lock !== undefined) unlock(version.lock, options.me);
     if (!moved) {
-      for (const dir of version.needs ?? []) needed.add(dir);
+      neededBy(version);
       continue;
     }
     bestEffort(() => {

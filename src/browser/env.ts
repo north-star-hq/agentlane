@@ -12,6 +12,11 @@ export const BROWSER_SESSION_ENV = envName('BROWSER_SESSION');
 export const BROWSER_PROFILE_ENV = envName('BROWSER_PROFILE');
 export const BROWSER_CDP_ENV = envName('BROWSER_CDP');
 
+const EXECUTABLE_PATH_ENV = 'AGENT_BROWSER_EXECUTABLE_PATH';
+
+/** The lane's `bin/` file that names the browsers it was set up with, one executable a line. */
+const BROWSERS_RECORD = '.browsers';
+
 export interface BrowserSetting {
   browser: ClaimedBrowser;
   paths: BrowserPaths;
@@ -46,7 +51,9 @@ exec ${cli.map(shellQuote).join(' ')} "$@"
 `;
 }
 
-export function agentBrowserShim(cli: readonly string[], ffmpegDir: string | null): string {
+export function agentBrowserShim(cli: readonly string[], ffmpegDir: string | null, executable: string | null): string {
+  const executableLine =
+    executable === null ? '' : `${EXECUTABLE_PATH_ENV}=${shellQuote(executable)}\nexport ${EXECUTABLE_PATH_ENV}\n`;
   const pathLine = ffmpegDir === null ? '' : `PATH=${shellQuote(ffmpegDir)}:"$PATH"\nexport PATH\n`;
   return `#!/bin/sh
 # ${TOOL}: agent-browser, the toolkit's pinned build, on the toolkit's Chrome for Testing.
@@ -55,20 +62,36 @@ case "$1" in
     echo "${TOOL}: agent-browser and its Chrome are pinned and installed by ${TOOL} (${CLI} browser install), so agent-browser $1 is refused here." >&2
     exit 2 ;;
 esac
-${pathLine}exec ${cli.map(shellQuote).join(' ')} "$@"
+${executableLine}${pathLine}exec ${cli.map(shellQuote).join(' ')} "$@"
 `;
 }
 
-function writeExecutable(file: string, content: string): void {
+/** The browser executables an install gives a lane, one a line. */
+function browsersRecord(install: Pick<InstalledDriver, 'chrome' | 'headlessShell' | 'ffmpeg'>): string {
+  return [install.chrome, install.headlessShell, install.ffmpeg]
+    .filter(file => file !== '')
+    .map(file => `${file}\n`)
+    .join('');
+}
+
+function writeFile(file: string, content: string, mode: number): void {
   const temp = `${file}.${String(process.pid)}.tmp`;
-  fs.writeFileSync(temp, content, { mode: 0o755 });
+  fs.writeFileSync(temp, content, { mode });
   fs.renameSync(temp, file);
 }
 
-/** Writes the lane's driver wrapper and the files its driver reads, and returns the folder that goes first on PATH. */
+function writeExecutable(file: string, content: string): void {
+  writeFile(file, content, 0o755);
+}
+
+/**
+ * Writes the lane's driver wrapper, the files its driver reads and the record of its browsers, and returns the folder
+ * that goes first on PATH.
+ */
 export function writeDriverFiles(setting: BrowserSetting, laneId: string): string {
   const { paths, install, browser } = setting;
   for (const dir of [paths.dir, paths.bin, paths.output, paths.evidence]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFile(path.join(paths.bin, BROWSERS_RECORD), browsersRecord(install), 0o600);
   if (browser.driver === 'playwright') {
     fs.mkdirSync(paths.playwrightSessions, { recursive: true, mode: 0o700 });
     const config = path.join(paths.playwrightConfigHome, '.playwright');
@@ -85,7 +108,8 @@ export function writeDriverFiles(setting: BrowserSetting, laneId: string): strin
       fs.rmSync(link, { force: true });
       fs.symlinkSync(install.ffmpeg, link);
     }
-    writeExecutable(path.join(paths.bin, 'agent-browser'), agentBrowserShim(install.cli, ffmpegDir));
+    const executable = install.headlessShell === '' ? null : install.headlessShell;
+    writeExecutable(path.join(paths.bin, 'agent-browser'), agentBrowserShim(install.cli, ffmpegDir, executable));
   }
   return paths.bin;
 }
@@ -126,7 +150,7 @@ export function browserVariables(setting: BrowserSetting, basePath: string): Rec
     AGENT_BROWSER_ARGS: `--remote-debugging-port=${String(browser.debugPort)}`,
     AGENT_BROWSER_SCREENSHOT_DIR: paths.output,
   });
-  if (install.headlessShell !== '') vars.AGENT_BROWSER_EXECUTABLE_PATH = install.headlessShell;
+  if (install.headlessShell !== '') vars[EXECUTABLE_PATH_ENV] = install.headlessShell;
   if (browser.streamPort !== null) vars.AGENT_BROWSER_STREAM_PORT = String(browser.streamPort);
   return vars;
 }

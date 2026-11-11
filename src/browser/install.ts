@@ -422,14 +422,19 @@ function pinnedBrowsers(core: string, base: string): string[] | undefined {
   }
 }
 
+/** The browser folders the toolkit installed, each with the pinned build it is a revision of. */
+function installedBuilds(base: string, builds: readonly BrowserBuild[]): { dir: string; pin: BrowserBuild; revision: string }[] {
+  return installedFolders(base).flatMap(name => {
+    const m = /^(.+)-(\d+)$/.exec(name);
+    const pin = builds.find(b => browserFolder({ name: b.name, revision: '' }) === `${m?.[1] ?? ''}-`);
+    return m?.[2] !== undefined && pin !== undefined ? [{ dir: path.join(base, name), pin, revision: m[2] }] : [];
+  });
+}
+
 function olderBrowsers(base: string, builds: readonly BrowserBuild[]): OlderVersion[] {
-  return installedFolders(base)
-    .filter(name => {
-      const m = /^(.+)-(\d+)$/.exec(name);
-      const build = builds.find(b => browserFolder({ name: b.name, revision: '' }) === `${m?.[1] ?? ''}-`);
-      return m?.[2] !== undefined && build !== undefined && compareVersions(m[2], build.revision) < 0;
-    })
-    .map(name => ({ dir: path.join(base, name) }));
+  return installedBuilds(base, builds)
+    .filter(build => compareVersions(build.revision, build.pin.revision) < 0)
+    .map(build => ({ dir: build.dir }));
 }
 
 function linkOf(base: string, core: string): string {
@@ -445,7 +450,8 @@ function linkPlaywright(base: string, core: string): void {
 /**
  * Installs what the driver needs that is missing or does not match its pin, under a lock held across processes.
  * Then removes the older driver packages and browsers it installed that no running process, no file of a recorded
- * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses.
+ * lane's `bin/` or `browser/ffmpeg/ffmpeg`, and no kept version uses. Every older browser stays while a process or
+ * lane runs agent-browser, of any version, without naming the browser it launches.
  */
 export async function ensureBrowserDriver(driver: BrowserDriverName, options: BrowserInstallOptions): Promise<InstalledDriver> {
   const releases = {
@@ -507,14 +513,19 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
     if (after.kind !== 'installed') throw new DriverError(describeInstallState(driver, after), `retry ${INSTALL_FIX}`);
     const base = browsersPath(options.env);
     const cores = path.dirname(core);
-    const browsers = options.env[BROWSERS_OVERRIDE_ENV] === undefined ? olderBrowsers(base, playwright.browsers) : [];
+    const overridden = options.env[BROWSERS_OVERRIDE_ENV] !== undefined;
+    const browsers = overridden ? [] : olderBrowsers(base, playwright.browsers);
     const all = browsers.map(b => b.dir);
+    const agentBrowsers = path.dirname(agentBrowserHome(options.env, agentBrowser));
+    const launches = overridden
+      ? []
+      : installedBuilds(base, playwright.browsers)
+          .filter(b => b.pin.name !== 'ffmpeg')
+          .map(b => b.dir);
     const newer = packagesBy(cores, playwright.version, order => order > 0).map(dir => pinnedBrowsers(dir, base) ?? all);
     const older: OlderVersion[] = [
       ...packagesBy(cores, playwright.version, order => order < 0).map(dir => ({ dir, needs: pinnedBrowsers(dir, base) ?? all })),
-      ...packagesBy(path.dirname(agentBrowserHome(options.env, agentBrowser)), agentBrowser.version, order => order < 0).map(
-        dir => ({ dir, needs: all }),
-      ),
+      ...packagesBy(agentBrowsers, agentBrowser.version, order => order < 0).map(dir => ({ dir, needs: all })),
       ...browsers.filter(b => !newer.flat().includes(b.dir)),
     ];
     const removed = removeOlderVersions(older, {
@@ -523,6 +534,7 @@ export async function ensureBrowserDriver(driver: BrowserDriverName, options: Br
       processes,
       commandLines: options.commandLines ?? systemCommandLines,
       laneTools: options.laneTools ?? laneToolsOf(options.env),
+      launchers: [{ dir: agentBrowsers, launches, needs: all }],
       log: options.log ?? (() => undefined),
     });
     for (const dir of removed.filter(d => path.dirname(d) === cores)) {
