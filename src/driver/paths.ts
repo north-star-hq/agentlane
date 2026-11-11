@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { envName } from '../name.ts';
 import { diskNames, lanesRoot } from '../registry/paths.ts';
 import { DriverError } from './errors.ts';
 import { isAlive } from './exec.ts';
@@ -29,18 +30,23 @@ export interface EnginePaths {
 // sockaddr_un.sun_path holds 104 bytes on macOS and 108 on Linux, terminator included.
 export const SUN_PATH_LIMIT = 100;
 
+export const USER_TEMP_ENV = envName('USER_TEMP');
+
 let cachedTemp: string | undefined;
 
+function findPerUserTemp(): string {
+  const override = process.env[USER_TEMP_ENV];
+  if (override && path.isAbsolute(override)) return override;
+  if (process.platform !== 'darwin') return '/tmp';
+  const result = spawnSync('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' });
+  const found = result.status === 0 ? result.stdout.trim() : '';
+  return found || '/tmp';
+}
+
+/** The folder for sockets whose path in the state dir would be too long: macOS's per-user temp folder, or /tmp. */
 export function perUserTemp(): string {
-  if (cachedTemp !== undefined) return cachedTemp;
-  let dir = '/tmp';
-  if (process.platform === 'darwin') {
-    const result = spawnSync('getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' });
-    const found = result.status === 0 ? result.stdout.trim() : '';
-    if (found) dir = found;
-  }
-  cachedTemp = dir;
-  return dir;
+  cachedTemp ??= findPerUserTemp();
+  return cachedTemp;
 }
 
 export function ensurePrivateDir(dir: string): string {

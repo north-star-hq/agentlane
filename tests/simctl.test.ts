@@ -8,6 +8,7 @@ import { newestIphone, parseDeviceList, resolveSimSpec, simctlBackend } from '..
 import { UsageError } from '../src/registry/refusal.ts';
 import { fakeXcrun, xcrunsOn } from './support/fake-xcrun.ts';
 import { CATALOG, tempDir } from './support/fakes.ts';
+import { useOwnerFolders } from './support/isolate.ts';
 import { isolatedEnv, withProcessEnv } from './support/isolated-env.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_SIMCTL === '1';
@@ -144,7 +145,8 @@ test("a fake xcrun that can't run fails the call instead of reaching any other x
 test(
   'live simctl: the defaults resolve on this Mac and the list sees every simulator',
   { skip: !LIVE && 'set AGENTLANE_LIVE_SIMCTL=1 to run against xcrun simctl' },
-  () => {
+  t => {
+    useOwnerFolders(t);
     const spec = simctlBackend.resolveSpec({});
     assert.match(spec.deviceTypeName, /^iPhone \d+/);
     assert.match(spec.runtimeName, /^iOS \d+/);

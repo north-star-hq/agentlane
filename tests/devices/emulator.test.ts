@@ -19,6 +19,7 @@ import {
 } from '../../src/devices/emulator.ts';
 import { UsageError } from '../../src/registry/refusal.ts';
 import { tempDir } from '../support/fakes.ts';
+import { ownerEnv } from '../support/isolate.ts';
 import { isolatedEnv } from '../support/isolated-env.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_EMULATOR === '1';
@@ -194,7 +195,7 @@ test(
   'live emulator: the defaults resolve on this Mac and the list sees every AVD',
   { skip: !LIVE && 'set AGENTLANE_LIVE_EMULATOR=1 to run against the Android SDK' },
   () => {
-    const backend = createEmulatorBackend({ env: process.env, logDir: tempDir('emulator-logs') });
+    const backend = createEmulatorBackend({ env: ownerEnv(), logDir: tempDir('emulator-logs') });
     const spec = backend.resolveSpec({});
     assert.equal(spec.deviceType, 'pixel_8');
     assert.match(spec.runtime, /^system-images;android-\d+(\.\d+)?;google_apis;(arm64-v8a|x86_64)$/);
