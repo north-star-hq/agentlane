@@ -9,6 +9,7 @@ import type { ServiceConfig } from '../../src/project/config.ts';
 import { startMs } from '../../src/processes.ts';
 import type { ServiceProcess } from '../../src/registry/types.ts';
 import {
+  describeStop,
   explainInspection,
   inspectService,
   leaderAliveAt,
@@ -20,6 +21,7 @@ import {
   waitForService,
 } from '../../src/services/services.ts';
 import { realServiceSystem as system, type ServiceSystem } from '../../src/services/system.ts';
+import { stopClaimedService } from '../../src/up/lane-services.ts';
 import { stopRecordedProcesses } from '../../src/up/release.ts';
 import { tempDir } from '../support/fakes.ts';
 import { world } from '../support/world.ts';
@@ -43,6 +45,16 @@ process.on('SIGTERM', () => {
   if (process.argv[2] === 'exit') setTimeout(() => process.exit(0), 100);
 });
 console.log('handling SIGTERM');
+setInterval(() => {}, 1e9);
+`;
+
+const IGNORER = `process.on('SIGTERM', () => {});
+console.log('ignoring SIGTERM');
+setInterval(() => {}, 1e9);
+`;
+
+/** On SIGTERM, exits 300 ms later. */
+const LINGERER = `process.on('SIGTERM', () => setTimeout(() => process.exit(0), 300));
 setInterval(() => {}, 1e9);
 `;
 
@@ -85,6 +97,8 @@ function project(t: TestContext) {
   fs.writeFileSync(path.join(dir, 'wrap.mjs'), WRAPPER);
   fs.writeFileSync(path.join(dir, 'forker.mjs'), FORKER);
   fs.writeFileSync(path.join(dir, 'helper.mjs'), HELPER);
+  fs.writeFileSync(path.join(dir, 'ignorer.mjs'), IGNORER);
+  fs.writeFileSync(path.join(dir, 'lingerer.mjs'), LINGERER);
   const groups: number[] = [];
   const children: ChildProcess[] = [];
   t.after(() => {
@@ -359,7 +373,7 @@ const listings: [string, number[] | undefined][] = [
   ['unlisted', undefined],
 ];
 for (const [seen, listing] of listings) {
-  test(`after the grace, a group ${seen} once since SIGTERM gets no SIGKILL, so a process that joined it since is left alone`, async t => {
+  test(`after the grace, a group ${seen} once since SIGTERM gets no SIGKILL, and a process that joined it since is reported, not signalled`, async t => {
     const p = project(t);
     const proc = await orphaned(p, "(trap '' TERM; exec sleep 30) & exit 0", 0);
     const [stubborn] = system.groupMembers(proc.pid) ?? [];
@@ -407,7 +421,153 @@ for (const [seen, listing] of listings) {
     ]);
     assert.equal(alive(stubborn), false);
     assert.equal(alive(joined), true, 'a process outside the proven set was signalled');
-    assert.deepEqual(outcome, { kind: 'survived', members: [joined] });
+    assert.deepEqual(outcome, {
+      kind: 'cant-tell',
+      sent: 'SIGKILL',
+      reason: `processes ${String(joined)} in a process group of id ${String(proc.pid)} can't be proven ours; stop them with kill ${String(joined)}`,
+    });
+    assert.match(describeStop(proc, outcome), /^sent SIGTERM, then SIGKILL, to api \(pid \d+, .*\), but processes \d+ in /);
+  });
+}
+
+test('a group seen empty after SIGTERM that a process joins once the service has exited is reported, and nothing is sent it', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, 'node lingerer.mjs & exit 0', 0);
+  const [lingerer] = system.groupMembers(proc.pid) ?? [];
+  assert.ok(lingerer !== undefined);
+  const newcomer = spawn('sleep', ['30'], { stdio: 'ignore' });
+  t.after(() => newcomer.kill('SIGKILL'));
+  const joined = newcomer.pid ?? 0;
+  const sent: string[] = [];
+  let polls = 0;
+  const watched: ServiceSystem = {
+    ...system,
+    groupMembers: pgid => {
+      const members = system.groupMembers(pgid);
+      if (sent.length === 0 || !members) return members;
+      polls += 1;
+      return polls === 1 ? [] : [...members, joined];
+    },
+    signalGroup: (pgid, signal) => {
+      sent.push(`group ${String(pgid)} ${signal}`);
+      return system.signalGroup(pgid, signal);
+    },
+    signal: (pid, signal) => {
+      sent.push(`${String(pid)} ${signal}`);
+      return system.signal(pid, signal);
+    },
+  };
+  const outcome = await stopService(watched, proc, systemClock, 2000, 50);
+  assert.deepEqual(sent, [`group ${String(proc.pid)} SIGTERM`]);
+  assert.equal(alive(lingerer), false);
+  assert.equal(alive(joined), true, 'a process outside the proven set was signalled');
+  assert.deepEqual(outcome, {
+    kind: 'cant-tell',
+    sent: 'SIGTERM',
+    reason: `processes ${String(joined)} in a process group of id ${String(proc.pid)} can't be proven ours; stop them with kill ${String(joined)}`,
+  });
+  assert.match(describeStop(proc, outcome), /^sent SIGTERM to api \(pid \d+, .*\), but processes \d+ in /);
+});
+
+test('once its group was seen empty, a process of the service that exits between the two listings of a poll is not taken for a newcomer', async t => {
+  const p = project(t);
+  const proc = await orphaned(p, "node -e 'setInterval(() => {}, 1e9)' & exit 0", 0);
+  const [orphan] = system.groupMembers(proc.pid) ?? [];
+  assert.ok(orphan !== undefined);
+  const start = system.processes.startTimes([orphan])?.get(orphan) ?? '';
+  let termed = false;
+  let listings = 0;
+  let groupListings = 0;
+  const running = () => {
+    listings += 1;
+    return listings <= 3;
+  };
+  const exitsMidPoll: ServiceSystem = {
+    ...system,
+    processes: {
+      ...system.processes,
+      startTimes: pids => {
+        if (!termed || !pids.includes(orphan)) return system.processes.startTimes(pids);
+        return new Map(running() ? [[orphan, start]] : []);
+      },
+    },
+    groupMembers: pgid => {
+      if (!termed) return system.groupMembers(pgid);
+      groupListings += 1;
+      return running() && groupListings > 1 ? [orphan] : [];
+    },
+    signalGroup: (pgid, signal) => {
+      if (signal === 'SIGTERM') termed = true;
+      return system.signalGroup(pgid, signal);
+    },
+  };
+  assert.deepEqual(await stopService(exitsMidPoll, proc, systemClock, 1000, 50), { kind: 'stopped', signal: 'SIGTERM' });
+});
+
+const failures: [string, boolean][] = [
+  ['one listing of its group fails right after SIGTERM', false],
+  ['every listing fails after SIGTERM', true],
+];
+for (const [what, every] of failures) {
+  test(`a live leader that ignores SIGTERM is not reported stopped, nor restarted beside itself, when ${what}`, async t => {
+    const p = project(t);
+    const proc = p.start(p.service('exec node ignorer.mjs'), 0);
+    await until(() => fs.readFileSync(p.log, 'utf8').includes('ignoring SIGTERM'));
+    let termed = false;
+    let failed = 0;
+    const failing: ServiceSystem = {
+      ...system,
+      processes: {
+        ...system.processes,
+        startTimes: pids => (termed && every ? undefined : system.processes.startTimes(pids)),
+      },
+      groupMembers: pgid => {
+        if (termed && (every || failed === 0)) {
+          failed += 1;
+          return undefined;
+        }
+        return system.groupMembers(pgid);
+      },
+      signalGroup: (pgid, signal) => {
+        if (signal === 'SIGTERM') termed = true;
+        return system.signalGroup(pgid, signal);
+      },
+    };
+    const w = world();
+    t.after(() => {
+      w.close();
+    });
+    const owner = w.procs.owner();
+    const { lane } = await w.registry().claim(w.request(owner, w.folder('a'), { device: null }));
+    const ref = { id: lane.id, token: lane.token };
+    w.registry().recordProcess(ref, proc);
+    const services = {
+      deps: { system: failing, clock: systemClock },
+      registry: w.registry(),
+      ref,
+      lane,
+      dir: p.dir,
+      env: {},
+    };
+    const recorded = () =>
+      w
+        .registry()
+        .status()
+        .lanes[0]?.processes.map(r => r.pid);
+    if (every) {
+      await assert.rejects(stopClaimedService(services, proc), {
+        message: new RegExp(
+          `^service api can't be restarted: sent SIGTERM to api \\(pid ${String(proc.pid)}, .*\\), but ps could not list what is left in process group ${String(proc.pid)}, so processes ${String(proc.pid)} can't be proven stopped; stop them with kill ${String(proc.pid)}$`,
+        ),
+      });
+      assert.equal(alive(proc.pid), true);
+      assert.deepEqual(recorded(), [proc.pid], 'the lane forgot a process that may still run');
+    } else {
+      assert.match(await stopClaimedService(services, proc), /^stopped api .* with SIGKILL after SIGTERM was ignored$/);
+      assert.equal(alive(proc.pid), false, 'the lane forgot a leader that still runs');
+      assert.deepEqual(recorded(), []);
+    }
+    assert.ok(failed >= 1);
   });
 }
 

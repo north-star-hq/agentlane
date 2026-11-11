@@ -32,7 +32,7 @@ export type StopOutcome =
   | { kind: 'stopped'; signal: NodeJS.Signals }
   | { kind: 'already-gone' }
   | { kind: 'not-ours'; reason: string }
-  | { kind: 'cant-tell'; reason: string }
+  | { kind: 'cant-tell'; reason: string; sent?: NodeJS.Signals }
   | { kind: 'survived'; members: number[] };
 
 export class ServiceFailed extends Error {
@@ -292,31 +292,78 @@ export async function stopService(
     group = [{ pid: proc.pid, start: proc.start }, ...found.filter(member => member.pid !== proc.pid)];
   }
   const strays = outsideGroup(system, proc.pid, leader === 'gone' ? group.map(member => member.pid) : [proc.pid]);
-  const left = (processes: readonly ProcessIdentity[]) => {
+  const proven = [...group, ...strays];
+  const left = (processes: readonly ProcessIdentity[]): number[] | undefined => {
     const starts = system.processes.startTimes(processes.map(p => p.pid));
-    return processes.filter(p => starts?.get(p.pid) === p.start).map(p => p.pid);
+    return starts === undefined ? undefined : processes.filter(p => starts.get(p.pid) === p.start).map(p => p.pid);
   };
-  const waitEmpty = async (ms: number): Promise<{ remaining: number[]; groupSeenEveryPoll: boolean }> => {
+  const seen = { groupEveryPoll: true, lastOurs: proven.map(p => p.pid), lastInGroup: [] as number[] };
+  const poll = (): StopPoll => {
+    const provenLeft = left(proven);
+    const inGroup = system.groupMembers(proc.pid);
+    if (provenLeft) seen.lastOurs = provenLeft;
+    if (inGroup !== undefined) seen.lastInGroup = inGroup;
+    const listed = inGroup !== undefined && inGroup.length > 0;
+    if (!listed) seen.groupEveryPoll = false;
+    if (listed && seen.groupEveryPoll) {
+      return { ours: provenLeft && [...inGroup, ...provenLeft.filter(pid => !inGroup.includes(pid))], unproven: [] };
+    }
+    return { ours: provenLeft, unproven: inGroup && provenLeft && inGroup.filter(pid => !provenLeft.includes(pid)) };
+  };
+  const settled = (p: StopPoll) => p.ours?.length === 0 && p.unproven !== undefined;
+  const waitSettled = async (ms: number): Promise<StopPoll> => {
     const until = clock.now() + ms;
-    let groupSeenEveryPoll = true;
     for (;;) {
-      const inGroup = system.groupMembers(proc.pid);
-      if (inGroup === undefined || inGroup.length === 0) groupSeenEveryPoll = false;
-      const remaining = [...(inGroup ?? []), ...left(strays)];
-      if (remaining.length === 0 || clock.now() >= until) return { remaining, groupSeenEveryPoll };
+      const now = poll();
+      if (settled(now) || clock.now() >= until) return now;
       await clock.sleep(pollMs);
     }
   };
+  let sent: NodeJS.Signals = 'SIGTERM';
+  const outcome = (p: StopPoll): StopOutcome => {
+    if (p.ours === undefined || p.unproven === undefined) {
+      const pids = [...new Set([...seen.lastOurs, ...seen.lastInGroup])].join(' ');
+      const unlisted = `ps could not list what is left in process group ${String(proc.pid)}`;
+      return {
+        kind: 'cant-tell',
+        sent,
+        reason:
+          pids === ''
+            ? `${unlisted}, so it can't be proven stopped`
+            : `${unlisted}, so processes ${pids} can't be proven stopped; stop them with kill ${pids}`,
+      };
+    }
+    if (p.ours.length > 0) return { kind: 'survived', members: p.ours };
+    if (p.unproven.length > 0) {
+      return {
+        kind: 'cant-tell',
+        sent,
+        reason: `processes ${p.unproven.join(', ')} in a process group of id ${String(proc.pid)} can't be proven ours; stop them with kill ${p.unproven.join(' ')}`,
+      };
+    }
+    return { kind: 'stopped', signal: sent };
+  };
   system.signalGroup(proc.pid, 'SIGTERM');
-  for (const pid of left(strays)) system.signal(pid, 'SIGTERM');
-  const grace = await waitEmpty(graceMs);
-  if (grace.remaining.length === 0) return { kind: 'stopped', signal: 'SIGTERM' };
-  // A pid can't name a new process group while a group of that id lives (XBD 4.14), so a group listed and non-empty
-  // at every poll since SIGTERM is still the service's.
-  if (grace.groupSeenEveryPoll) system.signalGroup(proc.pid, 'SIGKILL');
-  for (const pid of left([...group, ...strays])) system.signal(pid, 'SIGKILL');
-  const survivors = (await waitEmpty(2000)).remaining;
-  return survivors.length === 0 ? { kind: 'stopped', signal: 'SIGKILL' } : { kind: 'survived', members: survivors };
+  for (const pid of left(strays) ?? []) system.signal(pid, 'SIGTERM');
+  const grace = await waitSettled(graceMs);
+  if (settled(grace)) return outcome(grace);
+  // A pid can't name a new process group while a group of that id lives (XBD 4.14), but polls only sample the group:
+  // one listed with processes in it at every poll since SIGTERM may have emptied and been made anew between two polls
+  // or since the last one. That window is bounded by one poll interval, not ruled out.
+  if (seen.groupEveryPoll) {
+    system.signalGroup(proc.pid, 'SIGKILL');
+    sent = 'SIGKILL';
+  }
+  for (const pid of left(proven) ?? []) {
+    system.signal(pid, 'SIGKILL');
+    sent = 'SIGKILL';
+  }
+  return outcome(await waitSettled(2000));
+}
+
+interface StopPoll {
+  ours: number[] | undefined;
+  unproven: number[] | undefined;
 }
 
 function withStarts(system: ServiceSystem, pids: readonly number[]): ProcessIdentity[] | undefined {
@@ -372,7 +419,8 @@ export function describeStop(proc: ServiceProcess, outcome: StopOutcome): string
     case 'not-ours':
       return `left ${who} alone: ${outcome.reason}`;
     case 'cant-tell':
-      return `left ${who} alone: ${outcome.reason}`;
+      if (outcome.sent === undefined) return `left ${who} alone: ${outcome.reason}`;
+      return `sent ${outcome.sent === 'SIGKILL' ? 'SIGTERM, then SIGKILL,' : 'SIGTERM'} to ${who}, but ${outcome.reason}`;
     case 'survived':
       return `${who} survived SIGKILL: processes ${outcome.members.join(', ')} remain`;
   }
