@@ -9,6 +9,7 @@ import { agentHookChecks, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts
 import { GUARDED_WORDS, hookCommand, UNSPLIT_SED } from '../../src/agents/launcher.ts';
 import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
+import { runHookCommand } from '../../src/plugin/hook-cli.ts';
 import { writeHookMark } from '../../src/plugin/hook-mark.ts';
 import { systemProcesses } from '../../src/processes.ts';
 import type { Agent } from '../../src/registry/owner.ts';
@@ -393,13 +394,53 @@ test('with the plugin enabled and the hooks in the settings, both copies of the 
       replies.every(r => r.status === 0),
       replies.map(r => r.stderr).join(''),
     );
-    assert.equal(replies.filter(r => r.stderr.includes('releasing 1 lane')).length, 1);
-    assert.equal(replies.filter(r => r.stderr.includes('another copy of this hook is already releasing')).length, 1);
+    assert.equal(replies.filter(r => r.stderr.includes('releasing 1 lane')).length, 2);
     await until(() => held(f).length === 0);
     assert.deepEqual(held(f), []);
-    await until(() => (fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8').match(/released lane /g) ?? []).length > 0);
-    const released = fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8').match(/releasing every lane of /g) ?? [];
-    assert.equal(released.length, 1);
+    const workerLog = () => fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8');
+    await until(() => workerLog().includes('released lane ') && workerLog().includes('already releasing'));
+    assert.equal(workerLog().match(/releasing every lane of /g)?.length, 1, workerLog());
+    assert.equal(workerLog().match(/another copy of this hook is already releasing the lanes of /g)?.length, 1, workerLog());
+  } finally {
+    owner.kill('SIGKILL');
+    f.cleanup();
+  }
+});
+
+test('a session-end copy that dies before its release starts leaves the other copy to release the lane', async () => {
+  const f = fixture('hooks-once-dies');
+  const owner = sleeper();
+  try {
+    const dir = f.repo('app');
+    write(path.join(dir, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }));
+    await init(dir, f.env(), '--agents', 'claude');
+    installToolkit(dir, path.join(f.root, 'calls.log'));
+    const env = f.env({
+      AGENTLANE_OWNER_PID: String(owner.pid),
+      CLAUDE_PROJECT_DIR: dir,
+      CLAUDE_PLUGIN_ROOT: path.dirname(HOOK_SH),
+    });
+    const lane = await claim(f, owner.pid ?? 0, dir);
+    const end = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 's', reason: 'other', cwd: dir });
+    const killed = runHookCommand(['session-end'], {
+      env,
+      cwd: dir,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      processes: systemProcesses,
+      ports: tcpProbe,
+      devices: {},
+      stdin: end,
+      startWorker: () => {
+        throw new Error('killed before the release started');
+      },
+    });
+    await assert.rejects(killed, /killed before the release started/);
+    const other = sh(`"${HOOK_SH}" session-end`, dir, env, end);
+    assert.equal(other.status, 0, other.stderr);
+    assert.match(other.stderr, new RegExp(`releasing 1 lane\\(s\\) .*: ${lane}`));
+    await until(() => held(f).length === 0);
+    assert.deepEqual(held(f), []);
   } finally {
     owner.kill('SIGKILL');
     f.cleanup();

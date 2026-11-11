@@ -40,6 +40,7 @@ export const HOOK_USAGE = groupUsage(HOOK_HELP);
 
 export const SESSION_END_OWNER_ENV = envName('SESSION_END_OWNER');
 export const SESSION_END_WAIT_ENV = envName('SESSION_END_WAIT_MS');
+export const SESSION_END_ONCE_ENV = envName('SESSION_END_ONCE');
 const OWNER_EXIT_WAIT_MS = 30_000;
 const OWNER_EXIT_POLL_MS = 250;
 const PLUGIN_AND_SETTINGS: ReadonlySet<Agent> = new Set(['claude']);
@@ -141,16 +142,13 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
   const held = readRegistryStatus({ dir, processes: deps.processes, devices: {} }).lanes.filter(c => c.ownerKey === key);
   if (held.length === 0) return 0;
   const once = PLUGIN_AND_SETTINGS.has(agent) ? ['session-end', input.sessionId ?? '', key] : null;
-  if (once && !claimOnce(dir, once, (deps.clock ?? systemClock).now())) {
-    deps.stderr(`${TOOL}: session end: another copy of this hook is already releasing the lanes of ${describeOwner(owner)}\n`);
-    return 0;
-  }
   const log = path.join(dir, 'session-end.log');
   const waits = convention.release !== 'at-once' && convention.release !== 'by-thread' && owner.process !== null;
   deps.startWorker(
     {
       ...deps.env,
       [SESSION_END_OWNER_ENV]: JSON.stringify(owner),
+      [SESSION_END_ONCE_ENV]: once ? JSON.stringify(once) : undefined,
       ...(waits ? { [SESSION_END_WAIT_ENV]: String(OWNER_EXIT_WAIT_MS) } : {}),
     },
     log,
@@ -226,10 +224,23 @@ async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promis
   }
 }
 
+function onceParts(raw: string | undefined): string[] | null {
+  if (raw === undefined) return null;
+  const parts: unknown = JSON.parse(raw);
+  if (!Array.isArray(parts) || !parts.every(part => typeof part === 'string'))
+    throw new Error(`${SESSION_END_ONCE_ENV} is not a list of strings`);
+  return parts;
+}
+
 async function releaseWorker(raw: string, deps: HookDeps): Promise<number> {
   const owner = parseOwner(raw);
   const clock = deps.clock ?? systemClock;
   const stamp = () => new Date(clock.now()).toISOString();
+  const once = onceParts(deps.env[SESSION_END_ONCE_ENV]);
+  if (once && !claimOnce(stateDir(deps.env), once, clock.now())) {
+    deps.stderr(`${stamp()} session end: another copy of this hook is already releasing the lanes of ${describeOwner(owner)}\n`);
+    return 0;
+  }
   const waitMs = Number(deps.env[SESSION_END_WAIT_ENV] ?? 0);
   if (waitMs > 0 && !(await ownerExited(owner, waitMs, deps))) {
     deps.stderr(
