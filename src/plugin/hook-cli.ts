@@ -18,6 +18,7 @@ import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
 import { guard } from './guard.ts';
 import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
+import { claimOnce } from './hook-once.ts';
 import { claudeSessionName } from './session-name.ts';
 
 export const HOOK_COMMANDS = ['hook'] as const;
@@ -41,6 +42,7 @@ export const SESSION_END_OWNER_ENV = envName('SESSION_END_OWNER');
 export const SESSION_END_WAIT_ENV = envName('SESSION_END_WAIT_MS');
 const OWNER_EXIT_WAIT_MS = 30_000;
 const OWNER_EXIT_POLL_MS = 250;
+const PLUGIN_AND_SETTINGS: ReadonlySet<Agent> = new Set(['claude']);
 
 export interface HookDeps extends CliDeps {
   stdin: string;
@@ -138,6 +140,11 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
   const key = ownerKey(owner);
   const held = readRegistryStatus({ dir, processes: deps.processes, devices: {} }).lanes.filter(c => c.ownerKey === key);
   if (held.length === 0) return 0;
+  const once = PLUGIN_AND_SETTINGS.has(agent) ? ['session-end', input.sessionId ?? '', key] : null;
+  if (once && !claimOnce(dir, once, (deps.clock ?? systemClock).now())) {
+    deps.stderr(`${TOOL}: session end: another copy of this hook is already releasing the lanes of ${describeOwner(owner)}\n`);
+    return 0;
+  }
   const log = path.join(dir, 'session-end.log');
   const waits = convention.release !== 'at-once' && convention.release !== 'by-thread' && owner.process !== null;
   deps.startWorker(

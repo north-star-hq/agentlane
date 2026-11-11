@@ -11,6 +11,7 @@ import { diagnose, renderDoctor } from '../../src/up/doctor.ts';
 import { tempDir } from '../support/fakes.ts';
 import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
+import { writeToolkit } from '../support/toolkit.ts';
 
 const PLUGIN = path.resolve(import.meta.dirname, '..', '..', 'plugin');
 const TOOLKIT = listSkills().map(skill => skill.name);
@@ -228,9 +229,7 @@ test('a project left to a plugin that is not loaded says so, and init without th
 });
 
 function installToolkit(dir: string): void {
-  const bin = path.join(dir, 'node_modules/.bin/agentlane');
-  write(bin, `#!/bin/sh\nexec "${process.execPath}" "${path.join(PLUGIN, '..', 'src', 'cli.ts')}" "$@"\n`);
-  fs.chmodSync(bin, 0o755);
+  writeToolkit(dir, `exec "${process.execPath}" "${path.join(PLUGIN, '..', 'src', 'cli.ts')}" "$@"`);
 }
 
 type Line = [ok: boolean, warning: boolean, detail: string, fix: string];

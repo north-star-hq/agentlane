@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CLI, TOOL } from '../name.ts';
 import type { HookMark } from '../plugin/hook-mark.ts';
-import { HOOK_PROBE_ENV, readHookMarks } from '../plugin/hook-mark.ts';
+import { HOOK_PROBE_ENV, readHookMark } from '../plugin/hook-mark.ts';
 import type { Agent } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { claudePluginInstall } from './claude-plugin.ts';
@@ -23,10 +23,11 @@ export interface HookCheck {
 
 export const PROBE_COMMAND = `echo ${TOOL} doctor checks that the simctl guard runs`;
 const PROBE_TIMEOUT_MS = 10_000;
+export const MARK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 interface Route {
   where: string;
-  file: string | null;
+  file: string;
   command: string;
   env: NodeJS.ProcessEnv;
 }
@@ -58,6 +59,46 @@ function modified(file: string): number {
   } catch {
     return 0;
   }
+}
+
+function manifestAt(file: string): { file: string; version: string } | null {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(file, 'utf8')) as { name?: unknown; version?: unknown };
+    return manifest.name === TOOL && typeof manifest.version === 'string'
+      ? { file: fs.realpathSync(file), version: manifest.version }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function toolkitManifest(bin: string): { file: string; version: string } | null {
+  const beside = manifestAt(path.join(path.dirname(path.dirname(bin)), TOOL, 'package.json'));
+  if (beside) return beside;
+  let target: string;
+  try {
+    target = fs.realpathSync(bin);
+  } catch {
+    return null;
+  }
+  if (target === bin) return null;
+  for (let dir = path.dirname(target); path.dirname(dir) !== dir; dir = path.dirname(dir)) {
+    const found = manifestAt(path.join(dir, 'package.json'));
+    if (found) return found;
+  }
+  return null;
+}
+
+function markHolds(mark: HookMark, bin: string, hookFile: string, now: number): boolean {
+  const manifest = toolkitManifest(bin);
+  return (
+    manifest !== null &&
+    mark.version === manifest.version &&
+    mark.at >= modified(hookFile) &&
+    mark.at > modified(bin) &&
+    mark.at > modified(manifest.file) &&
+    now - mark.at <= MARK_MAX_AGE_MS
+  );
 }
 
 function executable(file: string): boolean {
@@ -114,7 +155,8 @@ function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJ
     encoding: 'utf8',
     timeout: PROBE_TIMEOUT_MS,
   });
-  const mark = readHookMarks(stateDir(env), agent, root).find(m => m.probe === token);
+  const last = readHookMark(stateDir(env), agent, root);
+  const mark = last?.probe === token ? last : null;
   const how = `doctor ran the guard hook in ${route.where} on a command it allows, and it`;
   const exit = result.error
     ? `failed to run: ${result.error.message}`
@@ -124,25 +166,32 @@ function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJ
   if (mark && result.status === 0) return { name, ok: true, detail: ran(mark, how), fix: '' };
   const fix = `${CLI} init --agents ${agent}, then ${CLI} doctor`;
   if (mark) return { name, ok: false, detail: `${ran(mark, how)}, then ${exit}`, fix };
-  const older = result.status === 0 ? `, so ${bin} is older than this check, which needs the mark the hook leaves` : '';
-  return { name, ok: false, detail: `${how} never reached the toolkit: it ${exit}${older}`, fix };
+  if (result.status === 0)
+    return {
+      name,
+      ok: false,
+      detail: `${how} exited 0 without reaching the toolkit at ${bin}: its command found no toolkit to run, or predates the one init writes`,
+      fix,
+    };
+  return { name, ok: false, detail: `${how} never reached the toolkit: it ${exit}`, fix };
 }
 
-function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv): HookCheck {
+function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv, now: number): HookCheck {
   const name = `hooks ${agent}`;
   const file = guardFile(agent);
   const command = settingsCommand(root, file);
-  let route: Route | null = command ? { where: file, file, command, env: {} } : null;
+  let route: Route | null = command ? { where: file, file: path.join(root, file), command, env: {} } : null;
   if (route === null && agent === 'claude') {
     const install = claudePluginInstall(root, env);
-    if (install?.kind === 'loaded')
+    if (install?.kind === 'loaded') {
+      const script = path.join(install.dir, 'scripts', 'hook.sh');
       route = {
         where: `the plugin in ${install.dir}`,
-        file: null,
-        command: `"${path.join(install.dir, 'scripts', 'hook.sh')}" pre-tool-use`,
+        file: script,
+        command: `"${script}" pre-tool-use`,
         env: { CLAUDE_PLUGIN_ROOT: install.dir },
       };
-    else if (install?.kind === 'not-installed')
+    } else if (install?.kind === 'not-installed')
       return {
         name,
         ok: false,
@@ -173,20 +222,26 @@ function hookCheck(root: string, agent: Agent, env: NodeJS.ProcessEnv): HookChec
       detail: `the hooks in ${route.where} find no ${CLI} in ${root}, the folders above it or this repository's other worktrees, so they never run ${TOOL}`,
       fix: installFix(root, agent),
     };
-  const changed = route.file ? modified(path.join(root, route.file)) : 0;
-  const mark = readHookMarks(stateDir(env), agent, root).find(m => m.at >= changed);
-  if (mark) return { name, ok: true, detail: ran(mark, `the ${mark.event} hook in ${route.where}`), fix: '' };
+  const mark = readHookMark(stateDir(env), agent, root);
+  if (mark && markHolds(mark, bin, route.file, now))
+    return { name, ok: true, detail: ran(mark, `the ${mark.event} hook in ${route.where}`), fix: '' };
   return probe(root, agent, route, bin, env);
 }
 
 /**
- * One line per agent: whether its hooks run, from the mark the hook leaves each time it reaches the toolkit, or, with
- * no mark for this project, from running the guard hook on a command it allows.
+ * One line per agent: whether its hooks run. The mark the hook left for this project folder answers while it is newer
+ * than the hook and the toolkit, names the toolkit's version and is under a day old; otherwise doctor runs the guard
+ * hook on a command it allows.
  */
-export function agentHookChecks(root: string, agents: readonly Agent[], env: NodeJS.ProcessEnv): HookCheck[] {
+export function agentHookChecks(
+  root: string,
+  agents: readonly Agent[],
+  env: NodeJS.ProcessEnv,
+  now: number = Date.now(),
+): HookCheck[] {
   return agents.map(agent => {
     try {
-      return hookCheck(root, agent, env);
+      return hookCheck(root, agent, env, now);
     } catch (error) {
       return {
         name: `hooks ${agent}`,

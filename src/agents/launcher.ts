@@ -26,6 +26,8 @@ export const GUARDED_WORDS = [
   'agent-browser',
 ] as const;
 
+const UNQUOTED_INPUT = String.raw`$(printf %s "$i" | tr -d "'\"\\\\")`;
+
 function walkUp(start: string): string {
   return `d="${start}"; while [ ! -x "$d/${CLI}" ] && [ "$d" != / ]; do d=$(dirname "$d"); done`;
 }
@@ -50,7 +52,7 @@ export function hookCommand(agent: Agent, event: HookEvent): string {
   const args = `hook ${event} --agent ${agent}`;
   if (event === 'session-end') return `${find}; if [ -x "$d/${CLI}" ]; then exec "$d/${CLI}" ${args}; fi; ${allow}`;
   const words = GUARDED_WORDS.map(word => `*${word}*`).join('|');
-  return `i=$(cat); case $i in ${words}) ;; *) ${allow};; esac; ${find}; if [ -x "$d/${CLI}" ]; then printf '%s' "$i" | "$d/${CLI}" ${args}; exit; fi; ${allow}`;
+  return `i=$(cat); case ${UNQUOTED_INPUT} in ${words}) ;; *) ${allow};; esac; ${find}; if [ -x "$d/${CLI}" ]; then printf '%s' "$i" | "$d/${CLI}" ${args}; exit; fi; ${allow}`;
 }
 
 export function mcpLaunch(): { command: string; args: string[] } {

@@ -5,8 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { runAgentCommand } from '../../src/agents/cli.ts';
-import { agentHookChecks } from '../../src/agents/hook-check.ts';
+import { agentHookChecks, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts';
 import { GUARDED_WORDS, hookCommand } from '../../src/agents/launcher.ts';
+import { toolVersion } from '../../src/agents/package.ts';
+import { aimsOf } from '../../src/plugin/aims.ts';
+import { writeHookMark } from '../../src/plugin/hook-mark.ts';
 import { systemProcesses } from '../../src/processes.ts';
 import type { Agent } from '../../src/registry/owner.ts';
 import { AGENTS } from '../../src/registry/owner.ts';
@@ -16,6 +19,7 @@ import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { tempDir } from '../support/fakes.ts';
 import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
+import { writeToolkit } from '../support/toolkit.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const CLI = path.join(ROOT, 'src', 'cli.ts');
@@ -60,11 +64,8 @@ function write(file: string, text: string): void {
 }
 
 /** A toolkit at `dir` that writes each call's arguments to `log`, then runs the real CLI. */
-function installToolkit(dir: string, log: string): string {
-  const bin = path.join(dir, 'node_modules/.bin/agentlane');
-  write(bin, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nexec "${process.execPath}" "${CLI}" "$@"\n`);
-  fs.chmodSync(bin, 0o755);
-  return bin;
+function installToolkit(dir: string, log: string, run = `exec "${process.execPath}" "${CLI}" "$@"`): string {
+  return writeToolkit(dir, `printf '%s\\n' "$*" >> "${log}"\n${run}`);
 }
 
 function calls(log: string): string[] {
@@ -161,6 +162,18 @@ for (const plugin of [false, true]) {
   });
 }
 
+const SPLIT_NAMES = [
+  "xcrun 'sim'ctl boot booted",
+  'xcrun sim\\ctl boot booted',
+  "a''db shell",
+  'a\\db shell',
+  "emu''lator -avd x",
+  "agent-''browser --session x open",
+  'playwright\\-cli kill-all',
+  "npx @play''wright/cli kill-all",
+  `sh -c 'xcrun sim""ctl boot booted'`,
+];
+
 test('the guard hooks init writes start no node process for a command with no device or browser tool in it', async () => {
   const f = fixture('hooks-no-node');
   try {
@@ -178,22 +191,32 @@ test('the guard hooks init writes start no node process for a command with no de
       CLAUDE_PROJECT_DIR: dir,
       CURSOR_PROJECT_DIR: dir,
     });
-    for (const agent of AGENTS) {
-      const [command] = hookCommandsOf(dir, agent, 'pre-tool-use');
+    for (const shell of SPLIT_NAMES) assert.notDeepEqual(aimsOf(shell, {}, dir), [], `the guard judges ${shell}`);
+    const input = (shell: string) => JSON.stringify({ cwd: dir, tool_input: { command: shell } });
+    const routes = [
+      ...AGENTS.map(agent => ({
+        agent,
+        command: hookCommandsOf(dir, agent, 'pre-tool-use')[0] ?? '',
+        args: ` --agent ${agent}`,
+      })),
+      { agent: 'plugin', command: `"${HOOK_SH}" pre-tool-use`, args: '' },
+    ];
+    for (const { agent, command, args } of routes) {
       assert.ok(command, agent);
-      const input = (shell: string) => JSON.stringify({ cwd: dir, tool_input: { command: shell } });
       const quiet = sh(command, dir, env, input('git status && pnpm test'));
       assert.equal(quiet.status, 0, `${agent}: ${quiet.stderr}`);
       assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
       assert.deepEqual(calls(log), [], `${agent} started the toolkit or node for a plain command`);
-      const device = sh(command, dir, env, input('xcrun simctl boot booted'));
-      assert.equal(device.status, 0, `${agent}: ${device.stderr}`);
-      assert.deepEqual(
-        calls(log),
-        [`toolkit hook pre-tool-use --agent ${agent}`, `node hook pre-tool-use --agent ${agent}`],
-        `${agent}: a device command reaches the guard`,
-      );
-      fs.rmSync(log);
+      for (const shell of ['xcrun simctl boot booted', ...SPLIT_NAMES]) {
+        const device = sh(command, dir, env, input(shell));
+        assert.equal(device.status, 0, `${agent}: ${device.stderr}`);
+        assert.deepEqual(
+          calls(log),
+          [`toolkit hook pre-tool-use${args}`, `node hook pre-tool-use${args}`],
+          `${agent}: ${shell} reaches the guard`,
+        );
+        fs.rmSync(log);
+      }
     }
   } finally {
     f.cleanup();
@@ -222,13 +245,12 @@ test('a session-end hook run from a main checkout with no toolkit releases the l
     const log = path.join(f.root, 'calls.log');
     installToolkit(worktree, log);
     const env = f.env({ AGENTLANE_OWNER_PID: String(owner.pid), CLAUDE_PROJECT_DIR: main });
-    const end = JSON.stringify({ hook_event_name: 'SessionEnd', reason: 'other', cwd: main });
-
     for (const [route, command] of [
       ['settings', hookCommand('claude', 'session-end')],
       ['plugin', `"${HOOK_SH}" session-end`],
     ] as const) {
       const lane = await claim(f, owner.pid ?? 0, worktree);
+      const end = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: route, reason: 'other', cwd: main });
       const result = sh(command, main, env, end);
       assert.equal(result.status, 0, `${route}: ${result.stderr}`);
       assert.match(result.stderr, new RegExp(`releasing 1 lane\\(s\\) .*: ${lane}`), route);
@@ -242,7 +264,27 @@ test('a session-end hook run from a main checkout with no toolkit releases the l
   }
 });
 
-test('with the plugin enabled and the hooks in the settings, one session end releases once and one guarded command is judged once', async () => {
+function shAsync(command: string, cwd: string, env: NodeJS.ProcessEnv, input: string): Promise<Reply> {
+  return new Promise(resolve => {
+    const child = spawn('/bin/sh', ['-c', command], { cwd, env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+    child.on('close', status => {
+      resolve({ status, stdout, stderr });
+    });
+    child.stdin.end(input);
+  });
+}
+
+interface Reply {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+test('with the plugin enabled and the hooks in the settings, both copies of the guard give one answer, and two session-end hooks racing release the lane once', async () => {
   const f = fixture('hooks-once');
   const owner = sleeper();
   try {
@@ -259,21 +301,76 @@ test('with the plugin enabled and the hooks in the settings, one session end rel
     const settings = (event: 'pre-tool-use' | 'session-end') => hookCommandsOf(dir, 'claude', event)[0] ?? '';
     const plugin = (event: string) => `"${HOOK_SH}" ${event}`;
 
-    const guarded = JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'xcrun simctl list' }, cwd: dir });
-    for (const command of [settings('pre-tool-use'), plugin('pre-tool-use')])
-      assert.equal(sh(command, dir, env, guarded).status, 0);
-    assert.deepEqual(calls(log), ['hook pre-tool-use --agent claude']);
+    const guarded = JSON.stringify({
+      session_id: 's',
+      tool_name: 'Bash',
+      tool_input: { command: 'xcrun simctl list' },
+      cwd: dir,
+    });
+    const answers = [settings('pre-tool-use'), plugin('pre-tool-use')].map(command => sh(command, dir, env, guarded));
+    assert.deepEqual(
+      answers.map(r => [r.status, r.stdout, r.stderr]),
+      [
+        [0, '', ''],
+        [0, '', ''],
+      ],
+    );
+    assert.deepEqual(calls(log), ['hook pre-tool-use --agent claude', 'hook pre-tool-use']);
 
     await claim(f, owner.pid ?? 0, dir);
-    const end = JSON.stringify({ hook_event_name: 'SessionEnd', reason: 'other', cwd: dir });
-    const replies = [settings('session-end'), plugin('session-end')].map(command => sh(command, dir, env, end));
-    assert.ok(replies.every(r => r.status === 0));
+    const end = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 's', reason: 'other', cwd: dir });
+    const replies = await Promise.all([settings('session-end'), plugin('session-end')].map(c => shAsync(c, dir, env, end)));
+    assert.ok(
+      replies.every(r => r.status === 0),
+      replies.map(r => r.stderr).join(''),
+    );
     assert.equal(replies.filter(r => r.stderr.includes('releasing 1 lane')).length, 1);
+    assert.equal(replies.filter(r => r.stderr.includes('another copy of this hook is already releasing')).length, 1);
     await until(() => held(f).length === 0);
     assert.deepEqual(held(f), []);
-    assert.deepEqual(calls(log), ['hook pre-tool-use --agent claude', 'hook session-end --agent claude']);
-    const released = fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8').match(/released lane /g) ?? [];
+    await until(() => (fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8').match(/released lane /g) ?? []).length > 0);
+    const released = fs.readFileSync(path.join(f.state, 'session-end.log'), 'utf8').match(/releasing every lane of /g) ?? [];
     assert.equal(released.length, 1);
+  } finally {
+    owner.kill('SIGKILL');
+    f.cleanup();
+  }
+});
+
+test('with the plugin enabled and a settings file Claude Code cannot load, the plugin’s hooks still judge a guarded command and release the lane', async () => {
+  const f = fixture('hooks-unloaded-settings');
+  const owner = sleeper();
+  try {
+    const dir = f.repo('app');
+    write(path.join(dir, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }));
+    await init(dir, f.env(), '--agents', 'claude');
+    const settings = path.join(dir, '.claude/settings.json');
+    const good = fs.readFileSync(settings, 'utf8');
+    fs.writeFileSync(settings, `<<<<<<< HEAD\n${good}=======\n{}\n>>>>>>> other\n`);
+    const log = path.join(f.root, 'calls.log');
+    installToolkit(dir, log);
+    const env = f.env({
+      AGENTLANE_OWNER_PID: String(owner.pid),
+      CLAUDE_PROJECT_DIR: dir,
+      CLAUDE_PLUGIN_ROOT: path.dirname(HOOK_SH),
+    });
+
+    const guarded = JSON.stringify({
+      session_id: 's',
+      tool_name: 'Bash',
+      tool_input: { command: 'xcrun simctl boot booted' },
+      cwd: dir,
+    });
+    assert.equal(sh(`"${HOOK_SH}" pre-tool-use`, dir, env, guarded).status, 0);
+    assert.deepEqual(calls(log), ['hook pre-tool-use'], 'the guard judged the command');
+
+    const lane = await claim(f, owner.pid ?? 0, dir);
+    const end = JSON.stringify({ hook_event_name: 'SessionEnd', session_id: 's', reason: 'other', cwd: dir });
+    const reply = sh(`"${HOOK_SH}" session-end`, dir, env, end);
+    assert.equal(reply.status, 0, reply.stderr);
+    assert.match(reply.stderr, new RegExp(`releasing 1 lane\\(s\\) .*: ${lane}`));
+    await until(() => held(f).length === 0);
+    assert.deepEqual(held(f), []);
   } finally {
     owner.kill('SIGKILL');
     f.cleanup();
@@ -337,6 +434,111 @@ test('doctor fails a hook that points at a missing toolkit, naming the fix, and 
     assert.equal(broken.fix, 'node_modules/.bin/agentlane init --agents codex, then node_modules/.bin/agentlane doctor');
     await init(dir, f.env(), '--agents', 'codex');
     assert.equal(agentHookChecks(dir, ['codex'], f.env())[0]?.ok, true, 'init puts the hook back');
+  } finally {
+    f.cleanup();
+  }
+});
+
+for (const route of ['settings', 'plugin'] as const) {
+  test(`doctor stops trusting a hook's mark once the toolkit changes, its version differs or the mark is a day old, on the ${route} route`, async () => {
+    const f = fixture(`hooks-stale-mark-${route}`);
+    try {
+      const dir = f.repo('app');
+      const agent: Agent = route === 'settings' ? 'codex' : 'claude';
+      if (route === 'settings') await init(dir, f.env(), '--agents', 'codex');
+      else {
+        write(path.join(dir, '.claude/settings.json'), JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }));
+        write(
+          path.join(f.root, 'home/.claude/plugins/installed_plugins.json'),
+          JSON.stringify({
+            version: 2,
+            plugins: { 'agentlane@agentlane': [{ scope: 'user', installPath: path.dirname(path.dirname(HOOK_SH)) }] },
+          }),
+        );
+      }
+      const log = path.join(f.root, 'calls.log');
+      installToolkit(dir, log);
+      const check = (now?: number) => agentHookChecks(dir, [agent], f.env(), now)[0];
+      const where = route === 'settings' ? '\\.codex\\/hooks\\.json' : 'the plugin in .*\\/plugin';
+      assert.match(
+        check()?.detail ?? '',
+        new RegExp(`^doctor ran the guard hook in ${where} on a command it allows, and it reached `),
+      );
+      assert.match(check()?.detail ?? '', /^the pre-tool-use hook in .* reached /, 'a fresh mark spares the run');
+      const runs = () => calls(log).length;
+
+      const probes = runs();
+      assert.equal(check(Date.now() + MARK_MAX_AGE_MS + 60_000)?.ok, true);
+      assert.equal(runs(), probes + 1, 'a mark over a day old is checked again');
+
+      const manifest = path.join(dir, 'node_modules/agentlane/package.json');
+      const { mtime } = fs.statSync(manifest);
+      fs.writeFileSync(manifest, JSON.stringify({ name: 'agentlane', version: '0.0.1' }));
+      fs.utimesSync(manifest, mtime, mtime);
+      assert.equal(check()?.ok, true);
+      assert.equal(runs(), probes + 2, 'a mark from another version is checked again');
+
+      installToolkit(dir, log, `echo "node: bad option" >&2; exit 9`);
+      const broken = check();
+      assert.equal(broken?.ok, false, broken?.detail);
+      assert.match(broken.detail, new RegExp(`never reached the toolkit: it exited ${route === 'settings' ? '9' : '1'}`));
+      assert.equal(broken.fix, `node_modules/.bin/agentlane init --agents ${agent}, then node_modules/.bin/agentlane doctor`);
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test('doctor says the hook exited 0 without reaching the toolkit when an old hook command finds none', () => {
+  const f = fixture('hooks-old-command');
+  try {
+    const main = f.repo('main');
+    write(path.join(main, 'README.md'), 'main\n');
+    git(main, f.env(), 'add', '-A');
+    git(main, f.env(), 'commit', '-q', '-m', 'main');
+    const worktree = path.join(f.root, 'feature');
+    git(main, f.env(), 'worktree', 'add', '-q', worktree);
+    const bin = installToolkit(worktree, path.join(f.root, 'calls.log'));
+    const old = `d="\${CLAUDE_PROJECT_DIR:-$PWD}"; while [ ! -x "$d/node_modules/.bin/agentlane" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; if [ -x "$d/node_modules/.bin/agentlane" ]; then exec "$d/node_modules/.bin/agentlane" hook pre-tool-use --agent claude; fi; exit 0`;
+    write(
+      path.join(main, '.claude/settings.json'),
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: old }] }] } }),
+    );
+    const [line] = agentHookChecks(main, ['claude'], f.env());
+    assert.equal(line?.ok, false);
+    assert.equal(
+      line.detail,
+      `doctor ran the guard hook in .claude/settings.json on a command it allows, and it exited 0 without reaching the toolkit at ${bin}: its command found no toolkit to run, or predates the one init writes`,
+    );
+    assert.equal(line.fix, 'node_modules/.bin/agentlane init --agents claude, then node_modules/.bin/agentlane doctor');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('a mark left from a worktree nested in the project does not vouch for the project’s own hook', async () => {
+  const f = fixture('hooks-nested-mark');
+  try {
+    const dir = f.repo('app');
+    await init(dir, f.env(), '--agents', 'codex');
+    const bin = installToolkit(dir, path.join(f.root, 'calls.log'), 'exit 9');
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    for (const file of [bin, path.join(dir, 'node_modules/agentlane/package.json'), path.join(dir, '.codex/hooks.json')])
+      fs.utimesSync(file, hourAgo, hourAgo);
+    const nested = path.join(dir, '.claude/worktrees/x');
+    fs.mkdirSync(nested, { recursive: true });
+    writeHookMark(f.state, {
+      agent: 'codex',
+      event: 'pre-tool-use',
+      project: nested,
+      at: Date.now(),
+      toolkit: bin,
+      version: toolVersion(),
+      probe: null,
+    });
+    const [line] = agentHookChecks(dir, ['codex'], f.env());
+    assert.equal(line?.ok, false, line?.detail);
+    assert.match(line.detail, /never reached the toolkit: it exited 9/);
   } finally {
     f.cleanup();
   }

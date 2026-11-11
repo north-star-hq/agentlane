@@ -78,7 +78,7 @@ export interface AgentCliDeps {
 }
 
 function throughPlugin(source: PluginSource): string {
-  const done = `${describePluginSource(source)}, which brings the skills and the MCP server, so init wrote neither for Claude Code: it mirrored only the project's own skills and kept Claude Code from loading the .mcp.json server a second time. It wrote the hooks into .claude/settings.json, where Claude Code runs them whether or not the plugin loads and gives the session-end hook its full timeout, and the plugin's own hooks step aside for them`;
+  const done = `${describePluginSource(source)}, which brings the skills and the MCP server, so init wrote neither for Claude Code: it mirrored only the project's own skills and kept Claude Code from loading the .mcp.json server a second time. It wrote the hooks into .claude/settings.json, where Claude Code runs them whether or not the plugin loads and gives the session-end hook its full timeout. Where the plugin's hooks run too, both guards give the same answer and the session's lanes are released once`;
   if (source.kind === 'project') return done;
   const others = `Claude Code without the plugin gets none of them from this project's files; to wire it the same for everyone, enable the plugin in the project's .claude/settings.json`;
   return source.kind === 'session'

@@ -30,12 +30,16 @@ function real(dir: string): string {
   }
 }
 
+function markFile(stateDir: string, agent: Agent, project: string): string {
+  const key = crypto.createHash('sha256').update(project).digest('hex').slice(0, 16);
+  return path.join(marksDir(stateDir), `${agent}-${key}.json`);
+}
+
 export function writeHookMark(stateDir: string, mark: HookMark): void {
   const dir = marksDir(stateDir);
   fs.mkdirSync(dir, { recursive: true });
   const project = real(mark.project);
-  const key = crypto.createHash('sha256').update(project).digest('hex').slice(0, 16);
-  const file = path.join(dir, `${mark.agent}-${key}.json`);
+  const file = markFile(stateDir, mark.agent, project);
   const temp = `${file}.${String(process.pid)}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify({ ...mark, project })}\n`);
   fs.renameSync(temp, file);
@@ -71,26 +75,15 @@ function parseMark(text: string): HookMark | null {
   };
 }
 
-/** The marks the agent's hook left in this project or a folder inside it, the latest first. */
-export function readHookMarks(stateDir: string, agent: Agent, project: string): HookMark[] {
+/** The latest mark the agent's hook left for exactly this project folder. */
+export function readHookMark(stateDir: string, agent: Agent, project: string): HookMark | null {
   const root = real(project);
-  let names: string[];
+  let text: string;
   try {
-    names = fs.readdirSync(marksDir(stateDir));
+    text = fs.readFileSync(markFile(stateDir, agent, root), 'utf8');
   } catch {
-    return [];
+    return null;
   }
-  return names
-    .filter(name => name.startsWith(`${agent}-`) && name.endsWith('.json'))
-    .flatMap(name => {
-      let text: string;
-      try {
-        text = fs.readFileSync(path.join(marksDir(stateDir), name), 'utf8');
-      } catch {
-        return [];
-      }
-      const mark = parseMark(text);
-      return mark?.agent === agent && (mark.project === root || mark.project.startsWith(`${root}${path.sep}`)) ? [mark] : [];
-    })
-    .sort((a, b) => b.at - a.at);
+  const mark = parseMark(text);
+  return mark?.agent === agent && mark.project === root ? mark : null;
 }
