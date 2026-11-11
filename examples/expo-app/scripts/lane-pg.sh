@@ -13,6 +13,11 @@ prefix="${LANE_PG_PREFIX:-app}"
 migrations="${LANE_PG_MIGRATIONS:-migrations}"
 lane_db="${prefix}_${AGENTLANE_LANE:?}"
 
+prefix_bytes="$(printf %s "$prefix" | wc -c | tr -d ' ')"
+if [ "$prefix_bytes" -gt 35 ]; then
+  die "LANE_PG_PREFIX is $prefix_bytes bytes; Postgres cuts names at 63 bytes, so it can be at most 35"
+fi
+
 sql() {
   psql "$server/postgres" -X -q -t -A -v ON_ERROR_STOP=1 -c "$1"
 }
@@ -28,7 +33,7 @@ sha() {
 fingerprint() {
   [ -d "$migrations" ] || die "no migrations folder at $migrations"
   {
-    find "$migrations" -type f | LC_ALL=C sort | while IFS= read -r file; do
+    find "$migrations" -type f ! -name '.*' | LC_ALL=C sort | while IFS= read -r file; do
       printf '%s %s\n' "$(sha <"$file" | cut -c1-64)" "$file"
     done
     printf 'migrate %s\n' "${LANE_PG_MIGRATE:-}"
@@ -39,7 +44,7 @@ migrate() {
   if [ -n "${LANE_PG_MIGRATE:-}" ]; then
     DATABASE_URL="$1" sh -c "$LANE_PG_MIGRATE"
   else
-    find "$migrations" -type f -name '*.sql' | LC_ALL=C sort | while IFS= read -r file; do
+    find "$migrations" -type f -name '*.sql' ! -name '.*' | LC_ALL=C sort | while IFS= read -r file; do
       psql "$1" -X -q -v ON_ERROR_STOP=1 -f "$file"
     done
   fi
@@ -49,6 +54,9 @@ build_template() {
   template="$1"
   build="${template}_build"
   if exists "$template"; then return; fi
+  if exists "$build"; then
+    sql "ALTER DATABASE \"$build\" IS_TEMPLATE false"
+  fi
   sql "DROP DATABASE IF EXISTS \"$build\" WITH (FORCE)"
   sql "CREATE DATABASE \"$build\""
   migrate "$server/$build"
@@ -62,6 +70,7 @@ case "$1" in
     template="${prefix}_template_$fp"
     if ! exists "$template"; then
       psql "$server/postgres" -X -q -v ON_ERROR_STOP=1 >/dev/null <<EOF
+SELECT set_config(name, '0', false) FROM pg_settings WHERE name IN ('statement_timeout', 'lock_timeout', 'idle_session_timeout');
 SELECT pg_advisory_lock($((0x$fp)));
 \! sh "$0" build-template </dev/null >&2
 EOF

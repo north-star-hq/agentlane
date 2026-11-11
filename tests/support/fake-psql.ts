@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -36,6 +36,26 @@ function sleep(ms: number): void {
 
 class Failure extends Error {}
 
+const NAMEDATALEN = 63;
+
+function identifier(name: string): string {
+  return Buffer.from(name).subarray(0, NAMEDATALEN).toString();
+}
+
+function roleSettings(): Map<string, number> {
+  const settings = new Map<string, number>();
+  for (const pair of (process.env.FAKE_PG_ROLE_SETTINGS ?? '').split(',')) {
+    const [name = '', value = ''] = pair.split('=');
+    if (name !== '') settings.set(name, Number(value));
+  }
+  return settings;
+}
+
+function serverSettings(): string[] {
+  const version = Number(process.env.FAKE_PG_VERSION ?? '17');
+  return ['statement_timeout', 'lock_timeout', ...(version >= 14 ? ['idle_session_timeout'] : [])];
+}
+
 function run(state: string, argv: string[]): void {
   let target: string | null = null;
   let command: string | null = null;
@@ -61,6 +81,8 @@ function run(state: string, argv: string[]): void {
   const connection = path.join(connections, `${db}.${String(process.pid)}`);
   fs.writeFileSync(connection, '');
   const locks: string[] = [];
+  const settings = roleSettings();
+  const setting = (name: string): number => settings.get(name) ?? 0;
   process.on('exit', () => {
     fs.rmSync(connection, { force: true });
     for (const lock of locks) fs.rmSync(lock, { recursive: true, force: true });
@@ -79,31 +101,66 @@ function run(state: string, argv: string[]): void {
     log(`${db}: ${sql}`);
     let m: RegExpExecArray | null;
     if ((m = /^\\! (.+)$/.exec(sql))) {
+      const idle = setting('idle_session_timeout');
+      const started = Date.now();
+      const terminator =
+        idle > 0
+          ? spawn(
+              process.execPath,
+              [
+                '-e',
+                'setTimeout(() => { for (const l of JSON.parse(process.argv[1])) require("fs").rmSync(l, { recursive: true, force: true }); }, Number(process.argv[2]))',
+                JSON.stringify(locks),
+                String(idle),
+              ],
+              { stdio: 'ignore' },
+            )
+          : null;
       spawnSync('sh', ['-c', m[1] ?? ''], { stdio: 'inherit' });
+      terminator?.kill();
+      if (idle > 0 && Date.now() - started >= idle) {
+        throw new Failure('FATAL: terminating connection due to idle-session timeout');
+      }
+    } else if ((m = /^SELECT set_config\(name, '0', false\) FROM pg_settings WHERE name IN \(([^)]+)\)$/.exec(sql))) {
+      const known = serverSettings();
+      for (const quoted of (m[1] ?? '').split(',')) {
+        const name = quoted.trim().replace(/^'|'$/g, '');
+        if (known.includes(name)) settings.set(name, 0);
+      }
     } else if ((m = /^SELECT 1 FROM pg_database WHERE datname = '([^']+)'$/.exec(sql))) {
       if (readDatabase(state, m[1] ?? '') !== null) process.stdout.write('1\n');
     } else if ((m = /^SELECT pg_advisory_lock\((-?\d+)\)$/.exec(sql))) {
       const lock = path.join(state, 'locks', m[1] ?? '');
       fs.mkdirSync(path.dirname(lock), { recursive: true });
+      const limits = [setting('statement_timeout'), setting('lock_timeout')].filter(limit => limit > 0);
+      const started = Date.now();
       for (;;) {
         try {
           fs.mkdirSync(lock);
           break;
         } catch {
+          if (limits.some(limit => Date.now() - started >= limit)) {
+            throw new Failure('ERROR: canceling statement due to statement timeout');
+          }
           sleep(5);
         }
       }
       locks.push(lock);
     } else if ((m = /^CREATE DATABASE "([^"]+)"(?: TEMPLATE "([^"]+)")?$/.exec(sql))) {
-      const name = m[1] ?? '';
-      const source = m[2] ?? 'template1';
+      const name = identifier(m[1] ?? '');
+      const source = identifier(m[2] ?? 'template1');
       const from = m[2] === undefined ? null : readDatabase(state, source);
       if (m[2] !== undefined && from === null) throw new Failure(`ERROR: template database "${source}" does not exist`);
       if (othersOn(source).length > 0) {
         throw new Failure(`ERROR: source database "${source}" is being accessed by other users`);
       }
       const staging = fs.mkdtempSync(path.join(state, 'staging-'));
-      const created: FakeDatabase = { template: false, allowConnections: true, from: m[2] ?? null, applied: from?.applied ?? [] };
+      const created: FakeDatabase = {
+        template: false,
+        allowConnections: true,
+        from: m[2] === undefined ? null : source,
+        applied: from?.applied ?? [],
+      };
       fs.writeFileSync(path.join(staging, 'meta.json'), JSON.stringify(created));
       fs.mkdirSync(path.join(state, 'db'), { recursive: true });
       try {
@@ -113,16 +170,26 @@ function run(state: string, argv: string[]): void {
         throw new Failure(`ERROR: database "${name}" already exists`);
       }
     } else if ((m = /^DROP DATABASE IF EXISTS "([^"]+)"( WITH \(FORCE\))?$/.exec(sql))) {
-      const name = m[1] ?? '';
+      const name = identifier(m[1] ?? '');
       const found = readDatabase(state, name);
       if (found === null) return;
       if (found.template) throw new Failure('ERROR: cannot drop a template database');
-      if (m[2] === undefined && othersOn(name).length > 0) {
+      const others = othersOn(name);
+      if (m[2] === undefined && others.length > 0) {
         throw new Failure(`ERROR: database "${name}" is being accessed by other users`);
+      }
+      for (const other of others) {
+        fs.rmSync(path.join(connections, other), { force: true });
+        try {
+          process.kill(Number(other.slice(name.length + 1)), 'SIGTERM');
+        } catch {
+          continue;
+        }
       }
       fs.rmSync(databaseDir(state, name), { recursive: true, force: true });
     } else if ((m = /^ALTER DATABASE "([^"]+)" RENAME TO "([^"]+)"$/.exec(sql))) {
-      const [, name = '', to = ''] = m;
+      const name = identifier(m[1] ?? '');
+      const to = identifier(m[2] ?? '');
       if (readDatabase(state, name) === null) throw new Failure(`ERROR: database "${name}" does not exist`);
       if (othersOn(name).length > 0) throw new Failure(`ERROR: database "${name}" is being accessed by other users`);
       try {
@@ -131,10 +198,15 @@ function run(state: string, argv: string[]): void {
         throw new Failure(`ERROR: database "${to}" already exists`);
       }
     } else if ((m = /^ALTER DATABASE "([^"]+)" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false$/.exec(sql))) {
-      const name = m[1] ?? '';
+      const name = identifier(m[1] ?? '');
       const found = readDatabase(state, name);
       if (found === null) throw new Failure(`ERROR: database "${name}" does not exist`);
       write(name, { ...found, template: true, allowConnections: false });
+    } else if ((m = /^ALTER DATABASE "([^"]+)" IS_TEMPLATE false$/.exec(sql))) {
+      const name = identifier(m[1] ?? '');
+      const found = readDatabase(state, name);
+      if (found === null) throw new Failure(`ERROR: database "${name}" does not exist`);
+      write(name, { ...found, template: false });
     } else {
       throw new Failure(`fake psql does not know: ${sql}`);
     }

@@ -98,17 +98,17 @@ It needs `psql` on the `PATH` and Postgres 13 or later, on your Mac or in a cont
 | `LANE_PG_SERVER`     | `postgres://localhost:5432` | The server, as a URL without a database name. Add a user and password here. |
 | `LANE_PG_MIGRATIONS` | `migrations`                | The folder of migrations and seeds, relative to `agentlane.json`.          |
 | `LANE_PG_MIGRATE`    | none                        | Your own migrate command, run with `DATABASE_URL` set to the new template. Without one, the script runs each `.sql` file in the folder through `psql`, in name order. |
-| `LANE_PG_PREFIX`     | `app`                       | The start of every database name it makes.                                 |
+| `LANE_PG_PREFIX`     | `app`                       | The start of every database name it makes. At most 35 bytes, because Postgres cuts names at 63. |
 
-A lane's database is `app_<lane id>`. Its template is `app_template_<fingerprint>`, where the fingerprint is a hash of every file in the migrations folder and of `LANE_PG_MIGRATE`.
+A lane's database is `app_<lane id>`. Its template is `app_template_<fingerprint>`, where the fingerprint is a hash of every file in the migrations folder, leaving out dotfiles such as `.DS_Store`, and of `LANE_PG_MIGRATE`.
 
 **When a template is built.** create looks for the template that matches the migrations as they are now. When it isn't there, create builds it into a database named `<template>_build`, marks that as a template that accepts no connections, and renames it. So the template is rebuilt whenever a migration is added or changed, or the migrate command changes. Databases already cloned from the old template stay as they are, and the old template stays too, for any worktree still on the old migrations. To remove one by hand, run `ALTER DATABASE <name> IS_TEMPLATE false` and then `DROP DATABASE <name>`.
 
-**When several lanes start at once.** Before building, create takes a Postgres advisory lock keyed by the fingerprint and builds the template inside that one session. The other lanes wait on the lock, then find the template and clone it, so it is built once. Postgres frees the lock when the session ends, so a build that crashed leaves no lock behind, and the next create drops the half-built `<template>_build` and starts again.
+**When several lanes start at once.** Before building, create takes a Postgres advisory lock keyed by the fingerprint and builds the template inside that one session. The other lanes wait on the lock, then find the template and clone it, so it is built once. That session turns off `statement_timeout`, `lock_timeout` and, on Postgres 14 and later, `idle_session_timeout`, so a slow build neither fails the waiting lanes nor loses the lock. Postgres frees the lock when the session ends, so a build that crashed leaves no lock behind, and the next create clears the template mark on the half-built `<template>_build`, drops it and starts again.
 
 **Why a clone finds the template free.** Postgres refuses to copy a database while another session is connected to it. The migrations run while the database still has its build name, and it is closed to connections before it is renamed, so nothing can ever connect to the finished template, not even a superuser.
 
-Running create twice drops and clones the lane's database again, and running drop twice finds nothing the second time, so both cope with a partial earlier run. Drop uses `WITH (FORCE)`, so a server that is still connected doesn't stop it.
+Running create twice drops and clones the lane's database again, and running drop twice finds nothing the second time, so both cope with a partial earlier run. Drop uses `WITH (FORCE)`, which ends any session still connected to the lane's database, so a server that is still running doesn't stop it.
 
 ## Check it
 

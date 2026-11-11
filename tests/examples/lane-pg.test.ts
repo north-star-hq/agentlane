@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, test } from 'node:test';
-import { databases, readDatabase, seed } from '../support/fake-psql.ts';
+import { databaseDir, databases, readDatabase, seed } from '../support/fake-psql.ts';
 import { tempDir } from '../support/fakes.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -96,6 +96,10 @@ function templates(w: World): string[] {
 
 function laneDatabases(w: World): string[] {
   return databases(w.state).filter(name => /^app_[0-9a-f]{8}$/.test(name));
+}
+
+async function until(check: () => boolean): Promise<void> {
+  while (!check()) await new Promise(resolve => setTimeout(resolve, 10));
 }
 
 describe('the lane Postgres recipe', () => {
@@ -204,5 +208,86 @@ describe('the lane Postgres recipe', () => {
     assert.equal(readDatabase(w.state, 'app_0000000a')?.applied.length, 2);
     await ok(lane(w, '0000000b', 'create'));
     assert.equal(templates(w).length, 2);
+  });
+
+  test('a create after a build that crashed once it was marked a template clears the mark and builds again', async () => {
+    const w = world();
+    await ok(lane(w, '0000000a', 'create'));
+    const [template = ''] = templates(w);
+    await ok(lane(w, '0000000a', 'drop'));
+    fs.renameSync(databaseDir(w.state, template), databaseDir(w.state, `${template}_build`));
+    assert.equal(readDatabase(w.state, `${template}_build`)?.template, true);
+
+    await ok(lane(w, '0000000b', 'create'));
+    assert.deepEqual(templates(w), [template]);
+    assert.ok(!databases(w.state).includes(`${template}_build`));
+    assert.equal(readDatabase(w.state, 'app_0000000b')?.from, template);
+    assert.equal(readDatabase(w.state, 'app_0000000b')?.applied.length, 2);
+  });
+
+  for (const timeout of ['statement_timeout', 'lock_timeout', 'idle_session_timeout']) {
+    test(`builds the template once when eight lanes start together under a role with a short ${timeout}`, async () => {
+      const w = world();
+      const ids = ['0000000a', '0000000b', '0000000c', '0000000d', '0000000e', '0000000f', '00000010', '00000011'];
+      const extra = { FAKE_PG_MIGRATE_MS: '100', FAKE_PG_ROLE_SETTINGS: `${timeout}=50` };
+      await Promise.all(ids.map(id => ok(lane(w, id, 'create', extra))));
+      assert.equal(templates(w).length, 1);
+      assert.equal(calls(w).filter(c => c.includes(': migrate ')).length, 2);
+      assert.deepEqual(laneDatabases(w), ids.map(id => `app_${id}`));
+    });
+  }
+
+  test('turns off the timeouts on Postgres 13, which has no idle_session_timeout', async () => {
+    const w = world();
+    const extra = { FAKE_PG_MIGRATE_MS: '100', FAKE_PG_ROLE_SETTINGS: 'statement_timeout=50', FAKE_PG_VERSION: '13' };
+    await Promise.all(['0000000a', '0000000b'].map(id => ok(lane(w, id, 'create', extra))));
+    assert.equal(templates(w).length, 1);
+  });
+
+  test('leaves dotfiles in the migrations folder out of the fingerprint and the migrations', async () => {
+    const w = world();
+    migration(w, '._002_seed.sql', 'AppleDouble');
+    await ok(lane(w, '0000000a', 'create'));
+    const [template = ''] = templates(w);
+    assert.equal(readDatabase(w.state, 'app_0000000a')?.applied.length, 2);
+    migration(w, '.DS_Store', 'Finder');
+    await ok(lane(w, '0000000b', 'create'));
+    assert.deepEqual(templates(w), [template]);
+    assert.equal(readDatabase(w.state, 'app_0000000b')?.from, template);
+  });
+
+  test('a drop ends the sessions still connected to the lane database', async () => {
+    const w = world();
+    await ok(lane(w, '0000000a', 'create'));
+    const held = spawn(path.join(w.bin, 'psql'), [`${SERVER}/app_0000000a`], {
+      env: environment(w),
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
+    const ended = new Promise<NodeJS.Signals | null>(resolve => held.on('close', (_code, signal) => {
+      resolve(signal);
+    }));
+    const connection = path.join(w.state, 'connections', `app_0000000a.${String(held.pid)}`);
+    try {
+      await until(() => fs.existsSync(connection));
+      await ok(lane(w, '0000000a', 'drop'));
+      assert.deepEqual(laneDatabases(w), []);
+      assert.equal(await ended, 'SIGTERM');
+    } finally {
+      held.kill();
+    }
+  });
+
+  test('refuses a prefix so long that Postgres would cut the names it makes', async () => {
+    const w = world();
+    const refused = await lane(w, '0000000a', 'create', { LANE_PG_PREFIX: 'p'.repeat(36) });
+    assert.notEqual(refused.code, 0);
+    assert.match(refused.stderr, /LANE_PG_PREFIX is 36 bytes; Postgres cuts names at 63 bytes, so it can be at most 35/);
+    assert.deepEqual(databases(w.state), ['postgres']);
+
+    const prefix = 'p'.repeat(35);
+    await ok(lane(w, '0000000a', 'create', { LANE_PG_PREFIX: prefix }));
+    await ok(lane(w, '0000000b', 'create', { LANE_PG_PREFIX: prefix }));
+    assert.equal(calls(w).filter(c => c.includes(': migrate ')).length, 2);
+    assert.ok(databases(w.state).includes(`${prefix}_0000000b`));
   });
 });
