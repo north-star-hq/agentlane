@@ -8,7 +8,10 @@ import { envName, TOOL } from '../name.ts';
 import type { Agent, Owner } from '../registry/owner.ts';
 import { AGENTS, describeOwner, judgeProcess, ownerKey, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
-import { readRegistryStatus } from '../registry/registry.ts';
+import { tcpProbe } from '../registry/ports.ts';
+import { readRegistryStatus, Registry } from '../registry/registry.ts';
+import { recordCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
+import type { LaneStatus } from '../registry/types.ts';
 import type { CliDeps } from '../registry-cli.ts';
 import { releaseEveryLaneOf, resolveFolder } from '../registry-cli.ts';
 import { commandUsage, groupUsage, type UsageGroup } from '../usage.ts';
@@ -17,7 +20,7 @@ import { toolVersion } from '../agents/package.ts';
 import { aimsOf } from './aims.ts';
 import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
-import { guard } from './guard.ts';
+import { aimedOwnLanes, guard, type GuardContext } from './guard.ts';
 import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
 import { claimOnce } from './hook-once.ts';
 import { claudeSessionName } from './session-name.ts';
@@ -83,15 +86,41 @@ function guardReply(raw: string, agent: Agent, deps: HookDeps): HookReply {
     devices: deps.devices,
     ...(deps.clock ? { clock: deps.clock } : {}),
   });
-  const verdict = guard(command, deps.env, {
+  const context: GuardContext = {
     self: owner ? ownerKey(owner) : null,
     cwd,
     lanes: report.lanes,
     now: report.now,
     worktreeOf,
     sessionName: lane => claudeSessionName(lane.owner, deps.env),
-  });
-  return verdict.allow ? convention.allow : convention.deny(verdict.reason);
+  };
+  const verdict = guard(command, deps.env, context);
+  if (!verdict.allow) return convention.deny(verdict.reason);
+  if (owner) recordCalls(owner, aimedOwnLanes(command, deps.env, context), deps);
+  return convention.allow;
+}
+
+/** Records an allowed simctl, adb, playwright-cli or agent-browser command on the caller's own lanes as a call on each. */
+function recordCalls(owner: Owner, lanes: readonly LaneStatus[], deps: HookDeps): void {
+  if (lanes.length === 0) return;
+  const dir = stateDir(deps.env);
+  let registry: Registry;
+  try {
+    registry = Registry.open({ dir, processes: deps.processes, ports: tcpProbe, devices: {}, lockWaitMs: TOUCH_WAIT_MS });
+  } catch {
+    return;
+  }
+  try {
+    const at = (deps.clock ?? systemClock).now();
+    for (const lane of lanes) {
+      const found = registry.find(owner, lane.worktree);
+      if (found?.id === lane.id) recordCall(dir, { id: found.id, token: found.token }, at);
+    }
+  } catch {
+    return;
+  } finally {
+    registry.close();
+  }
 }
 
 function preToolUse(raw: string, agent: Agent, deps: HookDeps): number {

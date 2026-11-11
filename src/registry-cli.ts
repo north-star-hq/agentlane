@@ -34,7 +34,8 @@ import {
 } from './registry/prune.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
 import { readRegistryStatus, Registry } from './registry/registry.ts';
-import type { Lane, LaneOutcome, LaneStatus, EndedLane, ServiceRequest, StatusReport } from './registry/types.ts';
+import { describeRestarts } from './registry/parks.ts';
+import type { Lane, LaneOutcome, LaneStatus, EndedLane, ParkStatus, ServiceRequest, StatusReport } from './registry/types.ts';
 import type { ServiceSystem } from './services/system.ts';
 import { realServiceSystem } from './services/system.ts';
 import type { Teardown } from './up/release.ts';
@@ -206,7 +207,6 @@ function renderOutcome(outcome: LaneOutcome, now: number, deps: CliDeps, json: b
     return;
   }
   for (const e of outcome.freed) deps.stderr(`${TOOL}: ${describeEnded(e, now)}\n`);
-  for (const e of outcome.tookOver) deps.stderr(`${TOOL}: ${describeEnded(e, now)}\n`);
   for (const note of outcome.notes) deps.stderr(`${TOOL}: ${note}\n`);
   const verb = outcome.created ? 'claimed lane' : 'reusing lane';
   deps.stderr(`${TOOL}: ${verb} ${lane.id} for ${describeOwner(lane.owner)} in ${lane.worktree}: ${describeLane(lane)}\n`);
@@ -215,13 +215,23 @@ function renderOutcome(outcome: LaneOutcome, now: number, deps: CliDeps, json: b
 
 export type SessionNames = (lane: LaneStatus) => string | null;
 
-function laneLines(c: LaneStatus, sessionName: SessionNames): string[] {
+function parkLines(park: ParkStatus, now: number): string[] {
+  const at = park.parkedAt ?? park.since;
+  const head =
+    park.state === 'parked'
+      ? `      parked       since ${formatTime(at)} (${formatAge(now - at)} ago); its next call brings back ${describeRestarts(park.restarts)}`
+      : `      ${park.state.padEnd(13)}since ${formatTime(park.since)}, by pid ${String(park.by ?? 'unknown')}`;
+  return [head, ...park.problems.map(p => `      problem      ${p}`)];
+}
+
+function laneLines(c: LaneStatus, sessionName: SessionNames, now: number): string[] {
   const state = c.ownerState === 'alive' ? 'alive' : describeState(c.ownerState).toUpperCase();
   const name = sessionName(c);
   const lines = [
     `  ${c.id}  ${describeOwner(c.owner)}${name ? ` "${name}"` : ''}  [${state}]`,
     `      folder       ${c.worktree}${c.projectRoot !== c.worktree ? `  (project ${c.projectRoot})` : ''}`,
     `      started      ${formatTime(c.createdAt)}   idle ${formatAge(c.idleMs)}   last action: ${c.lastAction}`,
+    ...(c.park ? parkLines(c.park, now) : []),
   ];
   if (c.device) {
     lines.push(
@@ -263,7 +273,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
   const { config } = report;
   const lines = [
     `${TOOL} registry: ${report.stateDir}`,
-    `pool: ${poolLine(report)}; idle lanes are reclaimable after ${formatAge(config.idleMs)} when the pool is full`,
+    `pool: ${poolLine(report)}; a lane is parked ${formatAge(config.parkMs)} after its last call, giving its device back`,
     `ports: ${Object.entries(config.blocks)
       .map(([type, b]) => `${type} ${String(b.first)}-${String(b.last)}`)
       .join(', ')}`,
@@ -272,7 +282,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
   if (report.lanes.length === 0) lines.push('no lanes');
   else {
     lines.push(`lanes (${String(report.lanes.length)}):`);
-    for (const c of report.lanes) lines.push(...laneLines(c, sessionName));
+    for (const c of report.lanes) lines.push(...laneLines(c, sessionName, report.now));
   }
   if (report.queue.length > 0) {
     lines.push('', 'queue:');
@@ -560,7 +570,7 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
         renderOutcome(outcome, now(deps), deps, values.json);
         const state = stateDir(deps.env);
         const stopped = [
-          ...(await stopEndedLanes(teardownDeps(deps), state, [...outcome.freed, ...outcome.tookOver])),
+          ...(await stopEndedLanes(teardownDeps(deps), state, outcome.freed)),
           ...(await stopEndedBrowsers(teardownDeps(deps).browser, registry, state, teardownDeps(deps).clock)),
           ...(await tearDownEndedResources(teardownDeps(deps), registry, state)),
         ];

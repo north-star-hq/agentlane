@@ -22,7 +22,7 @@ export interface Teardown {
   problems: string[];
 }
 
-type TeardownDeps = Pick<EnvDeps, 'env' | 'sim' | 'system' | 'clock' | 'processes' | 'adb' | 'browser' | 'evidence'>;
+export type TeardownDeps = Pick<EnvDeps, 'env' | 'sim' | 'system' | 'clock' | 'processes' | 'adb' | 'browser' | 'evidence'>;
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -37,8 +37,8 @@ async function stopDriver(deps: Pick<EnvDeps, 'processes'>, stateDir: string, la
   }
 }
 
-async function browserControl(
-  deps: TeardownDeps,
+export async function browserControl(
+  deps: Pick<TeardownDeps, 'env' | 'browser'>,
   stateDir: string,
   lane: LaneInfo & { browser: ClaimedBrowser },
   into: Teardown,

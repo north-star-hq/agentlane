@@ -15,6 +15,7 @@ import { databasePath } from '../src/registry/paths.ts';
 import type { Step } from '../src/registry/registry.ts';
 import { Registry, STEPS } from '../src/registry/registry.ts';
 import { FakeDevices, tempDir } from './support/fakes.ts';
+import { parkNow } from './support/world.ts';
 import type { ClaimerPlan, SlowDevices, StressOp } from './support/stress-plan.ts';
 import { EXIT_REFUSED, runClaimer } from './support/stress-plan.ts';
 
@@ -85,7 +86,7 @@ function overlapsIn(journal: string): { calls: number; overlaps: number } {
 
 async function runSeed(
   seed: number,
-  idleMs: number,
+  parkSquatters: boolean,
   targets: readonly Step[],
   lead: Step | null,
   slowMs: SlowDevices['ms'] | null = null,
@@ -101,8 +102,8 @@ async function runSeed(
     poolSize: 3,
     emulatorPoolSize: 2,
     memoryBudgetMb: 15_400,
-    idleMs,
-    blocks: { metro: { first: 48000, last: 48004 }, api: { first: 48100, last: 48104 } },
+    parkMs: 30 * 60_000,
+    blocks: { metro: { first: 48000, last: 48008 }, api: { first: 48100, last: 48108 } },
   };
   const immortal = [sleeper(), sleeper(), sleeper()];
   const mortal = [sleeper(), sleeper()];
@@ -120,7 +121,6 @@ async function runSeed(
   try {
     const plans: ClaimerPlan[] = [];
     let ops = 0;
-    const idleSeed = idleMs < 1000;
     const squat = (worktree: string, platform: Platform): StressOp => ({
       kind: 'claim',
       worktree,
@@ -161,17 +161,17 @@ async function runSeed(
       const shared = i % 2 === 1 ? pick([...immortal, ...mortal]) : null;
       const worktree = shared ? pick(folders.get(shared.pid ?? 0)?.slice(1) ?? []) : folder(`self-${String(i)}`);
       let script: StressOp[] = [];
-      let startMs = 30 + Math.floor(random() * 300);
+      const startMs = 30 + Math.floor(random() * 300);
       let crashAt: Step[] = [];
       if (hunter) {
         const platform: Platform = i % 8 === 7 ? 'android' : 'ios';
         script = [
           { kind: 'claim', worktree, platform, device: DEVICE_TYPES[platform][1], strict: true, boot: true, waitMs: 700 },
           { kind: 'touch' },
+          { kind: 'park' },
           { kind: 'release' },
         ];
         crashAt = [targets[(i >> 2) % targets.length] ?? 'claim:booted'];
-        if (crashAt[0] === 'claim:took-over') startMs = 0;
       } else {
         const count = 2 + Math.floor(random() * 4);
         for (let k = 0; k < count; k++) {
@@ -189,6 +189,7 @@ async function runSeed(
             });
           } else if (roll < 0.55) script.push({ kind: 'touch' });
           else if (roll < 0.75) script.push({ kind: 'release' });
+          else if (roll < 0.85) script.push({ kind: 'park' });
           else script.push({ kind: 'pause', ms: Math.floor(random() * 500) });
         }
         if (random() < 0.65) crashAt = [targets[(4 + i) % targets.length] ?? 'claim:locked'];
@@ -208,12 +209,31 @@ async function runSeed(
         crashOccurrence: hunter ? 1 : 1 + Math.floor(random() * 2),
       });
     }
-    const squatted = idleSeed || lead !== null;
+    const squatted = parkSquatters || lead !== null;
     if (squatted) {
       for (const exit of await Promise.all(squatters.map(runClaimer)))
         assert.equal(exit.code, 0, `squatter: ${exit.stdout}${exit.stderr}`);
     }
-    if (idleSeed) await new Promise(resolve => setTimeout(resolve, idleMs + 50));
+    if (parkSquatters) {
+      const parker = Registry.open({
+        dir: stateDir,
+        processes: systemProcesses,
+        ports: { listening: () => Promise.resolve(new Set<number>()) },
+        devices: { ios: new FakeDevices(devicesDir), android: new FakeDevices(emulatorsDir, 'android') },
+        config,
+      });
+      try {
+        const db = new DatabaseSync(databasePath(stateDir), { readOnly: true });
+        const lanes = db.prepare('SELECT id, token FROM claims').all();
+        db.close();
+        for (const lane of lanes) {
+          const ref = { id: String(lane.id), token: String(lane.token) };
+          assert.ok(parkNow(parker, ref), `seed ${String(seed)}: squatter lane ${ref.id} was not parked`);
+        }
+      } finally {
+        parker.close();
+      }
+    }
     const crashes: Step[] = [];
     if (lead !== null && LEASE_STEPS.includes(lead)) {
       const dropper = await runClaimer({
@@ -266,6 +286,7 @@ async function runSeed(
             waitMs: 700,
           },
           { kind: 'touch' },
+          ...(lead.startsWith('park:') ? [{ kind: 'park' } as const] : []),
           { kind: 'release' },
         ],
         crashAt: [lead],
@@ -349,8 +370,6 @@ async function runSeed(
         const reason = String(h.reason);
         const ownerKey = String(h.owner_key);
         if (reason === 'released') assert.equal(h.by_owner_key, ownerKey, `released by someone else: ${where}`);
-        else if (reason === 'taken-over')
-          assert.ok(Number(h.ended_at) - Number(h.last_used_at) >= idleMs, `taken over before it was idle: ${where}`);
         else if (reason === 'dead' || reason === 'pid-reused') {
           assert.notEqual(ownerKey, `codex:thread:${THREAD}`, `a can't-tell owner's lane was freed: ${where}`);
           assert.equal(immortalKeys.has(ownerKey), false, `a live owner's lane was freed: ${where}`);
@@ -455,11 +474,11 @@ test(`stress: ${String(CLAIMERS)} parallel claimers per seed with crashes inject
   const seeds: number[] = [];
   const seed = async (n: number, lead: Step | null) => {
     seeds.push(n);
-    const idleMs = lead === null ? (n % 2 === 0 ? 300 : 3_600_000) : lead === 'claim:waiting' ? 3_600_000 : 300;
-    const targets = [...STEPS]
-      .filter(step => idleMs < 1000 || step !== 'claim:took-over')
-      .sort((a, b) => (crashes.get(a) ?? 0) - (crashes.get(b) ?? 0) || STEPS.indexOf(a) - STEPS.indexOf(b));
-    const result = await runSeed(n, idleMs, targets, lead);
+    const parkSquatters = lead === null ? n % 2 === 0 : lead !== 'claim:waiting';
+    const targets = [...STEPS].sort(
+      (a, b) => (crashes.get(a) ?? 0) - (crashes.get(b) ?? 0) || STEPS.indexOf(a) - STEPS.indexOf(b),
+    );
+    const result = await runSeed(n, parkSquatters, targets, lead);
     for (const [reason, k] of Object.entries(result.reasons)) endings.set(reason, (endings.get(reason) ?? 0) + k);
     for (const step of result.crashes) crashes.set(step, (crashes.get(step) ?? 0) + 1);
     for (const [step, k] of Object.entries(result.reached)) reached.set(step as Step, (reached.get(step as Step) ?? 0) + k);
@@ -474,7 +493,7 @@ test(`stress: ${String(CLAIMERS)} parallel claimers per seed with crashes inject
   for (const [k, lead] of leads.entries()) await seed(SEEDS + 1 + k, lead);
   const missed = [...crashes].filter(([, n]) => n === 0).map(([s]) => s);
   console.log(
-    `stress seeds ${seeds.join(',')} (odd: no idle takeover, even: 300 ms idle; each seed past ${String(SEEDS)} first runs one claimer alone on a full pool, crashing at a step the others missed: ${leads.join(' ') || 'none'}); ${String(runs)} claimer processes, ${String(ops)} operations, ${String(ended)} lanes ended; ${String(Date.now() - started)} ms`,
+    `stress seeds ${seeds.join(',')} (odd: no squatters, even: squatters' lanes parked first; each seed past ${String(SEEDS)} first runs one claimer alone on a full pool, crashing at a step the others missed: ${leads.join(' ') || 'none'}); ${String(runs)} claimer processes, ${String(ops)} operations, ${String(ended)} lanes ended; ${String(Date.now() - started)} ms`,
   );
   console.log(`lanes ended by reason: ${[...endings].map(([r, n]) => `${r}=${String(n)}`).join(' ')}`);
   console.log(
@@ -497,12 +516,12 @@ test(`stress with a slow device backend (create ${String(SLOW_MS.create)} ms, sh
   let slowCalls = 0;
   let overlaps = 0;
   const seeds: number[] = [];
-  const seed = async (n: number, idleMs: number, lead: Step | null) => {
+  const seed = async (n: number, parkSquatters: boolean, lead: Step | null) => {
     seeds.push(n);
     const targets = [...DEVICE_WORK_STEPS].sort(
       (a, b) => (crashes.get(a) ?? 0) - (crashes.get(b) ?? 0) || STEPS.indexOf(a) - STEPS.indexOf(b),
     );
-    const result = await runSeed(n, idleMs, targets, lead, SLOW_MS);
+    const result = await runSeed(n, parkSquatters, targets, lead, SLOW_MS);
     for (const step of result.crashes) crashes.set(step, (crashes.get(step) ?? 0) + 1);
     claims += result.claims;
     refusals += result.refusals;
@@ -510,9 +529,9 @@ test(`stress with a slow device backend (create ${String(SLOW_MS.create)} ms, sh
     slowCalls += result.slowCalls;
     overlaps += result.overlaps;
   };
-  for (let n = 101; n < 101 + SLOW_SEEDS; n++) await seed(n, n % 2 === 0 ? 300 : 3_600_000, null);
+  for (let n = 101; n < 101 + SLOW_SEEDS; n++) await seed(n, n % 2 === 0, null);
   const leads = SLOW_LEASE_STEPS.filter(step => (crashes.get(step) ?? 0) === 0);
-  for (const [k, lead] of leads.entries()) await seed(101 + SLOW_SEEDS + k, 300, lead);
+  for (const [k, lead] of leads.entries()) await seed(101 + SLOW_SEEDS + k, true, lead);
   console.log(
     `slow stress seeds ${seeds.join(',')} (each past ${String(100 + SLOW_SEEDS)} first runs one claimer alone on a full pool, crashing at a lease step the others missed: ${leads.join(' ') || 'none'}): ${String(claims)} claims granted, ${String(refusals)} claimers refused at least once, ${String(ended)} lanes ended; ${String(slowCalls)} slow device calls finished, ${String(overlaps)} commits by other processes landed during one; ${String(Date.now() - started)} ms`,
   );

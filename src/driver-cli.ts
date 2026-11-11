@@ -51,6 +51,7 @@ import { CLI, TOOL } from './name.ts';
 import type { ProcessTable } from './processes.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
 import { touchLane } from './registry/touch.ts';
+import { enterLane, type LaneWaker } from './up/wake.ts';
 import { groupUsage, helpOf, type UsageGroup } from './usage.ts';
 
 export interface DriverCliDeps {
@@ -66,6 +67,8 @@ export interface DriverCliDeps {
   adb?: AdbFactory;
   browser?: BrowserTools;
   evidence?: EvidenceSystem;
+  /** Brings a parked lane back before a call on it runs; without it, a call on a parked lane is refused. */
+  wake?: LaneWaker;
 }
 
 export const DRIVER_COMMANDS = ['look', 'run', 'screenshot', 'record', 'evidence', 'driver', 'browser', 'device', 'mcp'] as const;
@@ -145,6 +148,21 @@ function stamp(): string {
 
 function laneFor(deps: DriverCliDeps, worktree: string | undefined, need: Caller['need'] = 'device'): CallerLane {
   return resolveCallerLane({ env: deps.env, cwd: deps.cwd, worktree, processes: deps.processes, need });
+}
+
+/** The caller's lane for a call on it: the call is recorded, and a parked lane is brought back first. */
+async function enter(deps: DriverCliDeps, worktree: string | undefined, need: Caller['need'] = 'device'): Promise<CallerLane> {
+  const resolved = resolveCallerLane({ env: deps.env, cwd: deps.cwd, worktree, processes: deps.processes, need, counts: true });
+  const lane = await enterLane(
+    { stateDir: resolved.stateDir, processes: deps.processes },
+    resolved.lane,
+    resolved.park,
+    deps.wake,
+    line => {
+      deps.stderr(`${TOOL}: ${line}\n`);
+    },
+  );
+  return { ...resolved, lane, park: null };
 }
 
 /** The lane's browser when asked for, or when the lane holds no device; else null, for the device. */
@@ -251,7 +269,7 @@ async function look(args: string[], deps: DriverCliDeps): Promise<number> {
       throw new UsageError(`--depth ${values.depth} is not a level count`, 'pass --depth 2');
     lookArgs.depth = depth;
   }
-  const resolved = laneFor(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
+  const resolved = await enter(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
   const browser = values.device ? null : browserTarget(deps, resolved, values.browser);
   if (browser) {
     notOnBrowser({ bounds: values.bounds, raw: values.raw }, 'look');
@@ -318,7 +336,7 @@ async function run(args: string[], deps: DriverCliDeps): Promise<number> {
       throw new UsageError(`no flow file at ${file}`, 'pass the path of a Maestro flow');
     runArgs.file = file;
   }
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
   const driverLogFrom = sizeOf(enginePaths(resolved.stateDir, resolved.lane.id).log);
   const response = await callEngine(targetOf(deps, resolved), { op: 'run', args: runArgs });
   let screenshot: string | undefined;
@@ -360,7 +378,7 @@ async function screenshot(args: string[], deps: DriverCliDeps): Promise<number> 
     shotArgs.scale = scale;
   }
   if (values.crop !== undefined) shotArgs.crop = parseCrop(values.crop);
-  const resolved = laneFor(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
+  const resolved = await enter(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
   const browser = values.device ? null : browserTarget(deps, resolved, values.browser);
   if (browser) {
     notOnBrowser({ scale: values.scale, crop: values.crop }, 'screenshot');
@@ -397,7 +415,7 @@ async function record(args: string[], deps: DriverCliDeps): Promise<number> {
   ) {
     throw new UsageError('record takes save <file>, show or clear', `${CLI} record save flows/probe.yaml`);
   }
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
   const response = await callEngine(targetOf(deps, resolved), {
     op: 'record',
     args: { action, ...(file === undefined ? {} : { file: path.resolve(deps.cwd, file) }) },
@@ -446,7 +464,7 @@ async function driver(args: string[], deps: DriverCliDeps): Promise<number> {
       return 0;
     }
     case 'start': {
-      const resolved = laneFor(deps, values.worktree);
+      const resolved = await enter(deps, values.worktree);
       const started = Date.now();
       const response = await callEngine(targetOf(deps, resolved), { op: 'look', args: { interactiveOnly: true } });
       const seconds = (Date.now() - started) / 1000;
@@ -545,7 +563,8 @@ async function evidence(args: string[], deps: DriverCliDeps): Promise<number> {
   const [what = 'list', action, ...rest] = positionals;
   if (rest.length > 0) throw new UsageError(`unexpected ${rest.join(' ')}`, EVIDENCE_FIX);
   const asked: EvidenceTarget | undefined = values.browser ? 'browser' : values.device ? 'device' : undefined;
-  const resolved = laneFor(deps, values.worktree, asked ?? 'either');
+  const resolved =
+    what === 'list' ? laneFor(deps, values.worktree, asked ?? 'either') : await enter(deps, values.worktree, asked ?? 'either');
   if (what !== 'list') touch(deps, resolved, `evidence ${what}${action ? ` ${action}` : ''}`);
   const ctx = evidenceContext(deps, resolved);
   const folder = laneEvidence(resolved.stateDir, resolved.lane.id);
@@ -660,7 +679,7 @@ async function device(args: string[], deps: DriverCliDeps): Promise<number> {
     options: { worktree: { type: 'string' } },
   });
   const [control, ...rest] = positionals;
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
   touch(deps, resolved, control === undefined ? 'device' : `device ${control}`);
   const claimed = resolved.lane.device;
   if (claimed?.platform === 'android') {
@@ -891,7 +910,12 @@ async function mcp(args: string[], deps: DriverCliDeps): Promise<number> {
     output: deps.output,
     info: { name: TOOL, version: packageVersion() },
     tools: TOOLS,
-    call: createToolHandler({ env: deps.env, cwd: deps.cwd, processes: deps.processes }),
+    call: createToolHandler({
+      env: deps.env,
+      cwd: deps.cwd,
+      processes: deps.processes,
+      ...(deps.wake ? { wake: deps.wake } : {}),
+    }),
   });
   return 0;
 }

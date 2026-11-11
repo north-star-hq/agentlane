@@ -10,7 +10,7 @@ import { identityOf, systemProcesses, type ProcessIdentity, type ProcessTable } 
 import { isProven, judgeProcess, worktreeState, type Owner } from '../registry/owner.ts';
 import { tcpProbe } from '../registry/ports.ts';
 import { Registry } from '../registry/registry.ts';
-import { landTouch, laneHasEnded, recordCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
+import { HEARTBEAT_MS, landTouch, laneHasEnded, recordCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
 import { messageOf } from './errors.ts';
 import { IdleWatch, writeIdleStop, describeIdle } from './idle.ts';
 import { sipsImages, type ImageTools } from './images.ts';
@@ -37,6 +37,8 @@ export interface EngineConfig {
   lanePollMs?: number;
   ownerPollMs?: number;
   touchEveryMs?: number;
+  /** How often a tool call still running counts again as a call on the lane, so a long run keeps it from being parked. */
+  heartbeatMs?: number;
   /** How long the engine waits, idle, before one more read that teaches it which numbers tick on their own. */
   idleSampleMs?: number;
   runnerWatchMs?: number;
@@ -258,6 +260,8 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
     pendingTouch = action;
     if (Date.now() - lastTouch >= (config.touchEveryMs ?? 5000)) setImmediate(flushTouch);
   };
+  const running = new Map<number, string>();
+  let nextCall = 0;
 
   let laneEnded = false;
   const laneGone = (): EngineResponse => ({
@@ -361,9 +365,11 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
     clearTimeout(sampleTimer);
     const op = request.op;
     const tool = isToolCall(op);
+    const call = nextCall++;
     if (tool) {
       idle.begin();
       touchSoon(ACTIONS[op]);
+      running.set(call, ACTIONS[op]);
     }
     const job = tail.then(() => (stopping === undefined ? perform(request) : refusal(request, stopping)));
     tail = job.catch(() => undefined);
@@ -389,6 +395,7 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
       )
       .finally(() => {
         if (tool) {
+          running.delete(call);
           touchSoon(ACTIONS[op]);
           idle.end();
           scheduleIdleCheck();
@@ -560,6 +567,10 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
       }
       flushTouch();
     }, config.lanePollMs ?? 500),
+    setInterval(() => {
+      const action = [...running.values()][0];
+      if (stopping === undefined && action !== undefined) touchSoon(action);
+    }, config.heartbeatMs ?? HEARTBEAT_MS),
     setInterval(() => {
       if (stopping !== undefined) return;
       const owner = config.owner.process;

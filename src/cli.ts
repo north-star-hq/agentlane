@@ -25,7 +25,10 @@ import { tcpProbe } from './registry/ports.ts';
 import { REGISTRY_COMMANDS, REGISTRY_HELP, REGISTRY_USAGE, runRegistryCommand } from './registry-cli.ts';
 import { realServiceSystem } from './services/system.ts';
 import { UP_COMMANDS, UP_HELP, UP_USAGE, runUpCommand } from './up-cli.ts';
+import type { EnvDeps } from './up/deps.ts';
 import { systemToolchain } from './up/preflight.ts';
+import { passBy, runSweep, sweeper, SWEEP_COMMAND } from './up/sweep.ts';
+import { upWaker } from './up/waker.ts';
 import { asksForHelp, helpOf, type UsageGroup } from './usage.ts';
 
 const USAGE = `Usage: ${TOOL} <command>
@@ -88,10 +91,51 @@ async function main(args: string[]): Promise<number> {
     process.stdout.write(help);
     return 0;
   }
+  const state = stateDir(process.env);
+  if (command !== 'hook' && command !== SWEEP_COMMAND) passBy({ dir: state }, sweeper(process.argv[1] ?? '', process.env));
   const mac = process.platform === 'darwin';
-  const android = createEmulatorBackend({ env: process.env, logDir: path.join(stateDir(process.env), 'emulators') });
+  const android = createEmulatorBackend({ env: process.env, logDir: path.join(state, 'emulators') });
   const devices = mac ? { ios: simctlBackend, android } : { android };
   const sim = mac ? createXcrunTools() : null;
+  const envDeps = (): EnvDeps => ({
+    env: process.env,
+    cwd: process.cwd(),
+    log: line => process.stderr.write(`${line}\n`),
+    processes: systemProcesses,
+    ports: tcpProbe,
+    devices,
+    sim,
+    system: realServiceSystem,
+    toolchain: systemToolchain,
+    startDriver: async (lane, at, javaHome) => {
+      await prewarmEngine({
+        stateDir: at,
+        lane,
+        env: process.env,
+        ...(javaHome === undefined ? {} : { javaHome }),
+        progress: line => process.stderr.write(`${TOOL} up: driver: ${line}\n`),
+      });
+    },
+    clock: systemClock,
+    onCancel,
+  });
+  if (command === SWEEP_COMMAND) {
+    if (rest.length > 0) {
+      process.stderr.write(`${TOOL} ${SWEEP_COMMAND} takes no arguments\n`);
+      return 2;
+    }
+    await runSweep({
+      dir: state,
+      env: process.env,
+      processes: systemProcesses,
+      system: realServiceSystem,
+      clock: systemClock,
+      devices,
+      ports: tcpProbe,
+      log: line => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
+    });
+    return 0;
+  }
   if ((REGISTRY_COMMANDS as readonly string[]).includes(command)) {
     return runRegistryCommand(command, rest, {
       env: process.env,
@@ -123,33 +167,7 @@ async function main(args: string[]): Promise<number> {
     });
   }
   if ((UP_COMMANDS as readonly string[]).includes(command)) {
-    return runUpCommand(
-      command,
-      rest,
-      {
-        env: process.env,
-        cwd: process.cwd(),
-        log: line => process.stderr.write(`${line}\n`),
-        processes: systemProcesses,
-        ports: tcpProbe,
-        devices,
-        sim,
-        system: realServiceSystem,
-        toolchain: systemToolchain,
-        startDriver: async (lane, state, javaHome) => {
-          await prewarmEngine({
-            stateDir: state,
-            lane,
-            env: process.env,
-            ...(javaHome === undefined ? {} : { javaHome }),
-            progress: line => process.stderr.write(`${TOOL} up: driver: ${line}\n`),
-          });
-        },
-        clock: systemClock,
-        onCancel,
-      },
-      text => process.stdout.write(text),
-    );
+    return runUpCommand(command, rest, envDeps(), text => process.stdout.write(text));
   }
   if ((DRIVER_COMMANDS as readonly string[]).includes(command)) {
     return runDriverCommand(command, rest, {
@@ -160,6 +178,7 @@ async function main(args: string[]): Promise<number> {
       stdin: process.stdin,
       output: process.stdout,
       processes: systemProcesses,
+      wake: upWaker(envDeps()),
     });
   }
   if ((AGENT_COMMANDS as readonly string[]).includes(command)) {

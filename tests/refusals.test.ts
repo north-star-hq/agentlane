@@ -6,6 +6,7 @@ import type { Owner } from '../src/registry/owner.ts';
 import type { RefusalCode } from '../src/registry/refusal.ts';
 import { NotClaimed, Refusal, REFUSAL_CODES } from '../src/registry/refusal.ts';
 import { Store } from '../src/registry/store.ts';
+import { takeLane } from '../src/up/wake.ts';
 import type { World } from './support/world.ts';
 import { world } from './support/world.ts';
 
@@ -68,6 +69,15 @@ const scenarios: Record<RefusalCode, Scenario> = {
     const spec = { name: 'db', cwd: held.lane.worktree, teardown: 'true', timeoutMs: 1000, env: {}, cleared: [] };
     w.registry().startResource(ref, spec);
     const refusal = await refusalOf(() => w.registry().startResource(ref, spec));
+    return { refusal, holderFolder: held.lane.worktree };
+  },
+  'lane-busy': async w => {
+    const held = await w.registry().claim(w.request(w.procs.owner(), w.folder('holder'), NO_DEVICE));
+    const ref = { id: held.lane.id, token: held.lane.token };
+    assert.ok(w.registry().beginPark(ref, w.clock.now(), 'parking-now', null));
+    const refusal = await refusalOf(() =>
+      takeLane({ stateDir: w.dir, processes: w.procs, clock: w.clock, self: w.procs.spawn(), waitMs: 0 }, ref),
+    );
     return { refusal, holderFolder: held.lane.worktree };
   },
   'registry-busy': async w => {

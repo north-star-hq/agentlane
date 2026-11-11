@@ -170,7 +170,10 @@ export interface BrowserTeardown {
   problems: string[];
 }
 
-/** Stops a lane's browser: the driver's own close first, then every process of it the process table still shows. */
+/**
+ * Stops a lane's browser: the driver's own close first, then every process of it the process table still shows. Once
+ * nothing of it runs, its login goes too, unless `keepLogin`, for a lane that opens its browser again.
+ */
 export async function stopLaneBrowser(
   tools: BrowserTools,
   stateDir: string,
@@ -178,6 +181,7 @@ export async function stopLaneBrowser(
   session: string,
   clock: Clock,
   control: BrowserControl | null,
+  keepLogin = false,
 ): Promise<BrowserTeardown> {
   const result: BrowserTeardown = { notes: [], problems: [] };
   if (control) {
@@ -199,7 +203,7 @@ export async function stopLaneBrowser(
     result.problems.push(`the process table could not be read, so the browser of lane ${lane} may still run`);
   else if (stopped.left.length > 0)
     result.problems.push(`the browser of lane ${lane} survived SIGKILL: ${describeProcesses(stopped.left)}`);
-  else forgetLogin(marks.paths);
+  else if (!keepLogin) forgetLogin(marks.paths);
   return result;
 }
 

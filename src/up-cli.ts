@@ -227,6 +227,7 @@ async function runDoctor(args: string[], deps: EnvDeps, stdout: (text: string) =
     folder: folder.worktree,
     platform: asked,
     installed: record?.installed,
+    park: lane?.park ?? null,
   });
   stdout(values.json ? `${JSON.stringify(result, null, 2)}\n` : renderDoctor(result));
   return result.ok ? 0 : EXIT_FAILED;

@@ -9,7 +9,7 @@ import type { Lane } from '../src/registry/types.ts';
 import { FakeProbe } from './support/fakes.ts';
 import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
 import type { World } from './support/world.ts';
-import { world } from './support/world.ts';
+import { parkNow, world } from './support/world.ts';
 
 const ANDROID = { device: { platform: 'android' } } as const;
 const KILL = (serial: string) => [`force-stop dev.mobile.maestro ${serial}`, `emu kill ${serial}`];
@@ -158,23 +158,27 @@ test('the same session claiming again keeps its emulator and port without a rest
   }
 });
 
-test('an idle emulator taken over is restarted on the new lane port, which stops the old holder driver', async () => {
+test("an idle emulator lane is never taken over; once parked, its emulator boots for the next lane on that lane's console port, and the parked lane keeps its own", async () => {
   const w = world({ emulatorPoolSize: 1 });
   try {
     const old = await w.registry().claim(android(w, w.procs.owner(), 'old'));
     await w.clock.advance(3 * HOUR_MS);
+    await assert.rejects(w.registry().claim(android(w, w.procs.owner(), 'taker')), { code: 'pool-busy' });
+    assert.ok(parkNow(w.registry(), old.lane));
     const taker = await w.registry().claim(android(w, w.procs.owner(), 'taker'));
-    assert.deepEqual(
-      taker.tookOver.map(e => e.id),
-      [old.lane.id],
-    );
     assert.equal(taker.lane.device?.id, old.lane.device?.id);
     assert.notEqual(taker.lane.device?.serial, old.lane.device?.serial);
     assert.deepEqual(w.emulators.calls.slice(-3), [
-      `boot ${taker.lane.device?.id ?? ''} on ${taker.lane.device?.serial?.slice('emulator-'.length) ?? ''}`,
       ...KILL(old.lane.device?.serial ?? ''),
+      `boot ${taker.lane.device?.id ?? ''} on ${taker.lane.device?.serial?.slice('emulator-'.length) ?? ''}`,
     ]);
     assert.equal(w.emulators.list()[0]?.serial, taker.lane.device?.serial);
+    const parked = w
+      .registry()
+      .status()
+      .lanes.find(c => c.id === old.lane.id);
+    assert.equal(parked?.device, null);
+    assert.deepEqual(parked.ports, old.lane.ports);
   } finally {
     w.close();
   }
@@ -209,16 +213,14 @@ test('simulators and emulators share one memory budget, and each kind keeps its 
   }
 });
 
-test('when memory is what is short, an idle lane of the other kind is taken over to make room', async () => {
+test('when memory is what is short, an idle lane of the other kind is never taken over, and parking it makes the room', async () => {
   const w = world({ memoryBudgetMb: 4000 });
   try {
     const sim = await w.registry().claim(w.request(w.procs.owner(), w.folder('sim')));
     await w.clock.advance(3 * HOUR_MS);
+    await assert.rejects(w.registry().claim(android(w, w.procs.owner(), 'emu')), { code: 'pool-busy' });
+    assert.ok(parkNow(w.registry(), sim.lane));
     const emu = await w.registry().claim(android(w, w.procs.owner(), 'emu'));
-    assert.deepEqual(
-      emu.tookOver.map(e => e.id),
-      [sim.lane.id],
-    );
     assert.equal(emu.lane.device?.platform, 'android');
     assert.equal(
       w

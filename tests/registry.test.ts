@@ -23,7 +23,7 @@ import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
 import type { FakeProcesses } from './support/fakes.ts';
 import { FakeProbe } from './support/fakes.ts';
 import type { World } from './support/world.ts';
-import { waitForStep, world } from './support/world.ts';
+import { parkNow, waitForStep, world } from './support/world.ts';
 
 const NO_DEVICE = { device: null } as const;
 const SHARED_BLOCKS = { metro: { first: 47600, last: 47603 }, api: { first: 47700, last: 47703 } };
@@ -377,17 +377,30 @@ test('a port with a listener is skipped, and a full block refuses naming the hol
   }
 });
 
-test('with the ports exhausted, an idle lane is taken over for its port and the taker is told whose it was', async () => {
+test('with the ports exhausted, an idle lane keeps its port at any idle age, parked or not, and the claim is refused naming it', async () => {
   const w = world({ blocks: { metro: { first: 47000, last: 47000 } } });
   try {
     const metro = [{ name: 'metro', type: 'metro' }];
     const a = await w.registry().claim(w.request(w.procs.owner(), w.folder('a'), { ...NO_DEVICE, services: metro }));
-    await w.clock.advance(2 * HOUR_MS + 60_000);
-    const b = await w.registry().claim(w.request(w.procs.owner(), w.folder('b'), { ...NO_DEVICE, services: metro }));
-    assert.equal(b.lane.ports[0]?.port, 47000);
+    for (const idle of [2 * HOUR_MS + 60_000, 7 * 24 * HOUR_MS]) {
+      await w.clock.advance(idle);
+      await assert.rejects(
+        w.registry().claim(w.request(w.procs.owner(), w.folder('b'), { ...NO_DEVICE, services: metro })),
+        (error: unknown) => {
+          assert.ok(error instanceof Refusal);
+          assert.equal(error.code, 'ports-exhausted');
+          assert.match(error.message, new RegExp(a.lane.worktree));
+          return true;
+        },
+      );
+      parkNow(w.registry(), a.lane);
+    }
     assert.deepEqual(
-      b.tookOver.map(t => [t.id, t.lastUsedAt]),
-      [[a.lane.id, a.lane.lastUsedAt]],
+      w
+        .registry()
+        .status()
+        .lanes.map(c => [c.id, c.ports.map(p => p.port), c.park?.state]),
+      [[a.lane.id, [47000], 'parked']],
     );
   } finally {
     w.close();
@@ -459,69 +472,58 @@ test('a waiter that times out is refused with the holders named and leaves the q
   }
 });
 
-test('an idle lane over 2 h is taken over only when no slot is free, and the taker sees whose it was', async () => {
+test("a live owner's idle lane is never ended by another claim at any idle age: a claim short of a simulator waits, and gets it once the lane is parked", async () => {
   const w = world({ poolSize: 1 });
   try {
     const ownerA = w.procs.owner();
     const a = await w.registry().claim(w.request(ownerA, w.folder('a')));
     const ref = { id: a.lane.id, token: a.lane.token };
 
-    await w.clock.advance(HOUR_MS);
-    await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('early'))), { code: 'pool-busy' });
+    for (const idle of [HOUR_MS, 2 * HOUR_MS + 60_000, 7 * 24 * HOUR_MS]) {
+      await w.clock.advance(idle);
+      await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('b'))), { code: 'pool-busy' });
+      assert.equal(w.registry().touch(ref, 'still here').id, a.lane.id);
+    }
 
-    await w.clock.advance(HOUR_MS + 60_000);
-    const b = await w.registry().claim(w.request(w.procs.owner(), w.folder('b')));
-    assert.equal(b.lane.device?.id, a.lane.device?.id);
-    assert.equal(b.tookOver.length, 1);
-    const taken = b.tookOver[0];
-    assert.equal(taken?.id, a.lane.id);
-    assert.equal(taken.lastUsedAt, a.lane.lastUsedAt);
-    assert.equal(taken.lastAction, 'claim');
-    assert.equal(taken.worktree, a.lane.worktree);
-
-    assert.throws(
-      () => w.registry().touch(ref, 'look'),
-      (error: unknown) => {
-        assert.ok(error instanceof Refusal);
-        assert.equal(error.code, 'lane-gone');
-        assert.match(error.message, new RegExp(b.lane.worktree));
-        assert.match(error.message, /took it over/);
-        return true;
-      },
-    );
+    const waits = waitForStep('claim:waiting');
+    const b = w.registry({ onStep: waits.onStep }).claim(w.request(w.procs.owner(), w.folder('b'), { waitMs: 60_000 }));
+    await waits.reached;
+    assert.ok(parkNow(w.registry(), a.lane));
+    await w.clock.advance(500);
+    const got = await b;
+    assert.equal(got.lane.device?.id, a.lane.device?.id);
+    assert.deepEqual(got.freed, []);
+    const parked = w.registry().touch(ref, 'look');
+    assert.deepEqual(parked.ports, a.lane.ports);
+    assert.equal(parked.device, null);
+    assert.equal(w.registry().parkOf(a.lane.id)?.state, 'parked');
+    assert.deepEqual(w.registry().pendingTeardowns(), []);
   } finally {
     w.close();
   }
 });
 
-test("a can't-tell lane idle over 2 h is taken over only under pressure, for a device or a port, and the sweep never frees it", async () => {
+test("a can't-tell lane is never freed by the sweep nor taken over, for a device or a port, at any idle age", async () => {
   const w = world({
-    poolSize: 2,
-    blocks: { metro: { first: 41100, last: 41101 }, api: { first: 41200, last: 41219 } },
+    poolSize: 1,
+    blocks: { metro: { first: 41100, last: 41100 }, api: { first: 41200, last: 41219 } },
   });
   try {
     const thread: Owner = { kind: 'codex', process: null, sessionId: null, threadId: 't-idle' };
     const unknown = await w.registry().claim(w.request(thread, w.folder('unknown')));
-    await w.clock.advance(3 * HOUR_MS);
+    await w.clock.advance(3 * 24 * HOUR_MS);
 
-    const roomy = await w.registry().claim(w.request(w.procs.owner(), w.folder('roomy')));
     const sweeper = await w.registry().claim(w.request(w.procs.owner(), w.folder('sweeper'), { device: null, services: [] }));
-    for (const out of [roomy, sweeper]) assert.deepEqual([out.freed, out.tookOver], [[], []]);
-    assert.equal(
-      w
-        .registry()
-        .status()
-        .lanes.find(c => c.id === unknown.lane.id)?.ownerState,
-      'cant-tell',
-    );
-
-    const pressed = await w.registry().claim(w.request(w.procs.owner(), w.folder('pressed'), NO_DEVICE));
-    assert.deepEqual(pressed.freed, []);
-    assert.deepEqual(
-      pressed.tookOver.map(e => [e.id, e.reason, e.owner]),
-      [[unknown.lane.id, 'taken-over', 'codex thread t-idle (no process recorded)']],
-    );
-    assert.equal(pressed.lane.ports.find(p => p.service === 'metro')?.port, unknown.lane.ports[0]?.port);
+    assert.deepEqual(sweeper.freed, []);
+    await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('device'), { services: [] })), {
+      code: 'pool-busy',
+    });
+    await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('port'), NO_DEVICE)), {
+      code: 'ports-exhausted',
+    });
+    const status = w.registry().status();
+    assert.equal(status.lanes.find(c => c.id === unknown.lane.id)?.ownerState, 'cant-tell');
+    assert.equal(status.lanes.find(c => c.id === unknown.lane.id)?.device?.id, unknown.lane.device?.id);
   } finally {
     w.close();
   }
@@ -533,7 +535,6 @@ test('an idle lane is left alone while a slot is free, and a touch keeps a lane 
     const a = await w.registry().claim(w.request(w.procs.owner(), w.folder('a')));
     await w.clock.advance(3 * HOUR_MS);
     const b = await w.registry().claim(w.request(w.procs.owner(), w.folder('b')));
-    assert.deepEqual(b.tookOver, []);
     assert.notEqual(b.lane.device?.id, a.lane.device?.id);
     w.registry().touch({ id: a.lane.id, token: a.lane.token }, 'device call');
     await w.clock.advance(HOUR_MS);
@@ -760,11 +761,11 @@ test('a claim queued behind others still proceeds at once when there are more fr
   }
 });
 
-test('a lane that fails after taking over an idle lane never leaves that lane holding a deleted simulator', async () => {
+test("a lane that fails after taking a parked lane's simulator never leaves a lane holding a deleted simulator", async () => {
   const w = world({ poolSize: 1 });
   try {
     const a = await w.registry().claim(w.request(w.procs.owner(), w.folder('a')));
-    await w.clock.advance(3 * HOUR_MS);
+    assert.ok(parkNow(w.registry(), a.lane));
     const taker = w.procs.spawn();
     const db = new DatabaseSync(databasePath(w.dir));
     db.prepare(
@@ -1514,54 +1515,33 @@ test('a claim whose device listing predates the boot of a lane it sweeps looks a
 });
 
 for (const idle of ['simulator', 'emulator'] as const) {
-  test(`a claim that takes over an idle lane's ${idle} without using it shuts that ${idle} down before it plans on its memory`, async () => {
+  test(`a parked lane's ${idle} keeps its place in the pool and its memory until it is shut down, and then makes room for the next claim`, async () => {
     const w = world({ poolSize: 2, emulatorPoolSize: 2, memoryBudgetMb: 4000 });
     try {
       const device = { platform: idle === 'simulator' ? 'ios' : 'android' } as const;
       const held = await w.registry().claim(w.request(w.procs.owner(), w.folder('idle'), { device, boot: true }));
       assert.ok(held.lane.device);
-      await w.clock.advance(w.config.idleMs + 1);
-
-      const over: string[] = [];
-      const audit = (who: string, step: Step) => {
-        if (step !== 'claim:lease-committed' && step !== 'claim:reserve-committed' && step !== 'claim:committed') return;
-        const used = busyMb(w.dir);
-        if (used > w.config.memoryBudgetMb) over.push(`${who} at ${step}: ${String(used)} MB`);
-      };
-      let openProbe: () => void = () => undefined;
-      const probe = { regated: false };
-      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
-      const taker = w
-        .registry({
-          onStep: step => {
-            audit('the taker', step);
-            if (step !== 'claim:reserve-committed' || probe.regated) return;
-            probe.regated = true;
-            w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
-          },
-        })
-        .claim(w.request(w.procs.owner(), w.folder('taker'), strict));
-      for (let i = 0; i < 200 && !probe.regated; i++) await new Promise(resolve => setImmediate(resolve));
-      assert.ok(probe.regated, 'the taker reserved a simulator to create');
-
-      await w
-        .registry({
-          ports: new FakeProbe(),
-          onStep: step => {
-            audit('a bystander', step);
-          },
-        })
-        .claim(w.request(w.procs.owner(), w.folder('bystander'), NO_DEVICE));
-      openProbe();
-      const got = await taker;
-      assert.deepEqual(over, []);
-      assert.deepEqual(
-        got.tookOver.map(t => t.id),
-        [held.lane.id],
-      );
-      assert.equal(got.lane.device?.deviceTypeName, 'iPhone 17 Pro');
       const backend = idle === 'simulator' ? w.devices : w.emulators;
+      const seen: { busy: number; free: boolean }[] = [];
+      backend.during = call => {
+        if (call !== 'shutdown') return;
+        const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+        try {
+          const row = db.prepare('SELECT claim_id, device_id FROM devices WHERE name = ?').get(held.lane.device?.name ?? '');
+          seen.push({ busy: busyMb(w.dir), free: row?.claim_id === null && row.device_id !== null });
+        } finally {
+          db.close();
+        }
+      };
+      assert.ok(parkNow(w.registry(), held.lane));
+      backend.during = null;
+      assert.deepEqual(seen, [{ busy: DEVICE_MEMORY_MB[device.platform], free: false }]);
       assert.equal(backend.all().find(d => d.id === held.lane.device?.id)?.booted, false);
+
+      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+      const got = await w.registry().claim(w.request(w.procs.owner(), w.folder('next'), strict));
+      assert.equal(got.lane.device?.deviceTypeName, 'iPhone 17 Pro');
+      assert.ok(busyMb(w.dir) <= w.config.memoryBudgetMb);
     } finally {
       w.close();
     }
@@ -1820,18 +1800,13 @@ const FALLBACK_PATHS: {
     },
   },
   {
-    path: "a claim that takes over an idle lane's simulator without using it",
+    path: "a park of an idle lane's simulator",
     config: { poolSize: 2, memoryBudgetMb: 4000 },
     run: async (w, blind) => {
       const held = await w.registry().claim(w.request(w.procs.owner(), w.folder('idle'), { boot: true }));
-      await w.clock.advance(w.config.idleMs + 1);
-      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
-      const b = await blind().claim(w.request(w.procs.owner(), w.folder('b'), strict));
-      assert.deepEqual(
-        b.tookOver.map(t => t.id),
-        [held.lane.id],
-      );
+      assert.ok(parkNow(blind(), held.lane));
       assert.equal(w.devices.all().find(d => d.id === held.lane.device?.id)?.booted, false);
+      assert.equal(poolRows(w.dir).length, 1);
     },
   },
   {

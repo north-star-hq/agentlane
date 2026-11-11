@@ -97,6 +97,28 @@ class Judge {
     }
   }
 
+  /** The caller's own lanes the command aims at, here. */
+  aimedOwn(aimed: AimedCommand): LaneStatus[] {
+    const { aim, cwd } = aimed;
+    const own = (lanes: readonly LaneStatus[]) => lanes.filter(c => this.mine(c, cwd));
+    switch (aim.kind) {
+      case 'device':
+        return own(this.held.filter(c => matches(c, aim.platform, aim.ref)));
+      case 'booted':
+        return own(this.held.filter(c => c.device?.platform === 'ios'));
+      case 'every':
+        return own(this.held.filter(c => c.device?.platform === aim.platform));
+      case 'unselected':
+        return own(this.held.filter(c => c.device?.platform === 'android'));
+      case 'browser-session':
+        return own(this.browsers.filter(c => c.browser?.session === aim.session));
+      case 'browser-port':
+        return own(this.browsers.filter(c => c.browser?.debugPort === aim.port || c.browser?.streamPort === aim.port));
+      case 'every-browser':
+        return own(this.browsers.filter(c => c.browser?.driver === aim.driver));
+    }
+  }
+
   holder(lane: LaneStatus, aim: Aim): string {
     const name = this.ctx.sessionName(lane);
     const who = `${describeOwner(lane.owner)}${name ? ` "${name}"` : ''}`;
@@ -167,6 +189,14 @@ function recovery(aimed: AimedCommand, holders: readonly LaneStatus[], judge: Ju
   }
   lines.push(`${CLI} status   (every lane with its owner)`);
   return lines;
+}
+
+/** The caller's own lanes a command the guard allows aims at: the command is a call on each of them. */
+export function aimedOwnLanes(script: string, env: NodeJS.ProcessEnv, ctx: GuardContext): LaneStatus[] {
+  const judge = new Judge(ctx);
+  const found = new Map<string, LaneStatus>();
+  for (const aimed of aimsOf(script, env, ctx.cwd)) for (const lane of judge.aimedOwn(aimed)) found.set(lane.id, lane);
+  return [...found.values()];
 }
 
 export function guard(script: string, env: NodeJS.ProcessEnv, ctx: GuardContext): Verdict {

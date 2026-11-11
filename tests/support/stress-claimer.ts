@@ -7,6 +7,7 @@ import { Refusal } from '../../src/registry/refusal.ts';
 import type { Step } from '../../src/registry/registry.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import type { Lane } from '../../src/registry/types.ts';
+import { parkNow } from './world.ts';
 import type { Platform } from '../../src/devices/backend.ts';
 import type { SlowCall } from './fakes.ts';
 import { FakeDevices } from './fakes.ts';
@@ -29,6 +30,7 @@ const COMMITS: ReadonlySet<Step> = new Set([
   'claim:reserve-committed',
   'claim:committed',
   'release:committed',
+  'park:committed',
 ]);
 
 function fail(code: number, message: string): never {
@@ -169,8 +171,11 @@ async function main(): Promise<void> {
       const ended = db.prepare('SELECT reason, last_used_at, ended_at FROM history WHERE claim_id = ?').get(held.id);
       db.close();
       const idle = ended ? Number(ended.ended_at) - Number(ended.last_used_at) : -1;
-      if (selfOwned && !(ended?.reason === 'taken-over' && idle >= plan.config.idleMs)) {
-        fail(EXIT_LIVE_LANE_FREED, `lane ${held.id} of live owner ${String(process.pid)} ended: ${JSON.stringify(ended)}`);
+      if (selfOwned) {
+        fail(
+          EXIT_LIVE_LANE_FREED,
+          `lane ${held.id} of live owner ${String(process.pid)} ended after ${String(idle)} ms: ${JSON.stringify(ended)}`,
+        );
       }
       held = null;
       return;
@@ -211,6 +216,12 @@ async function main(): Promise<void> {
         }
       } else if (op.kind === 'touch' && held) {
         held = registry.touch({ id: held.id, token: held.token }, 'stress touch');
+      } else if (op.kind === 'park' && held) {
+        const notes: string[] = [];
+        const parked = parkNow(registry, held, notes);
+        held = registry.touch({ id: held.id, token: held.token }, 'stress park');
+        if (parked && held.device) fail(1, `lane ${held.id} still holds ${held.device.id} after it was parked`);
+        fs.writeSync(1, `parked ${JSON.stringify({ id: held.id, parked, notes })}\n`);
       } else if (op.kind === 'release' && held) {
         const notes: string[] = [];
         registry.release({ id: held.id, token: held.token }, owner, notes);
