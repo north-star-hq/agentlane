@@ -1,0 +1,312 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { PassThrough } from 'node:stream';
+import { test } from 'node:test';
+import { runDriverCommand, type DriverCliDeps } from '../src/driver-cli.ts';
+import { callEngine } from '../src/driver/client.ts';
+import { createToolHandler, type ToolResult } from '../src/mcp/tools.ts';
+import { systemProcesses } from '../src/processes.ts';
+import { databasePath } from '../src/registry/paths.ts';
+import { runRegistryCommand } from '../src/registry-cli.ts';
+import { up } from '../src/up/up.ts';
+import { runUpCommand } from '../src/up-cli.ts';
+import { FakeAdb } from './devices/fake-adb.ts';
+import { tempDir } from './support/fakes.ts';
+import { driverWorld, until, type DriverWorld } from './support/driver-world.ts';
+import { failures, OPTIONS, world, type World } from './support/up-world.ts';
+
+const FIXTURE = path.join(import.meta.dirname, 'fixtures', 'signin-site');
+const AGED = 1_000_000;
+
+function homeless(root: string): Record<string, string> {
+  const at = (name: string) => {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  return {
+    HOME: at('home'),
+    XDG_STATE_HOME: at('xdg-state'),
+    XDG_DATA_HOME: at('xdg-data'),
+    XDG_CONFIG_HOME: at('xdg-config'),
+    CLAUDE_CONFIG_DIR: at('claude-config'),
+    CODEX_HOME: at('codex'),
+  };
+}
+
+function webEnv(w: World): NodeJS.ProcessEnv {
+  const env = w.deps().env;
+  return { ...env, ...homeless(w.root), AGENTLANE_STATE_DIR: w.state };
+}
+
+interface LastUse {
+  at: number;
+  action: string;
+}
+
+function lastUse(state: string, id: string): LastUse {
+  const db = new DatabaseSync(databasePath(state), { readOnly: true });
+  try {
+    const row = db.prepare('SELECT last_used_at AS at, last_action AS action FROM claims WHERE id = ?').get(id);
+    assert.ok(row, `lane ${id} has no row`);
+    return { at: Number(row.at), action: String(row.action) };
+  } finally {
+    db.close();
+  }
+}
+
+function age(state: string, id: string): void {
+  const db = new DatabaseSync(databasePath(state), { timeout: 5000 });
+  try {
+    db.prepare("UPDATE claims SET last_used_at = ?, last_action = 'aged' WHERE id = ?").run(AGED, id);
+  } finally {
+    db.close();
+  }
+}
+
+/** Takes the registry's write lock, as a claim creating a device does, until the returned function is called. */
+function holdRegistry(state: string): () => void {
+  const db = new DatabaseSync(databasePath(state), { timeout: 5000 });
+  db.exec('BEGIN IMMEDIATE');
+  return () => {
+    db.exec('COMMIT');
+    db.close();
+  };
+}
+
+async function counts(state: string, id: string, action: string, call: () => Promise<unknown>): Promise<void> {
+  age(state, id);
+  const before = Date.now();
+  await call();
+  await until(
+    () => {
+      const now = lastUse(state, id);
+      return now.at >= before && now.action === action;
+    },
+    5000,
+    `'${action}' to move lane ${id}'s last use (it is ${JSON.stringify(lastUse(state, id))})`,
+  );
+}
+
+function leavesAlone(state: string, id: string): void {
+  assert.deepEqual(lastUse(state, id), { at: AGED, action: 'aged' });
+}
+
+interface Cli {
+  deps: DriverCliDeps;
+  drive(command: string, ...args: string[]): Promise<{ code: number; out: string; err: string }>;
+}
+
+function cli(env: NodeJS.ProcessEnv, cwd: string, over: Partial<DriverCliDeps> = {}): Cli {
+  const out: string[] = [];
+  const err: string[] = [];
+  const deps: DriverCliDeps = {
+    env,
+    cwd,
+    stdout: text => out.push(text),
+    stderr: text => err.push(text),
+    stdin: new PassThrough(),
+    output: new PassThrough(),
+    processes: systemProcesses,
+    ...over,
+  };
+  return {
+    deps,
+    async drive(command, ...args) {
+      out.length = 0;
+      err.length = 0;
+      const code = await runDriverCommand(command, args, deps);
+      return { code, out: out.join(''), err: err.join('') };
+    },
+  };
+}
+
+function ok(result: ToolResult): ToolResult {
+  assert.notEqual(result.isError, true, result.content.map(c => (c.type === 'text' ? c.text : c.type)).join('\n'));
+  return result;
+}
+
+async function webLane(w: World) {
+  for (const file of ['site.ts', 'signin.ts']) fs.copyFileSync(path.join(FIXTURE, file), path.join(w.project, file));
+  w.write({
+    web: { service: 'site' },
+    services: { site: { type: 'web', start: 'exec node site.ts', ready: { kind: 'http', path: '/health' }, timeoutSeconds: 10 } },
+    hooks: { signin: 'node signin.ts' },
+  });
+  const result = await up(w.deps({ env: webEnv(w) }), OPTIONS);
+  assert.equal(result.doctor.ok, true, failures(result));
+  return result.lane;
+}
+
+async function withDevice(platform: 'ios' | 'android', body: (w: DriverWorld, c: Cli) => Promise<void>): Promise<void> {
+  const home = tempDir('last-used-home');
+  const w = await driverWorld({ platform, env: homeless(home) });
+  try {
+    assert.equal((await callEngine(w.target(), { op: 'look', args: {} })).ok, true, 'the engine did not start');
+    await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's first touch");
+    const env = { ...w.env, AGENTLANE_STATE_DIR: w.stateDir, AGENTLANE_OWNER_PID: String(w.owner.pid) };
+    const adb = new FakeAdb(w.lane.device?.serial ?? '');
+    await body(w, cli(env, w.worktree, { adb: () => adb }));
+  } finally {
+    await w.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+test('every call on a browser lane moves its last use: the CLI, the MCP tools, exec, doctor, touch and up', async t => {
+  const w = world(t);
+  const lane = await webLane(w);
+  const c = cli(webEnv(w), w.project, { browser: w.browser });
+  const moves = (action: string, call: () => Promise<unknown>) => counts(w.state, lane.id, action, call);
+  const exits0 = async (run: Promise<{ code: number; err: string }>) => {
+    const { code, err } = await run;
+    assert.equal(code, 0, err);
+  };
+
+  await moves('look: browser', () => exits0(c.drive('look')));
+  await moves('screenshot: browser', () => exits0(c.drive('screenshot')));
+  await moves('evidence screenshot', () => exits0(c.drive('evidence', 'screenshot')));
+  await moves('evidence logs', () => exits0(c.drive('evidence', 'logs')));
+
+  const mcp = createToolHandler({ env: c.deps.env, cwd: w.project, processes: systemProcesses, browser: w.browser });
+  await moves('look: browser', async () => ok(await mcp('look', {})));
+  await moves('screenshot: browser', async () => ok(await mcp('screenshot', {})));
+  await moves('look: browser', async () => ok(await mcp('look', { browser: true })));
+
+  const stdout: string[] = [];
+  await moves('exec: true', async () => {
+    assert.equal(await runUpCommand('exec', ['--', 'true'], w.deps({ env: webEnv(w) }), text => stdout.push(text)), 0);
+  });
+  await moves('doctor', async () => {
+    assert.equal(await runUpCommand('doctor', [], w.deps({ env: webEnv(w) }), text => stdout.push(text)), 0, stdout.join(''));
+  });
+  await moves('ran by hand', async () => {
+    assert.equal(await runRegistryCommand('touch', ['--action', 'ran by hand'], registryDeps(w)), 0);
+  });
+  age(w.state, lane.id);
+  const again = await up(w.deps({ env: webEnv(w) }), OPTIONS);
+  assert.equal(again.lane.id, lane.id);
+  const after = lastUse(w.state, lane.id);
+  assert.ok(after.at > AGED && after.action.startsWith('up'), JSON.stringify(after));
+});
+
+function registryDeps(w: World) {
+  const deps = w.deps();
+  return {
+    env: webEnv(w),
+    cwd: deps.cwd,
+    stdout: () => undefined,
+    stderr: () => undefined,
+    processes: deps.processes,
+    ports: deps.ports,
+    devices: deps.devices,
+  };
+}
+
+test('status, lanes --json and evidence list leave the last use alone', async t => {
+  const w = world(t);
+  const lane = await webLane(w);
+  const c = cli(webEnv(w), w.project, { browser: w.browser });
+  age(w.state, lane.id);
+  assert.equal(await runRegistryCommand('status', [], registryDeps(w)), 0);
+  assert.equal(await runRegistryCommand('lanes', ['--json'], registryDeps(w)), 0);
+  assert.equal(await runRegistryCommand('lanes', [], registryDeps(w)), 2);
+  assert.equal((await c.drive('evidence', 'list')).code, 0);
+  assert.equal((await c.drive('evidence')).code, 0);
+  leavesAlone(w.state, lane.id);
+});
+
+test('every call on a simulator lane moves its last use: look, run, screenshot, record, evidence and the driver, from the CLI and MCP', () =>
+  withDevice('ios', async (w, c) => {
+    const moves = (action: string, call: () => Promise<unknown>) => counts(w.stateDir, w.lane.id, action, call);
+    const exits0 = async (run: Promise<{ code: number; err: string }>) => {
+      const { code, err } = await run;
+      assert.equal(code, 0, err);
+    };
+
+    await moves('look', () => exits0(c.drive('look')));
+    await moves('screenshot', () => exits0(c.drive('screenshot', '--out', path.join(w.root, 'shot.jpg'))));
+    await moves('run', () => exits0(c.drive('run', '--yaml', '- assertVisible: General\n', '--app-id', 'com.apple.Preferences')));
+    await moves('record', () => exits0(c.drive('record', 'show')));
+    await moves('look', () => exits0(c.drive('driver', 'start')));
+
+    const mcp = createToolHandler({ env: c.deps.env, cwd: w.worktree, processes: systemProcesses });
+    await moves('look', async () => ok(await mcp('look', {})));
+    await moves('screenshot', async () => ok(await mcp('screenshot', {})));
+    await moves('run', async () => ok(await mcp('run', { yaml: '- assertVisible: General\n', appId: 'com.apple.Preferences' })));
+
+    age(w.stateDir, w.lane.id);
+    assert.equal((await c.drive('driver', 'status')).code, 0);
+    await new Promise(resolve => setTimeout(resolve, 600));
+    leavesAlone(w.stateDir, w.lane.id);
+
+    age(w.stateDir, w.lane.id);
+    await exits0(c.drive('evidence', 'screenshot'));
+    await until(() => lastUse(w.stateDir, w.lane.id).at > AGED, 5000, 'evidence screenshot to move the last use');
+
+    await moves('driver stop', () => exits0(c.drive('driver', 'stop')));
+  }));
+
+test("a device control on an emulator lane moves the lane's last use", () =>
+  withDevice('android', async (w, c) => {
+    await counts(w.stateDir, w.lane.id, 'device appearance', async () => {
+      const { code, err } = await c.drive('device', 'appearance', 'dark');
+      assert.equal(code, 0, err);
+    });
+  }));
+
+test('a busy registry neither fails nor stalls a browser lane call; MCP lands the touch once the registry frees, the CLI on its next call', async t => {
+  const w = world(t);
+  const lane = await webLane(w);
+  const c = cli(webEnv(w), w.project, { browser: w.browser });
+  const mcp = createToolHandler({
+    env: c.deps.env,
+    cwd: w.project,
+    processes: systemProcesses,
+    browser: w.browser,
+    touchRetryMs: 50,
+  });
+
+  age(w.state, lane.id);
+  let free = holdRegistry(w.state);
+  let started = Date.now();
+  const looked = await c.drive('look');
+  const tookMs = Date.now() - started;
+  assert.equal(looked.code, 0, looked.err);
+  assert.match(looked.out, /Signed in as/);
+  assert.ok(tookMs < 5000, `the look waited ${String(tookMs)} ms on the registry`);
+  free();
+  leavesAlone(w.state, lane.id);
+  await counts(w.state, lane.id, 'look: browser', async () => {
+    assert.equal((await c.drive('look')).code, 0);
+  });
+
+  age(w.state, lane.id);
+  free = holdRegistry(w.state);
+  started = Date.now();
+  ok(await mcp('look', {}));
+  assert.ok(Date.now() - started < 5000);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  leavesAlone(w.state, lane.id);
+  free();
+  await until(() => lastUse(w.state, lane.id).action === 'look: browser', 5000, 'the retried MCP touch');
+});
+
+test('a busy registry neither fails nor stalls a device lane call, and the engine lands the touch once it frees', () =>
+  withDevice('ios', async (w, c) => {
+    age(w.stateDir, w.lane.id);
+    const free = holdRegistry(w.stateDir);
+    try {
+      const started = Date.now();
+      const looked = await c.drive('look');
+      assert.equal(looked.code, 0, looked.err);
+      assert.ok(Date.now() - started < 5000);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      leavesAlone(w.stateDir, w.lane.id);
+    } finally {
+      free();
+    }
+    await until(() => lastUse(w.stateDir, w.lane.id).action === 'look', 5000, "the engine's retried touch");
+  }));

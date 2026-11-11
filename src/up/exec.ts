@@ -12,8 +12,9 @@ import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/co
 import { asMobile, findProjectConfig, loadLaneConfig } from '../project/config.ts';
 import { describeOwner, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
-import { NotClaimed, UsageError } from '../registry/refusal.ts';
+import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
+import { touchLane } from '../registry/touch.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import type { Lane } from '../registry/types.ts';
 import { laneDir, readUpRecord } from './lane-files.ts';
@@ -74,10 +75,12 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
     if (!lane) {
       throw new NotClaimed(`${describeOwner(owner)} holds no lane in ${folder.worktree}`, `${CLI} up   (or ${CLI} claim)`);
     }
-    registry.touch({ id: lane.id, token: lane.token }, `exec: ${command}`);
   } finally {
     registry.close();
   }
+  const site = { dir: state, processes: deps.processes, clock: deps.clock };
+  const ref = { id: lane.id, token: lane.token };
+  touchLane(site, ref, `exec: ${command}`);
   const dir = laneDir(state, lane.id);
   const record = readUpRecord(dir);
   const { config, problem } = lenientConfig(
@@ -105,6 +108,11 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
   if (browser) env = { ...env, ...browser.vars };
 
   const code = await run(deps, command, args, env);
+  try {
+    touchLane(site, ref, `exec: ${command}`);
+  } catch (error) {
+    if (!(error instanceof Refusal)) throw error;
+  }
   if (code !== 0 && browser && (await browser.control.isOpen().catch(() => false))) {
     const kept = await keepFailureEvidence(browser.control, browser.setting.paths.evidence, [command, ...args].join(' '));
     deps.log(

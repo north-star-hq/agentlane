@@ -11,6 +11,7 @@ import { isProven, judgeProcess, worktreeState, type Owner } from '../registry/o
 import { tcpProbe } from '../registry/ports.ts';
 import { Refusal } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
+import { TOUCH_WAIT_MS } from '../registry/touch.ts';
 import { messageOf } from './errors.ts';
 import { IdleWatch, writeIdleStop, describeIdle } from './idle.ts';
 import { sipsImages, type ImageTools } from './images.ts';
@@ -112,9 +113,9 @@ function onlyReads(op: EngineRequest['op']): boolean {
   return op === 'ping' || op === 'status' || op === 'look' || op === 'screenshot';
 }
 
-const ACTIONS: Record<Exclude<EngineRequest['op'], 'stop'>, string> = {
-  ping: 'driver ping',
-  status: 'driver status',
+type ToolOp = Extract<EngineRequest['op'], 'look' | 'screenshot' | 'run' | 'record'>;
+
+const ACTIONS: Record<ToolOp, string> = {
   look: 'look',
   screenshot: 'screenshot',
   run: 'run',
@@ -155,7 +156,7 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
   const device = config.serial ?? config.deviceId;
   log(`starting for lane ${config.laneId} on ${device} in ${config.worktree}`);
 
-  const registry = Registry.open({ dir: config.stateDir, processes, ports: tcpProbe, devices: {}, lockWaitMs: 250 });
+  const registry = Registry.open({ dir: config.stateDir, processes, ports: tcpProbe, devices: {}, lockWaitMs: TOUCH_WAIT_MS });
   const held = (): boolean => {
     const lane = registry.find(config.owner, config.worktree);
     return (
@@ -349,18 +350,18 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
     sampleTimer.unref();
   };
 
-  const isToolCall = (op: EngineRequest['op']) => op === 'look' || op === 'run' || op === 'screenshot' || op === 'record';
+  const isToolCall = (op: EngineRequest['op']): op is ToolOp => Object.hasOwn(ACTIONS, op);
 
   const serialized = (request: Exclude<EngineRequest, { op: 'stop' }>): Promise<EngineResponse> => {
     clearTimeout(sampleTimer);
-    const tool = isToolCall(request.op);
+    const op = request.op;
+    const tool = isToolCall(op);
     if (tool) idle.begin();
     const job = tail.then(() => (stopping === undefined ? perform(request) : refusal(request, stopping)));
     tail = job.catch(() => undefined);
     return job
       .then(
         (response): EngineResponse => {
-          touchSoon(ACTIONS[request.op]);
           if (request.op === 'look' || request.op === 'run' || request.op === 'screenshot') sampleWhenIdle();
           return response;
         },
@@ -380,6 +381,7 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
       )
       .finally(() => {
         if (tool) {
+          touchSoon(ACTIONS[op]);
           idle.end();
           scheduleIdleCheck();
         }
