@@ -23,6 +23,7 @@ const SEEDS = Number(process.env.STRESS_SEEDS ?? 10);
 const SLOW_SEEDS = Number(process.env.STRESS_SLOW_SEEDS ?? 4);
 const SLOW_MS = { create: 150, shutdown: 100, delete: 80 } as const;
 const LEASE_STEPS: readonly Step[] = ['claim:lease-committed', 'claim:stopped-device'];
+const SLOW_LEASE_STEPS: readonly Step[] = [...LEASE_STEPS, 'release:committed', 'release:stopped-device'];
 const DEVICE_WORK_STEPS: readonly Step[] = [
   'claim:reserve-committed',
   'claim:retired-device',
@@ -496,26 +497,33 @@ test(`stress with a slow device backend (create ${String(SLOW_MS.create)} ms, sh
   let slowCalls = 0;
   let overlaps = 0;
   const seeds: number[] = [];
-  for (let n = 101; n < 101 + SLOW_SEEDS; n++) {
+  const seed = async (n: number, idleMs: number, lead: Step | null) => {
     seeds.push(n);
-    const idleMs = n % 2 === 0 ? 300 : 3_600_000;
     const targets = [...DEVICE_WORK_STEPS].sort(
       (a, b) => (crashes.get(a) ?? 0) - (crashes.get(b) ?? 0) || STEPS.indexOf(a) - STEPS.indexOf(b),
     );
-    const result = await runSeed(n, idleMs, targets, null, SLOW_MS);
+    const result = await runSeed(n, idleMs, targets, lead, SLOW_MS);
     for (const step of result.crashes) crashes.set(step, (crashes.get(step) ?? 0) + 1);
     claims += result.claims;
     refusals += result.refusals;
     ended += result.ended;
     slowCalls += result.slowCalls;
     overlaps += result.overlaps;
-  }
+  };
+  for (let n = 101; n < 101 + SLOW_SEEDS; n++) await seed(n, n % 2 === 0 ? 300 : 3_600_000, null);
+  const leads = SLOW_LEASE_STEPS.filter(step => (crashes.get(step) ?? 0) === 0);
+  for (const [k, lead] of leads.entries()) await seed(101 + SLOW_SEEDS + k, 300, lead);
   console.log(
-    `slow stress seeds ${seeds.join(',')}: ${String(claims)} claims granted, ${String(refusals)} claimers refused at least once, ${String(ended)} lanes ended; ${String(slowCalls)} slow device calls finished, ${String(overlaps)} commits by other processes landed during one; ${String(Date.now() - started)} ms`,
+    `slow stress seeds ${seeds.join(',')} (each past ${String(100 + SLOW_SEEDS)} first runs one claimer alone on a full pool, crashing at a lease step the others missed: ${leads.join(' ') || 'none'}): ${String(claims)} claims granted, ${String(refusals)} claimers refused at least once, ${String(ended)} lanes ended; ${String(slowCalls)} slow device calls finished, ${String(overlaps)} commits by other processes landed during one; ${String(Date.now() - started)} ms`,
   );
   console.log(
     `crashes injected per device-work step: ${DEVICE_WORK_STEPS.map(s => `${s}=${String(crashes.get(s) ?? 0)}`).join(' ')}`,
   );
   assert.ok(slowCalls > 0, 'devices were created and stopped');
   assert.ok(overlaps > 0, 'other processes committed while a device call ran');
+  assert.deepEqual(
+    SLOW_LEASE_STEPS.filter(step => (crashes.get(step) ?? 0) === 0),
+    [],
+    'every lease step had an injected crash with the slow backend',
+  );
 });

@@ -7,6 +7,7 @@ import { Refusal } from '../../src/registry/refusal.ts';
 import type { Step } from '../../src/registry/registry.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import type { Lane } from '../../src/registry/types.ts';
+import type { Platform } from '../../src/devices/backend.ts';
 import type { SlowCall } from './fakes.ts';
 import { FakeDevices } from './fakes.ts';
 import type { ClaimerPlan } from './stress-plan.ts';
@@ -125,27 +126,38 @@ async function main(): Promise<void> {
   let held: Lane | null = null;
   const selfOwned = plan.ownerPid === null && plan.threadOwner === null;
   const verifyBudget = () => {
-    const pool = registry.status().pool;
-    const leased = readRegistry(
-      plan.stateDir,
-      db =>
-        new Set(
-          db
-            .prepare('SELECT reservation FROM device_leases')
-            .all()
-            .map(r => String(r.reservation)),
-        ),
-    );
+    const { rows, deleting, context } = readRegistry(plan.stateDir, db => {
+      db.exec('BEGIN');
+      try {
+        return {
+          rows: db.prepare('SELECT name, platform, device_id, claim_id, creator_pid FROM devices').all(),
+          context: {
+            leases: db.prepare('SELECT reservation, work, holder_pid FROM device_leases').all(),
+            ended: db.prepare('SELECT claim_id, device, reason, by_label FROM history ORDER BY seq DESC LIMIT 6').all(),
+            me: process.pid,
+          },
+          deleting: new Set(
+            db
+              .prepare("SELECT reservation FROM device_leases WHERE work = 'delete'")
+              .all()
+              .map(r => String(r.reservation)),
+          ),
+        };
+      } finally {
+        db.exec('COMMIT');
+      }
+    });
     let used = 0;
-    for (const d of pool) {
-      if (d.laneId !== null || (d.state === 'creating' && !leased.has(d.name))) used += DEVICE_MEMORY_MB[d.platform];
+    for (const row of rows) {
+      const busy = row.claim_id !== null || (row.device_id === null && !deleting.has(String(row.name)));
+      if (busy) used += DEVICE_MEMORY_MB[row.platform as Platform];
     }
     if (used > plan.config.memoryBudgetMb)
-      fail(EXIT_OVER_BUDGET, `claimed devices use ${String(used)} MB: ${JSON.stringify(pool)}`);
+      fail(EXIT_OVER_BUDGET, `devices in use take ${String(used)} MB: ${JSON.stringify({ rows, ...context })}`);
     for (const platform of ['ios', 'android'] as const) {
-      const made = pool.filter(d => d.platform === platform && d.state !== 'creating');
+      const made = rows.filter(r => r.platform === platform && r.device_id !== null);
       if (made.length > poolCap(plan.config, platform)) {
-        fail(EXIT_OVER_BUDGET, `${String(made.length)} ${platform} pool devices: ${JSON.stringify(pool)}`);
+        fail(EXIT_OVER_BUDGET, `${String(made.length)} ${platform} pool devices: ${JSON.stringify(rows)}`);
       }
     }
   };

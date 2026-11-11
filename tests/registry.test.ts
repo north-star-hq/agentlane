@@ -1,17 +1,24 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { Platform } from '../src/devices/backend.ts';
 import { DeviceBackendError } from '../src/devices/backend.ts';
-import { DEFAULT_CONFIG, HOUR_MS } from '../src/registry/config.ts';
+import { identityOf, systemProcesses } from '../src/processes.ts';
+import { DEFAULT_CONFIG, DEVICE_MEMORY_MB, HOUR_MS } from '../src/registry/config.ts';
+import { allLeases, endLease, leaseDevice } from '../src/registry/leases.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { databasePath } from '../src/registry/paths.ts';
 import { Refusal } from '../src/registry/refusal.ts';
+import type { Registry, Step } from '../src/registry/registry.ts';
+import { Registry as RegistryClass } from '../src/registry/registry.ts';
 import type { Lane, LaneRequest } from '../src/registry/types.ts';
 import type { SharedRegistry } from './support/stress-plan.ts';
 import { sharedRegistry, startClaimer } from './support/stress-plan.ts';
+import { FakeProbe } from './support/fakes.ts';
+import type { World } from './support/world.ts';
 import { waitForStep, world } from './support/world.ts';
 
 const NO_DEVICE = { device: null } as const;
@@ -830,11 +837,20 @@ test('a release whose simulator is slow to shut down holds neither the registry 
         [],
         "0.4.1's free-device rows do not include it",
       );
-      const reservations = db.prepare('SELECT name, creator_pid FROM devices WHERE device_id IS NULL').all();
+      const reservations = db.prepare('SELECT name, creator_pid, creator_start FROM devices WHERE device_id IS NULL').all();
+      const launchd = identityOf(systemProcesses, 1);
+      assert.ok(launchd);
       assert.deepEqual(
-        reservations.map(r => r.creator_pid),
+        reservations.map(r => [r.creator_pid, r.creator_start]),
+        [[launchd.pid, launchd.start]],
+        '0.4.1 reads it as a device being created by pid 1, which it never finds dead while the Mac is up, so it counts against the pool and the memory budget',
+      );
+      assert.deepEqual(
+        db
+          .prepare('SELECT holder_pid FROM device_leases')
+          .all()
+          .map(r => r.holder_pid),
         [releaser.pid],
-        '0.4.1 reads it as a live process creating a device, so it counts against the pool and the memory budget',
       );
       const standIn = String(reservations[0]?.name);
       assert.equal(
@@ -928,7 +944,7 @@ test('a process killed while creating a simulator leaves its slot to the next cl
   }
 });
 
-test('a process killed while shutting down a released simulator leaves it to the next release or claim, which put it back in the pool and shut it down', async () => {
+test('a process killed while shutting down a released simulator leaves it to the next release or claim, which finishes the shutdown and puts it back in the pool', async () => {
   for (const next of ['release', 'claim'] as const) {
     const s = sharedRegistry({ ...DEFAULT_CONFIG, poolSize: 1, blocks: SHARED_BLOCKS });
     try {
@@ -969,20 +985,20 @@ test('a process killed while shutting down a released simulator leaves it to the
             .registry()
             .status()
             .pool.map(d => [d.id, d.laneId, d.state]),
-          [[stopping, null, 'booted']],
-          'the release put it back, still booted since its shutdown never finished',
+          [[stopping, null, 'shutdown']],
+          'the release finished the shutdown and put it back',
         );
         assert.equal(leaseRows(s.stateDir), 0);
       }
       const taker = await s.registry().claim(laneRequest(s, 'taker', { platform: 'ios' }));
       notes.push(...taker.notes);
       assert.ok(
-        notes.some(n => n.startsWith('returned pool simulator') && n.endsWith('stopped before it finished')),
+        notes.some(n => n.startsWith('took over shutting down pool simulator') && n.endsWith('stopped before it finished')),
         notes.join('\n'),
       );
       assert.ok(
-        taker.notes.some(n => n.startsWith('shut down unclaimed pool simulator')),
-        taker.notes.join('\n'),
+        notes.some(n => n.startsWith('shut down unclaimed pool simulator')),
+        notes.join('\n'),
       );
       assert.equal(taker.lane.device?.id, stopping);
       assert.equal(s.sims.all().find(d => d.id === stopping)?.booted, false);
@@ -1023,44 +1039,458 @@ test('a shutdown that fails still ends the lane and puts the simulator back in t
   }
 });
 
-test("a dead holder's simulator comes back from its lease even after a 0.4.1 process dropped the stand-in reservation", async () => {
+const FORMER_041_SRC = process.env.AGENTLANE_041_SRC;
+
+function cutShort(at: Step) {
+  return (step: Step) => {
+    if (step === at) throw new Error(`stopped at ${at}`);
+  };
+}
+
+async function releaseCutShort(w: World): Promise<{ id: string; name: string }> {
+  const owner = w.procs.owner();
+  const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+  const device = a.lane.device;
+  assert.ok(device);
+  const holder = w.procs.spawn();
+  assert.throws(
+    () => w.registry({ self: holder, onStep: cutShort('release:committed') }).release(refOf(a.lane), owner),
+    /stopped at release:committed/,
+  );
+  w.procs.kill(holder.pid);
+  assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, true);
+  return device;
+}
+
+function poolRows(dir: string): { name: string; id: string | null }[] {
+  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  try {
+    return db
+      .prepare('SELECT name, device_id FROM devices ORDER BY name')
+      .all()
+      .map(r => ({ name: String(r.name), id: r.device_id === null ? null : String(r.device_id) }));
+  } finally {
+    db.close();
+  }
+}
+
+function claimAs041(w: World): 'room' | 'pool-busy' {
+  const db = new DatabaseSync(databasePath(w.dir));
+  try {
+    const snapshot = db.prepare('SELECT name, creator_pid FROM devices WHERE device_id IS NULL').all();
+    const table = w.procs.startTimes(snapshot.map(r => Number(r.creator_pid)));
+    db.exec('BEGIN IMMEDIATE');
+    const listed = w.devices.list();
+    for (const row of db.prepare('SELECT * FROM devices WHERE device_id IS NULL').all()) {
+      if (!snapshot.some(r => r.name === row.name) || table === undefined) continue;
+      if (table.get(Number(row.creator_pid)) === row.creator_start) continue;
+      const named = listed.filter(d => d.name === row.name);
+      const only = named.length === 1 ? named[0] : undefined;
+      if (only && !db.prepare('SELECT 1 FROM devices WHERE device_id = ?').get(only.id)) {
+        db.prepare('UPDATE devices SET device_id = ?, creator_pid = NULL, creator_start = NULL WHERE name = ?').run(
+          only.id,
+          String(row.name),
+        );
+      } else {
+        db.prepare('DELETE FROM devices WHERE name = ?').run(String(row.name));
+      }
+    }
+    const pool = db.prepare("SELECT * FROM devices WHERE platform = 'ios'").all();
+    const busy = pool.filter(r => r.claim_id !== null || r.device_id === null).length;
+    db.exec('COMMIT');
+    const fits = (busy + 1) * DEVICE_MEMORY_MB.ios <= w.config.memoryBudgetMb;
+    return pool.length < w.config.poolSize && fits ? 'room' : 'pool-busy';
+  } finally {
+    db.close();
+  }
+}
+
+test("beside 0.4.1, a released simulator whose holder died mid-shutdown keeps its place: 0.4.1's own drop rule leaves the stand-in alone, no second simulator is made, and this version takes the first back", async () => {
+  const w = world({ poolSize: 1, memoryBudgetMb: 4000 });
+  try {
+    const device = await releaseCutShort(w);
+    assert.equal(claimAs041(w), 'pool-busy', "0.4.1 can't prove the stand-in's creator dead, so it counts it");
+    assert.equal(poolRows(w.dir).length, 1);
+    assert.equal(w.devices.all().length, 1);
+
+    const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c'), { boot: true }));
+    assert.equal(c.lane.device?.id, device.id);
+    assert.ok(
+      c.notes.some(n => n.startsWith(`took over shutting down pool simulator ${device.name}`)),
+      c.notes.join('\n'),
+    );
+    assert.deepEqual(
+      w.devices.all().map(d => [d.id, d.booted]),
+      [[device.id, true]],
+    );
+    assert.deepEqual(poolRows(w.dir), [{ name: device.name, id: device.id }]);
+    assert.equal(leaseRows(w.dir), 0);
+  } finally {
+    w.close();
+  }
+});
+
+test('after a reboot lets 0.4.1 drop a stand-in and make another simulator, this version deletes the leased one rather than put the pool past its size', async () => {
+  const w = world({ poolSize: 1, memoryBudgetMb: 4000 });
+  try {
+    const device = await releaseCutShort(w);
+    w.procs.recycle(1);
+    w.devices.setBooted(device.id, false);
+    assert.equal(claimAs041(w), 'room', 'pid 1 restarted, so 0.4.1 judges the stand-in dead and drops it');
+    assert.deepEqual(poolRows(w.dir), []);
+    const spec = w.devices.resolveSpec({});
+    const replacement = w.devices.addByHand('agentlane-pool-0a0b0c', false, spec);
+    const db = new DatabaseSync(databasePath(w.dir));
+    try {
+      db.prepare(
+        `INSERT INTO devices (name, platform, device_id, device_type, device_type_name, runtime, runtime_name, created_at)
+         VALUES ('agentlane-pool-0a0b0c', 'ios', ?, ?, ?, ?, ?, ?)`,
+      ).run(replacement, spec.deviceType, spec.deviceTypeName, spec.runtime, spec.runtimeName, w.clock.now());
+    } finally {
+      db.close();
+    }
+
+    const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c')));
+    assert.ok(
+      c.notes.includes(`deleted pool simulator ${device.name}: the pool holds its poolSize of 1 without it`),
+      c.notes.join('\n'),
+    );
+    assert.equal(c.lane.device?.id, replacement);
+    assert.deepEqual(
+      w.devices.all().map(d => d.id),
+      [replacement],
+    );
+    assert.deepEqual(poolRows(w.dir), [{ name: 'agentlane-pool-0a0b0c', id: replacement }]);
+    assert.equal(leaseRows(w.dir), 0);
+  } finally {
+    w.close();
+  }
+});
+
+test(
+  "0.4.1's own registry code, beside a lease whose holder died mid-shutdown, makes no second simulator, and this version takes the first back",
+  { skip: !FORMER_041_SRC && "set AGENTLANE_041_SRC to 0.4.1's src folder, such as one from git archive 6777fca src" },
+  async () => {
+    const source = path.join(FORMER_041_SRC ?? '', 'registry', 'registry.ts');
+    const { Registry: Registry041 } = (await import(pathToFileURL(source).href)) as { Registry: typeof Registry };
+    const w = world({ poolSize: 1, memoryBudgetMb: 4000 });
+    try {
+      const device = await releaseCutShort(w);
+      const former = Registry041.open({
+        dir: w.dir,
+        processes: w.procs,
+        ports: w.probe,
+        devices: { ios: w.devices, android: w.emulators },
+        config: w.config,
+        clock: w.clock,
+        pollMs: 500,
+        self: w.procs.spawn(),
+      });
+      try {
+        await assert.rejects(former.claim(w.request(w.procs.owner(), w.folder('b'), { boot: true })), { code: 'pool-busy' });
+      } finally {
+        former.close();
+      }
+      assert.deepEqual(
+        w.devices.all().map(d => d.id),
+        [device.id],
+        '0.4.1 made no second simulator',
+      );
+      assert.equal(poolRows(w.dir).length, 1);
+
+      const c = await w.registry().claim(w.request(w.procs.owner(), w.folder('c'), { boot: true }));
+      assert.equal(c.lane.device?.id, device.id);
+      assert.equal(w.devices.all().filter(d => d.booted).length, 1);
+      assert.deepEqual(poolRows(w.dir), [{ name: device.name, id: device.id }]);
+      assert.equal(leaseRows(w.dir), 0);
+    } finally {
+      w.close();
+    }
+  },
+);
+
+test('a stand-in name reused after an older snapshot is judged by the holder that snapshot saw, so a live holder keeps its simulator', async () => {
   const w = world({ poolSize: 1 });
   try {
     const owner = w.procs.owner();
     const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
     const device = a.lane.device;
     assert.ok(device);
-    const holder = w.procs.spawn();
-    const killedAfterLease = (step: string) => {
-      if (step === 'release:committed') throw new Error('killed once the lease was committed');
-    };
-    assert.throws(() => w.registry({ self: holder, onStep: killedAfterLease }).release(refOf(a.lane), owner), /killed once/);
-    w.procs.kill(holder.pid);
+    const first = w.procs.spawn();
+    assert.throws(
+      () => w.registry({ self: first, onStep: cutShort('release:committed') }).release(refOf(a.lane), owner),
+      /stopped/,
+    );
 
+    let openProbe: () => void = () => undefined;
+    w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+    const late = w.registry().claim(w.request(w.procs.owner(), w.folder('late')));
+
+    const second = w.procs.spawn();
     const db = new DatabaseSync(databasePath(w.dir));
+    let reservation = '';
     try {
-      const standIn = String(db.prepare('SELECT name FROM devices WHERE device_id IS NULL').get()?.name);
-      assert.equal(
-        w.devices.list().filter(d => d.name === standIn).length,
-        0,
-        '0.4.1 finds no device to adopt for the dead creator',
-      );
-      db.prepare('DELETE FROM devices WHERE name = ?').run(standIn);
-      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM devices').get()?.n, 0);
+      const [lease] = allLeases(db);
+      assert.ok(lease);
+      reservation = lease.reservation;
+      assert.equal(endLease(db, lease, 'present', 1), 'restored');
+      const start = w.procs.startTimes([1])?.get(1);
+      assert.ok(start);
+      const again = leaseDevice(db, device.name, {
+        reservation,
+        work: 'shutdown',
+        holder: second,
+        keeper: { pid: 1, start },
+        consolePort: null,
+        now: w.clock.now(),
+      });
+      assert.equal(again?.reservation, reservation);
     } finally {
       db.close();
     }
 
-    const b = await w.registry().claim(w.request(w.procs.owner(), w.folder('b')));
-    assert.equal(b.lane.device?.id, device.id);
-    assert.ok(
-      b.notes.some(n => n.startsWith(`returned pool simulator ${device.name} to the pool`)),
-      b.notes.join('\n'),
-    );
-    assert.ok(b.notes.includes(`shut down unclaimed pool simulator ${device.name}`), b.notes.join('\n'));
-    assert.equal(w.devices.all().length, 1);
-    assert.equal(leaseRows(w.dir), 0);
+    openProbe();
+    await assert.rejects(late, { code: 'pool-busy' });
+    const held = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+    try {
+      assert.deepEqual(
+        held
+          .prepare('SELECT reservation, holder_pid FROM device_leases')
+          .all()
+          .map(r => [r.reservation, r.holder_pid]),
+        [[reservation, second.pid]],
+      );
+    } finally {
+      held.close();
+    }
+    assert.deepEqual(poolRows(w.dir), [{ name: reservation, id: null }], 'the simulator was not put back');
+    assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, true, 'nobody else shut it down');
   } finally {
     w.close();
   }
 });
+
+test('a live process whose settlement misses the lock twice lands it at its next claim: no second simulator under one name, and its slot frees up', async () => {
+  const w = world({ poolSize: 1 });
+  let blocker: DatabaseSync | null = null;
+  const blockAt = (at: Step) => (step: Step) => {
+    if (step !== at || blocker) return;
+    blocker = new DatabaseSync(databasePath(w.dir));
+    blocker.exec('BEGIN IMMEDIATE');
+  };
+  const unblock = () => {
+    blocker?.exec('ROLLBACK');
+    blocker?.close();
+    blocker = null;
+  };
+  try {
+    const me = w.procs.spawn();
+    const owner = w.procs.owner();
+    await assert.rejects(
+      w.registry({ self: me, lockWaitMs: 50, onStep: blockAt('claim:created-device') }).claim(w.request(owner, w.folder('a'))),
+      { code: 'registry-busy' },
+    );
+    unblock();
+    const [made] = w.devices.all();
+    assert.ok(made);
+    assert.deepEqual(poolRows(w.dir), [{ name: made.name, id: null }], 'its reservation is still held by this live process');
+
+    const again = await w.registry({ self: me }).claim(w.request(owner, w.folder('a')));
+    assert.equal(again.lane.device?.id, made.id);
+    assert.deepEqual(
+      w.devices.all().map(d => [d.id, d.name]),
+      [[made.id, made.name]],
+      'no second simulator under its name',
+    );
+
+    const notes: string[] = [];
+    w.registry({ self: me, lockWaitMs: 50, onStep: blockAt('release:stopped-device') }).release(refOf(again.lane), owner, notes);
+    unblock();
+    assert.ok(
+      notes.some(n => n.startsWith(`could not return ${made.name} to the pool yet`)),
+      notes.join('\n'),
+    );
+    await assert.rejects(w.registry().claim(w.request(w.procs.owner(), w.folder('other'))), { code: 'pool-busy' });
+
+    w.devices.failList = true;
+    await w.registry({ self: me }).claim(w.request(owner, w.folder('b'), { device: null }));
+    w.devices.failList = false;
+    assert.deepEqual(poolRows(w.dir), [{ name: made.name, id: made.id }], 'the kept settlement landed without a fresh listing');
+    const other = await w.registry().claim(w.request(w.procs.owner(), w.folder('other')));
+    assert.equal(other.lane.device?.id, made.id, 'the slot is free again');
+    assert.equal(w.devices.all().length, 1);
+    assert.equal(leaseRows(w.dir), 0);
+  } finally {
+    unblock();
+    w.close();
+  }
+});
+
+test("a release reads the process table only before it takes the registry's write lock", async () => {
+  const w = world({ poolSize: 1 });
+  try {
+    const owner = w.procs.owner();
+    const a = await w.registry().claim(w.request(owner, w.folder('a'), { boot: true }));
+    w.procs.recycle(process.pid);
+    const insideLock: string[] = [];
+    const processes = {
+      startTimes: (pids: readonly number[]) => {
+        const probe = new DatabaseSync(databasePath(w.dir));
+        try {
+          probe.exec('BEGIN IMMEDIATE');
+          probe.exec('ROLLBACK');
+        } catch {
+          insideLock.push(pids.join(','));
+        } finally {
+          probe.close();
+        }
+        return w.procs.startTimes(pids);
+      },
+      info: (pid: number) => w.procs.info(pid),
+      cwd: () => undefined,
+    };
+    const registry = RegistryClass.open({
+      dir: w.dir,
+      processes,
+      ports: w.probe,
+      devices: { ios: w.devices, android: w.emulators },
+      config: w.config,
+      clock: w.clock,
+    });
+    try {
+      registry.release(refOf(a.lane), owner);
+    } finally {
+      registry.close();
+    }
+    assert.deepEqual(insideLock, []);
+    assert.equal(w.devices.all()[0]?.booted, false);
+  } finally {
+    w.close();
+  }
+});
+
+function busyMb(dir: string): number {
+  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  try {
+    const deleting = new Set(
+      db
+        .prepare("SELECT reservation FROM device_leases WHERE work = 'delete'")
+        .all()
+        .map(r => String(r.reservation)),
+    );
+    return db
+      .prepare('SELECT name, platform, device_id, claim_id FROM devices')
+      .all()
+      .filter(r => r.claim_id !== null || (r.device_id === null && !deleting.has(String(r.name))))
+      .reduce((mb, r) => mb + DEVICE_MEMORY_MB[r.platform as Platform], 0);
+  } finally {
+    db.close();
+  }
+}
+
+test('a claim whose device listing predates the boot of a lane it sweeps looks again before it plans, so nobody admits a device while that one runs uncounted', async () => {
+  const w = world({ poolSize: 2, memoryBudgetMb: 4000 });
+  try {
+    const owner = w.procs.owner();
+    const a = await w.registry().claim(w.request(owner, w.folder('a')));
+    const device = a.lane.device;
+    assert.ok(device);
+    w.procs.kill(owner.process?.pid ?? 0);
+
+    const over: string[] = [];
+    const audit = (who: string, step: Step) => {
+      if (step !== 'claim:lease-committed' && step !== 'claim:reserve-committed' && step !== 'claim:committed') return;
+      const used = busyMb(w.dir);
+      if (used > w.config.memoryBudgetMb) over.push(`${who} at ${step}: ${String(used)} MB`);
+    };
+    let openProbe: () => void = () => undefined;
+    w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+    const probe = { regated: false };
+    const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+    const late = w
+      .registry({
+        onStep: step => {
+          audit('the sweeper', step);
+          if (step !== 'claim:reserve-committed' || probe.regated) return;
+          probe.regated = true;
+          w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+        },
+      })
+      .claim(w.request(w.procs.owner(), w.folder('late'), strict));
+    w.devices.setBooted(device.id, true);
+    openProbe();
+    for (let i = 0; i < 200 && !probe.regated; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(probe.regated, 'the sweeper reserved a simulator to create');
+
+    await w
+      .registry({
+        ports: new FakeProbe(),
+        onStep: step => {
+          audit('a bystander', step);
+        },
+      })
+      .claim(w.request(w.procs.owner(), w.folder('bystander'), NO_DEVICE));
+    openProbe();
+    const got = await late;
+    assert.deepEqual(over, []);
+    assert.equal(got.lane.device?.deviceTypeName, 'iPhone 17 Pro');
+    assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, false);
+  } finally {
+    w.close();
+  }
+});
+
+for (const idle of ['simulator', 'emulator'] as const) {
+  test(`a claim that takes over an idle lane's ${idle} without using it shuts that ${idle} down before it plans on its memory`, async () => {
+    const w = world({ poolSize: 2, emulatorPoolSize: 2, memoryBudgetMb: 4000 });
+    try {
+      const device = { platform: idle === 'simulator' ? 'ios' : 'android' } as const;
+      const held = await w.registry().claim(w.request(w.procs.owner(), w.folder('idle'), { device, boot: true }));
+      assert.ok(held.lane.device);
+      await w.clock.advance(w.config.idleMs + 1);
+
+      const over: string[] = [];
+      const audit = (who: string, step: Step) => {
+        if (step !== 'claim:lease-committed' && step !== 'claim:reserve-committed' && step !== 'claim:committed') return;
+        const used = busyMb(w.dir);
+        if (used > w.config.memoryBudgetMb) over.push(`${who} at ${step}: ${String(used)} MB`);
+      };
+      let openProbe: () => void = () => undefined;
+      const probe = { regated: false };
+      const strict = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+      const taker = w
+        .registry({
+          onStep: step => {
+            audit('the taker', step);
+            if (step !== 'claim:reserve-committed' || probe.regated) return;
+            probe.regated = true;
+            w.probe.gate = new Promise<void>(resolve => (openProbe = resolve));
+          },
+        })
+        .claim(w.request(w.procs.owner(), w.folder('taker'), strict));
+      for (let i = 0; i < 200 && !probe.regated; i++) await new Promise(resolve => setImmediate(resolve));
+      assert.ok(probe.regated, 'the taker reserved a simulator to create');
+
+      await w
+        .registry({
+          ports: new FakeProbe(),
+          onStep: step => {
+            audit('a bystander', step);
+          },
+        })
+        .claim(w.request(w.procs.owner(), w.folder('bystander'), NO_DEVICE));
+      openProbe();
+      const got = await taker;
+      assert.deepEqual(over, []);
+      assert.deepEqual(
+        got.tookOver.map(t => t.id),
+        [held.lane.id],
+      );
+      assert.equal(got.lane.device?.deviceTypeName, 'iPhone 17 Pro');
+      const backend = idle === 'simulator' ? w.devices : w.emulators;
+      assert.equal(backend.all().find(d => d.id === held.lane.device?.id)?.booted, false);
+    } finally {
+      w.close();
+    }
+  });
+}

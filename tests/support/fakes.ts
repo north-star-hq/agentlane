@@ -49,7 +49,9 @@ export function tempDir(label: string): string {
 }
 
 export class FakeProcesses implements ProcessTable {
-  private readonly table = new Map<number, { start: string; ppid: number; command: string }>();
+  private readonly table = new Map<number, { start: string; ppid: number; command: string }>([
+    [1, { start: 'Sun Oct 11 07:00:00 2026', ppid: 0, command: '/sbin/launchd' }],
+  ]);
   private nextPid = 40_000;
   private generation = 0;
   blind = false;
@@ -170,6 +172,8 @@ export class FakeDevices implements DeviceBackend {
   failCreate = false;
   failBoot = false;
   failShutdown = false;
+  failList = false;
+  readonly unnamedSerials = new Set<string>();
   readonly calls: string[] = [];
   during: ((call: SlowCall, target: string) => void) | null = null;
 
@@ -219,13 +223,14 @@ export class FakeDevices implements DeviceBackend {
   }
 
   list(): BackendDevice[] {
+    if (this.failList) throw new DeviceBackendError('list failed (fake)');
     return this.all().map(({ id, name, deviceType, runtime, booted, port }) => ({
       id,
       name,
       deviceType,
       runtime,
       booted,
-      ...(booted && port !== undefined ? { serial: `emulator-${String(port)}` } : {}),
+      ...(booted && port !== undefined && !this.unnamedSerials.has(id) ? { serial: `emulator-${String(port)}` } : {}),
     }));
   }
 

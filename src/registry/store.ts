@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS device_leases (
   work TEXT NOT NULL,
   holder_pid INTEGER NOT NULL,
   holder_start TEXT NOT NULL,
-  since INTEGER NOT NULL
+  since INTEGER NOT NULL,
+  console_port INTEGER
 ) STRICT;
 `;
 const ADDED_TABLES = ['resources', 'browsers', 'device_leases'];
