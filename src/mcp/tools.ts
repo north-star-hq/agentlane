@@ -240,10 +240,7 @@ function errorResult(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-/**
- * The MCP tools' handler. It resolves the owner once, and the lane on every call, so a new lane is picked up. Each call
- * counts as the lane's last use: the driver engine records device calls, and the handler records browser calls.
- */
+/** The MCP tools' handler. It resolves the owner once, and the lane on every call, so a new lane is picked up. */
 export function createToolHandler(context: ToolContext): (name: string, args: Record<string, unknown>) => Promise<ToolResult> {
   let owner: Owner | undefined;
   let toucher: LaneToucher | undefined;

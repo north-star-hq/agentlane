@@ -31,6 +31,8 @@ export interface EnvDeps {
   evidence?: EvidenceSystem;
   clock: Clock;
   pollMs?: number;
+  /** How often a long `exec` command or `up` hook counts as a call on the lane while it runs; HEARTBEAT_MS when absent. */
+  heartbeatMs?: number;
   selfPid?: number;
   onCancel?: (cancel: () => void) => () => void;
 }

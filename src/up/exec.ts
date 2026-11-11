@@ -14,7 +14,7 @@ import { describeOwner, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
-import { touchLane } from '../registry/touch.ts';
+import { keepTouching, touchLane } from '../registry/touch.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import type { Lane } from '../registry/types.ts';
 import { laneDir, readUpRecord } from './lane-files.ts';
@@ -107,7 +107,13 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
     : null;
   if (browser) env = { ...env, ...browser.vars };
 
-  const code = await run(deps, command, args, env);
+  const stopTouching = keepTouching(site, ref, `exec: ${command}`, deps.heartbeatMs);
+  let code: number;
+  try {
+    code = await run(deps, command, args, env);
+  } finally {
+    stopTouching();
+  }
   try {
     touchLane(site, ref, `exec: ${command}`);
   } catch (error) {

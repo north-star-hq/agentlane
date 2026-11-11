@@ -9,9 +9,8 @@ import { findAndroidSdk } from '../devices/emulator.ts';
 import { identityOf, systemProcesses, type ProcessIdentity, type ProcessTable } from '../processes.ts';
 import { isProven, judgeProcess, worktreeState, type Owner } from '../registry/owner.ts';
 import { tcpProbe } from '../registry/ports.ts';
-import { Refusal } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
-import { TOUCH_WAIT_MS } from '../registry/touch.ts';
+import { landTouch, recordCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
 import { messageOf } from './errors.ts';
 import { IdleWatch, writeIdleStop, describeIdle } from './idle.ts';
 import { sipsImages, type ImageTools } from './images.ts';
@@ -235,21 +234,22 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
   });
   const timers: NodeJS.Timeout[] = [];
 
+  const laneRef = { id: config.laneId, token: config.token };
   const flushTouch = () => {
     if (pendingTouch === undefined || stopping !== undefined) return;
     const action = pendingTouch;
     try {
-      registry.touch({ id: config.laneId, token: config.token }, action);
+      if (!landTouch({ dir: config.stateDir, processes, waitMs: 0 }, laneRef, action)) return;
       pendingTouch = undefined;
       lastTouch = Date.now();
     } catch (error) {
-      if (error instanceof Refusal && error.code === 'registry-busy') return;
       if (!stillHeld()) endLane();
       else void shutdown(`the lane can't be touched: ${messageOf(error).split('\n')[0] ?? ''}`);
     }
   };
 
   const touchSoon = (action: string) => {
+    recordCall(config.stateDir, laneRef, Date.now());
     pendingTouch = action;
     if (Date.now() - lastTouch >= (config.touchEveryMs ?? 5000)) setImmediate(flushTouch);
   };

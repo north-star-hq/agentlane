@@ -33,6 +33,10 @@ export function laneDir(stateDir: string, laneId: string): string {
   return path.join(lanesRoot(stateDir), laneId);
 }
 
+export function lastCallFile(dir: string): string {
+  return path.join(dir, 'last-call.json');
+}
+
 export function serviceLog(dir: string, service: string): string {
   return path.join(dir, `${service}.log`);
 }

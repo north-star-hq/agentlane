@@ -51,6 +51,7 @@ import { resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
+import { keepTouching } from '../registry/touch.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
@@ -160,7 +161,17 @@ async function hook(ctx: Ctx, name: HookName, extraEnv: Record<string, string> =
   const log = hookLog(ctx.dir, name);
   ctx.deps.log(`${TOOL} up: ${name}: ${command}   (log: ${log})`);
   ctx.registry.touch(ctx.ref, `up: ${name}`);
-  return runHook(name, command, { cwd: ctx.config.dir, env: { ...ctx.env, ...extraEnv }, log });
+  const stopTouching = keepTouching(
+    { dir: ctx.registry.dir, processes: ctx.deps.processes, clock: ctx.deps.clock },
+    ctx.ref,
+    `up: ${name}`,
+    ctx.deps.heartbeatMs,
+  );
+  try {
+    return await runHook(name, command, { cwd: ctx.config.dir, env: { ...ctx.env, ...extraEnv }, log });
+  } finally {
+    stopTouching();
+  }
 }
 
 async function bootDevice(sim: SimTools, udid: string, reboot: boolean): Promise<string> {
