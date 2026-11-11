@@ -11,6 +11,8 @@ import { describeStart, startMs, type ProcessIdentity } from '../processes.ts';
 
 export type LeaderState = 'alive' | 'gone' | 'pid-reused' | 'moved' | 'cant-tell';
 
+type LeaderCheck = { state: Exclude<LeaderState, 'cant-tell'> } | { state: 'cant-tell'; unread: string };
+
 export interface Listener {
   pid: number;
   ours: boolean;
@@ -22,17 +24,25 @@ export interface ServiceInspection {
   port: number;
   process: ServiceProcess | null;
   leader: LeaderState | 'not-started';
+  leaderDetail: string;
   listeners: Listener[] | null;
   ready: boolean;
   readyDetail: string;
   healthy: boolean;
 }
 
+export interface Killed {
+  group: boolean;
+  pids: number[];
+}
+
 export type StopOutcome =
-  | { kind: 'stopped'; signal: NodeJS.Signals }
+  | { kind: 'stopped'; signal: 'SIGTERM' }
+  | { kind: 'stopped'; signal: 'SIGKILL'; killed: Killed }
   | { kind: 'already-gone' }
   | { kind: 'not-ours'; reason: string }
-  | { kind: 'cant-tell'; reason: string; sent?: NodeJS.Signals }
+  | { kind: 'cant-tell'; reason: string; sent?: 'SIGTERM' }
+  | { kind: 'cant-tell'; reason: string; sent: 'SIGKILL'; killed: Killed }
   | { kind: 'survived'; members: number[]; unproven?: number[] };
 
 export class ServiceFailed extends Error {
@@ -47,20 +57,24 @@ export class ServiceFailed extends Error {
 
 const PROBE_TIMEOUT_MS = 2000;
 
-export function judgeLeader(system: ServiceSystem, proc: ServiceProcess): LeaderState {
+function checkLeader(system: ServiceSystem, proc: ServiceProcess): LeaderCheck {
   const starts = system.running([proc.pid]);
-  if (!starts) return 'cant-tell';
+  if (!starts) return { state: 'cant-tell', unread: 'ps could not read when it started' };
   const start = starts.get(proc.pid);
-  if (start === undefined) return 'gone';
-  if (start !== proc.start) return 'pid-reused';
-  if (proc.cwd === null) return 'alive';
+  if (start === undefined) return { state: 'gone' };
+  if (start !== proc.start) return { state: 'pid-reused' };
+  if (proc.cwd === null) return { state: 'alive' };
   const cwd = system.processes.cwd(proc.pid);
-  if (cwd === undefined) return 'cant-tell';
-  return cwd === proc.cwd ? 'alive' : 'moved';
+  if (cwd === undefined) return { state: 'cant-tell', unread: 'its working directory could not be read' };
+  return { state: cwd === proc.cwd ? 'alive' : 'moved' };
 }
 
-function describeLeader(state: LeaderState, proc: ServiceProcess): string {
-  switch (state) {
+export function judgeLeader(system: ServiceSystem, proc: ServiceProcess): LeaderState {
+  return checkLeader(system, proc).state;
+}
+
+function describeLeader(check: LeaderCheck, proc: ServiceProcess): string {
+  switch (check.state) {
     case 'alive':
       return `pid ${String(proc.pid)} is running`;
     case 'gone':
@@ -70,7 +84,7 @@ function describeLeader(state: LeaderState, proc: ServiceProcess): string {
     case 'moved':
       return `pid ${String(proc.pid)} is no longer in ${proc.cwd ?? '(unknown)'}`;
     case 'cant-tell':
-      return `pid ${String(proc.pid)} could not be checked (ps or lsof failed)`;
+      return `pid ${String(proc.pid)} could not be checked: ${check.unread}`;
   }
 }
 
@@ -177,7 +191,8 @@ export async function inspectService(
   port: number,
   proc: ServiceProcess | null,
 ): Promise<ServiceInspection> {
-  const leader = proc ? judgeLeader(system, proc) : 'not-started';
+  const check = proc ? checkLeader(system, proc) : null;
+  const leader = check?.state ?? 'not-started';
   const listeners = listenersOn(system, port, leader === 'alive' && proc ? proc.pid : null);
   const probe = await probeReady(service.ready, port);
   const ours = listeners !== null && listeners.length > 0 && listeners.every(l => l.ours);
@@ -186,6 +201,7 @@ export async function inspectService(
     port,
     process: proc,
     leader,
+    leaderDetail: proc && check ? describeLeader(check, proc) : 'not started by the toolkit',
     listeners,
     ready: probe.ready,
     readyDetail: probe.detail,
@@ -194,9 +210,7 @@ export async function inspectService(
 }
 
 export function explainInspection(inspection: ServiceInspection): string {
-  const parts: string[] = [];
-  if (inspection.process) parts.push(describeLeader(inspection.leader as LeaderState, inspection.process));
-  else parts.push('not started by the toolkit');
+  const parts = [inspection.leaderDetail];
   if (inspection.listeners === null) parts.push(`the listener on ${String(inspection.port)} could not be read`);
   else if (inspection.listeners.length === 0) parts.push(`nothing listens on ${String(inspection.port)}`);
   else {
@@ -268,11 +282,12 @@ export async function stopService(
   graceMs = 5000,
   pollMs = 100,
 ): Promise<StopOutcome> {
-  const leader = judgeLeader(system, proc);
-  if (leader === 'pid-reused' || leader === 'moved') return { kind: 'not-ours', reason: describeLeader(leader, proc) };
-  if (leader === 'cant-tell') return { kind: 'cant-tell', reason: describeLeader(leader, proc) };
+  const leader = checkLeader(system, proc);
+  if (leader.state === 'pid-reused' || leader.state === 'moved')
+    return { kind: 'not-ours', reason: describeLeader(leader, proc) };
+  if (leader.state === 'cant-tell') return { kind: 'cant-tell', reason: describeLeader(leader, proc) };
   let group: ProcessIdentity[];
-  if (leader === 'gone') {
+  if (leader.state === 'gone') {
     const members = system.groupMembers(proc.pid);
     if (members === undefined) return { kind: 'cant-tell', reason: 'ps could not list the process group' };
     if (members.length === 0) return { kind: 'already-gone' };
@@ -291,9 +306,8 @@ export async function stopService(
     const found = members === undefined ? [] : (withStarts(system, members) ?? []);
     group = [{ pid: proc.pid, start: proc.start }, ...found.filter(member => member.pid !== proc.pid)];
   }
-  const strays = outsideGroup(system, proc.pid, leader === 'gone' ? group.map(member => member.pid) : [proc.pid]);
-  if ('unread' in strays) return { kind: 'cant-tell', reason: strays.unread };
-  const proven = [...group, ...strays];
+  const strays = outsideGroup(system, proc.pid, leader.state === 'gone' ? group.map(member => member.pid) : [proc.pid]);
+  const proven = [...group, ...strays.proven];
   const provenPids = proven.map(p => p.pid);
   const left = (processes: readonly ProcessIdentity[]): number[] | undefined => {
     const starts = system.running(processes.map(p => p.pid));
@@ -324,7 +338,13 @@ export async function stopService(
     }
   };
   const killed = { group: false, pids: new Set<number>(), unread: false };
-  const sent = (): NodeJS.Signals => (killed.group || killed.pids.size > 0 ? 'SIGKILL' : 'SIGTERM');
+  const sigkill = (): Killed | undefined =>
+    killed.group || killed.pids.size > 0 ? { group: killed.group, pids: [...killed.pids] } : undefined;
+  const cantTell = (reasons: readonly string[]): StopOutcome => {
+    const reason = reasons.join('; ');
+    const kill = sigkill();
+    return kill ? { kind: 'cant-tell', sent: 'SIGKILL', killed: kill, reason } : { kind: 'cant-tell', sent: 'SIGTERM', reason };
+  };
   const outcome = (p: StopPoll): StopOutcome => {
     if (p.kind === 'unread') {
       const failed = [
@@ -332,35 +352,34 @@ export async function stopService(
         ...(p.group ? [`list process group ${String(proc.pid)}`] : []),
       ].join(', nor ');
       const pids = [...new Set([...seen.lastOurs, ...seen.lastInGroup])].join(' ');
-      return {
-        kind: 'cant-tell',
-        sent: sent(),
-        reason:
-          pids === ''
-            ? `ps could not ${failed}, so it can't be proven stopped`
-            : `ps could not ${failed}, so processes ${pids} can't be proven stopped; stop them with kill ${pids}`,
-      };
+      return cantTell([
+        pids === ''
+          ? `ps could not ${failed}, so it can't be proven stopped`
+          : `ps could not ${failed}, so processes ${pids} can't be proven stopped; stop them with kill ${pids}`,
+        ...strays.unread,
+      ]);
     }
     const sentKill = (pid: number) => killed.pids.has(pid) || (killed.group && p.inGroup.includes(pid));
     const survivors = p.ours.filter(sentKill);
     const unkilled = p.ours.filter(pid => !sentKill(pid));
-    if (unkilled.length > 0) {
-      const why = killed.unread ? ': ps could not read when they started, so they were' : ' and were';
-      const reason = [
-        `processes ${unkilled.join(', ')} remain${why} not sent SIGKILL; stop them with kill ${unkilled.join(' ')}`,
-        ...(survivors.length > 0 ? [`processes ${survivors.join(', ')} survived SIGKILL`] : []),
-        ...(p.unproven.length > 0 ? [unprovenLeft(proc.pid, p.unproven)] : []),
-      ];
-      return { kind: 'cant-tell', sent: sent(), reason: reason.join('; ') };
-    }
-    if (survivors.length > 0) {
+    if (unkilled.length === 0 && strays.unread.length === 0 && survivors.length > 0) {
       return { kind: 'survived', members: survivors, ...(p.unproven.length > 0 ? { unproven: p.unproven } : {}) };
     }
-    if (p.unproven.length > 0) return { kind: 'cant-tell', sent: sent(), reason: unprovenLeft(proc.pid, p.unproven) };
-    return { kind: 'stopped', signal: sent() };
+    const why = killed.unread ? ': ps could not read when they started, so they were' : ' and were';
+    const reasons = [
+      ...(unkilled.length > 0
+        ? [`processes ${unkilled.join(', ')} remain${why} not sent SIGKILL; stop them with kill ${unkilled.join(' ')}`]
+        : []),
+      ...(survivors.length > 0 ? [`processes ${survivors.join(', ')} survived SIGKILL`] : []),
+      ...(p.unproven.length > 0 ? [unprovenLeft(proc.pid, p.unproven)] : []),
+      ...strays.unread,
+    ];
+    if (reasons.length > 0) return cantTell(reasons);
+    const kill = sigkill();
+    return kill ? { kind: 'stopped', signal: 'SIGKILL', killed: kill } : { kind: 'stopped', signal: 'SIGTERM' };
   };
   system.signalGroup(proc.pid, 'SIGTERM');
-  for (const pid of left(strays) ?? []) system.signal(pid, 'SIGTERM');
+  for (const stray of strays.proven) system.signal(stray.pid, 'SIGTERM');
   const grace = await waitSettled(graceMs);
   if (settled(grace)) return outcome(grace);
   // A pid can't name a new process group while a group of that id lives (XBD 4.14), but polls only sample the group:
@@ -407,32 +426,66 @@ function inOriginalGroup(proc: ServiceProcess, start: string): boolean {
   return proc.aliveAt !== undefined && member + START_RESOLUTION_MS <= proc.aliveAt;
 }
 
+function retryOnce<T>(read: () => T | undefined): T | undefined {
+  return read() ?? read();
+}
+
 /** The service's processes that left its process group, found while a process of the group still ties them to it. */
-function outsideGroup(system: ServiceSystem, pgid: number, roots: readonly number[]): ProcessIdentity[] | { unread: string } {
+function outsideGroup(
+  system: ServiceSystem,
+  pgid: number,
+  roots: readonly number[],
+): { proven: ProcessIdentity[]; unread: string[] } {
   const below = new Map<number, number>();
+  const unlisted: number[] = [];
   for (const root of roots) {
     if (below.has(root)) continue;
-    const descendants = system.descendants(root);
-    if (descendants === undefined) return { unread: `ps could not list the processes below pid ${String(root)}` };
-    for (const d of descendants) below.set(d.pid, d.pgid);
+    const descendants = retryOnce(() => system.descendants(root));
+    if (descendants === undefined) unlisted.push(root);
+    for (const d of descendants ?? []) below.set(d.pid, d.pgid);
   }
   const pids = [...below].filter(([, group]) => group !== pgid).map(([pid]) => pid);
-  if (pids.length === 0) return [];
-  return withStarts(system, pids) ?? { unread: `ps could not read when processes ${pids.join(', ')} started` };
+  const proven = pids.length === 0 ? [] : retryOnce(() => withStarts(system, pids));
+  return {
+    proven: proven ?? [],
+    unread: [
+      ...(unlisted.length > 0
+        ? [
+            `ps could not list the processes below ${unlisted.length === 1 ? 'pid' : 'pids'} ${unlisted.join(', ')}, so any of them outside process group ${String(pgid)} were not found and were sent nothing`,
+          ]
+        : []),
+      ...(proven === undefined
+        ? [
+            `ps could not read when processes ${pids.join(', ')} started, so they were sent nothing; stop them with kill ${pids.join(' ')}`,
+          ]
+        : []),
+    ],
+  };
+}
+
+function describeKilled(pgid: number, killed: Killed): string {
+  return [
+    ...(killed.group ? [`process group ${String(pgid)}`] : []),
+    ...(killed.pids.length > 0 ? [`processes ${killed.pids.join(', ')}`] : []),
+  ].join(' and ');
 }
 
 export function describeStop(proc: ServiceProcess, outcome: StopOutcome): string {
   const who = `${proc.service} (pid ${String(proc.pid)}, started ${describeStart(proc.start)})`;
   switch (outcome.kind) {
     case 'stopped':
-      return `stopped ${who}${outcome.signal === 'SIGKILL' ? ' with SIGKILL after SIGTERM was ignored' : ''}`;
+      if (outcome.signal === 'SIGTERM') return `stopped ${who}`;
+      return `stopped ${who} with SIGKILL to ${describeKilled(proc.pid, outcome.killed)}, which SIGTERM did not end`;
     case 'already-gone':
       return `${who} had already exited`;
     case 'not-ours':
       return `left ${who} alone: ${outcome.reason}`;
     case 'cant-tell':
-      if (outcome.sent === undefined) return `left ${who} alone: ${outcome.reason}`;
-      return `sent ${outcome.sent === 'SIGKILL' ? 'SIGTERM, then SIGKILL,' : 'SIGTERM'} to ${who}, but ${outcome.reason}`;
+      if (outcome.sent === 'SIGKILL') {
+        return `sent SIGTERM to ${who}, then SIGKILL to ${describeKilled(proc.pid, outcome.killed)}, but ${outcome.reason}`;
+      }
+      if (outcome.sent === 'SIGTERM') return `sent SIGTERM to ${who}, but ${outcome.reason}`;
+      return `left ${who} alone: ${outcome.reason}`;
     case 'survived':
       return `${who} survived SIGKILL: processes ${outcome.members.join(', ')} remain${outcome.unproven ? `; ${unprovenLeft(proc.pid, outcome.unproven)}` : ''}`;
   }

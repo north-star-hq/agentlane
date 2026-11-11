@@ -20,6 +20,8 @@ import {
   startService,
   stopService,
   waitForService,
+  type Killed,
+  type StopOutcome,
 } from '../../src/services/services.ts';
 import { realServiceSystem as system, type ServiceSystem } from '../../src/services/system.ts';
 import { stopClaimedService } from '../../src/up/lane-services.ts';
@@ -368,7 +370,12 @@ for (const after of ['exit', 'stay']) {
     const helper = Number(/^helper (\d+)$/m.exec(fs.readFileSync(p.log, 'utf8'))?.[1]);
     assert.ok(helper > 0, 'the leader started no helper');
     assert.equal(alive(helper), false, `the helper pid ${String(helper)} outlived its service`);
-    assert.deepEqual(outcome, { kind: 'stopped', signal: 'SIGKILL' });
+    assert.ok(outcome.kind === 'stopped' && outcome.signal === 'SIGKILL', describeStop(proc, outcome));
+    assert.equal(outcome.killed.group, true);
+    assert.ok(
+      outcome.killed.pids.every(pid => pid === proc.pid),
+      describeStop(proc, outcome),
+    );
   });
 }
 
@@ -428,9 +435,15 @@ for (const [seen, listing] of listings) {
     assert.deepEqual(outcome, {
       kind: 'cant-tell',
       sent: 'SIGKILL',
+      killed: { group: false, pids: [stubborn, strayPid] },
       reason: `processes ${String(joined)} in a process group of id ${String(proc.pid)} can't be proven ours; stop them with kill ${String(joined)}`,
     });
-    assert.match(describeStop(proc, outcome), /^sent SIGTERM, then SIGKILL, to api \(pid \d+, .*\), but processes \d+ in /);
+    assert.match(
+      describeStop(proc, outcome),
+      new RegExp(
+        `^sent SIGTERM to api \\(pid \\d+, .*\\), then SIGKILL to processes ${String(stubborn)}, ${String(strayPid)}, but processes \\d+ in `,
+      ),
+    );
   });
 }
 
@@ -561,7 +574,10 @@ for (const [what, every] of failures) {
       assert.equal(alive(proc.pid), true);
       assert.deepEqual(recorded(), [proc.pid], 'the lane forgot a process that may still run');
     } else {
-      assert.match(await stopClaimedService(services, proc), /^stopped api .* with SIGKILL after SIGTERM was ignored$/);
+      assert.match(
+        await stopClaimedService(services, proc),
+        new RegExp(`^stopped api .* with SIGKILL to processes ${String(proc.pid)}, which SIGTERM did not end$`),
+      );
       assert.equal(alive(proc.pid), false, 'the lane forgot a leader that still runs');
       assert.deepEqual(recorded(), []);
     }
@@ -659,9 +675,10 @@ interface Faults {
   starts?: (n: number) => boolean;
   /** Whether the nth listing of the group since SIGTERM fails. */
   group?: (n: number) => boolean;
-  /** Before SIGTERM, every read of start times that includes this pid fails. */
-  startsOf?: number;
-  descendants?: boolean;
+  /** Whether the nth read before SIGTERM of start times that include `pid` fails. */
+  startsOf?: { pid: number; fails: (n: number) => boolean };
+  /** Whether the nth listing of the processes below a pid fails. */
+  descendants?: (n: number) => boolean;
   /** A process that is in the leader's group from the listing after the nth since SIGTERM. */
   joins?: { pid: number; after: number };
 }
@@ -678,7 +695,7 @@ function fakeStop(processes: Record<number, FakeProcess>, faults: Faults = {}) {
   };
   const live = new Map(Object.entries(processes).map(([pid, p]) => [Number(pid), p]));
   const sent: string[] = [];
-  const reads = { starts: 0, group: 0 };
+  const reads = { starts: 0, group: 0, startsOf: 0, descendants: 0 };
   let termed = false;
   const deliver = (pid: number, signal: NodeJS.Signals) => {
     const p = live.get(pid);
@@ -691,7 +708,10 @@ function fakeStop(processes: Record<number, FakeProcess>, faults: Faults = {}) {
       reads.starts += 1;
       if (faults.starts?.(reads.starts)) return undefined;
     }
-    if (!termed && faults.startsOf !== undefined && pids.includes(faults.startsOf)) return undefined;
+    if (!termed && faults.startsOf && pids.includes(faults.startsOf.pid)) {
+      reads.startsOf += 1;
+      if (faults.startsOf.fails(reads.startsOf)) return undefined;
+    }
     return new Map(pids.filter(pid => live.has(pid)).map(pid => [pid, FAKE_START] as const));
   };
   const fake: ServiceSystem = {
@@ -710,10 +730,11 @@ function fakeStop(processes: Record<number, FakeProcess>, faults: Faults = {}) {
       }
       return faults.group?.(reads.group) ? undefined : members(pgid);
     },
-    descendants: pid =>
-      faults.descendants
-        ? undefined
-        : [...live].filter(([, p]) => p.ppid === pid).map(([child, p]) => ({ pid: child, pgid: p.pgid })),
+    descendants: pid => {
+      reads.descendants += 1;
+      if (faults.descendants?.(reads.descendants)) return undefined;
+      return [...live].filter(([, p]) => p.ppid === pid).map(([child, p]) => ({ pid: child, pgid: p.pgid }));
+    },
     signalGroup: (pgid, signal) => {
       sent.push(`group ${String(pgid)} ${signal}`);
       if (signal === 'SIGTERM') termed = true;
@@ -725,16 +746,28 @@ function fakeStop(processes: Record<number, FakeProcess>, faults: Faults = {}) {
     },
   };
   return {
-    stop: () => stopService(fake, fakeLeader, clock, FAKE_GRACE_MS, FAKE_POLL_MS),
+    stop: (proc = fakeLeader) => stopService(fake, proc, clock, FAKE_GRACE_MS, FAKE_POLL_MS),
+    system: fake,
     sent,
     live,
   };
 }
 
+const fakeWho = `api (pid ${String(LEADER)}, started ${FAKE_START} UTC)`;
+
 const notSentSigkill = (pids: string) =>
   `processes ${pids} remain: ps could not read when they started, so they were not sent SIGKILL; stop them with kill ${pids}`;
 
-const unsentKills: { what: string; processes: Record<number, FakeProcess>; faults: Faults; sent: string[]; reason: string }[] = [
+const groupKilled: Killed = { group: true, pids: [] };
+
+const unsentKills: {
+  what: string;
+  processes: Record<number, FakeProcess>;
+  faults: Faults;
+  sent: string[];
+  killed?: Killed;
+  reason: string;
+}[] = [
   {
     what: 'a leader that ignored SIGTERM, when a listing of its group failed during the grace',
     processes: { [LEADER]: leaderEndingOn('SIGKILL') },
@@ -745,15 +778,17 @@ const unsentKills: { what: string; processes: Record<number, FakeProcess>; fault
   {
     what: 'a process that left the group, when the group got SIGKILL',
     processes: { [LEADER]: leaderEndingOn('SIGKILL'), [STRAY]: strayEndingOn('SIGKILL') },
-    faults: { starts: n => n === 1 + GRACE_POLLS + 1 },
+    faults: { starts: n => n === GRACE_POLLS + 1 },
     sent: [`group ${String(LEADER)} SIGTERM`, `${String(STRAY)} SIGTERM`, `group ${String(LEADER)} SIGKILL`],
+    killed: groupKilled,
     reason: notSentSigkill(String(STRAY)),
   },
   {
     what: 'a process that left the group, beside a leader that survived the SIGKILL it was sent',
     processes: { [LEADER]: leaderEndingOn(), [STRAY]: strayEndingOn('SIGKILL') },
-    faults: { starts: n => n === 1 + GRACE_POLLS + 1 },
+    faults: { starts: n => n === GRACE_POLLS + 1 },
     sent: [`group ${String(LEADER)} SIGTERM`, `${String(STRAY)} SIGTERM`, `group ${String(LEADER)} SIGKILL`],
+    killed: groupKilled,
     reason: `${notSentSigkill(String(STRAY))}; processes ${String(LEADER)} survived SIGKILL`,
   },
 ];
@@ -762,11 +797,15 @@ for (const c of unsentKills) {
     const f = fakeStop(c.processes, c.faults);
     const outcome = await f.stop();
     assert.deepEqual(f.sent, c.sent);
-    const signal = c.sent.some(s => s.endsWith('SIGKILL')) ? 'SIGKILL' : 'SIGTERM';
-    assert.deepEqual(outcome, { kind: 'cant-tell', sent: signal, reason: c.reason });
+    assert.deepEqual(
+      outcome,
+      c.killed
+        ? { kind: 'cant-tell', sent: 'SIGKILL', killed: c.killed, reason: c.reason }
+        : { kind: 'cant-tell', sent: 'SIGTERM', reason: c.reason },
+    );
     assert.equal(
       describeStop(fakeLeader, outcome),
-      `sent ${signal === 'SIGKILL' ? 'SIGTERM, then SIGKILL,' : 'SIGTERM'} to api (pid ${String(LEADER)}, started ${FAKE_START} UTC), but ${c.reason}`,
+      `sent SIGTERM to ${fakeWho}${c.killed ? `, then SIGKILL to process group ${String(LEADER)}` : ''}, but ${c.reason}`,
     );
   });
 }
@@ -783,17 +822,19 @@ test('a process that survives SIGKILL is reported with a process in its group no
   );
 });
 
-const failedReads: { what: string; faults: Faults; sent: string[]; reason: string }[] = [
+const failedReads: { what: string; faults: Faults; sent: string[]; killed: Killed; reason: string }[] = [
   {
     what: 'read start times, though it could list the group',
     faults: { starts: () => true },
     sent: [`group ${String(LEADER)} SIGTERM`, `group ${String(LEADER)} SIGKILL`],
+    killed: groupKilled,
     reason: `ps could not read when processes ${String(LEADER)} started, so processes ${String(LEADER)} can't be proven stopped; stop them with kill ${String(LEADER)}`,
   },
   {
     what: 'list the group, though it could read start times',
     faults: { group: () => true },
     sent: [`group ${String(LEADER)} SIGTERM`, `${String(LEADER)} SIGKILL`],
+    killed: { group: false, pids: [LEADER] },
     reason: `ps could not list process group ${String(LEADER)}, so it can't be proven stopped`,
   },
 ];
@@ -802,33 +843,128 @@ for (const c of failedReads) {
     const f = fakeStop({ [LEADER]: leaderEndingOn('SIGKILL') }, c.faults);
     const outcome = await f.stop();
     assert.deepEqual(f.sent, c.sent);
-    assert.deepEqual(outcome, { kind: 'cant-tell', sent: 'SIGKILL', reason: c.reason });
+    assert.deepEqual(outcome, { kind: 'cant-tell', sent: 'SIGKILL', killed: c.killed, reason: c.reason });
   });
 }
 
-const unlistedStrays: { what: string; faults: Faults; reason: string }[] = [
+const strayReads: { what: string; twice: Faults; once: Faults; reason: string }[] = [
   {
     what: 'list the processes below its leader',
-    faults: { descendants: true },
-    reason: `ps could not list the processes below pid ${String(LEADER)}`,
+    twice: { descendants: n => n <= 2 },
+    once: { descendants: n => n === 1 },
+    reason: `ps could not list the processes below pid ${String(LEADER)}, so any of them outside process group ${String(LEADER)} were not found and were sent nothing`,
   },
   {
     what: 'read when the processes below its leader started',
-    faults: { startsOf: STRAY },
-    reason: `ps could not read when processes ${String(STRAY)} started`,
+    twice: { startsOf: { pid: STRAY, fails: n => n <= 2 } },
+    once: { startsOf: { pid: STRAY, fails: n => n === 1 } },
+    reason: `ps could not read when processes ${String(STRAY)} started, so they were sent nothing; stop them with kill ${String(STRAY)}`,
   },
 ];
-for (const c of unlistedStrays) {
-  test(`a stop that could not ${c.what} sends nothing and is not reported stopped`, async () => {
-    const f = fakeStop({ [LEADER]: leaderEndingOn('SIGTERM'), [STRAY]: strayEndingOn('SIGTERM', 'SIGKILL') }, c.faults);
+const leaderEnds: { on: string; leader: FakeProcess; sent: string[]; killed?: Killed }[] = [
+  { on: 'SIGTERM', leader: leaderEndingOn('SIGTERM'), sent: [`group ${String(LEADER)} SIGTERM`] },
+  {
+    on: 'the SIGKILL after the grace',
+    leader: leaderEndingOn('SIGKILL'),
+    sent: [`group ${String(LEADER)} SIGTERM`, `group ${String(LEADER)} SIGKILL`],
+    killed: groupKilled,
+  },
+];
+for (const c of strayReads) {
+  for (const l of leaderEnds) {
+    test(`a stop that could not ${c.what}, though it asked twice, stops a leader that ends on ${l.on}, sends nothing outside its group, and names the read`, async () => {
+      const f = fakeStop({ [LEADER]: l.leader, [STRAY]: strayEndingOn('SIGTERM', 'SIGKILL') }, c.twice);
+      const outcome = await f.stop();
+      assert.deepEqual(f.sent, l.sent);
+      assert.ok(!f.live.has(LEADER), 'the leader outlived the stop');
+      assert.ok(f.live.has(STRAY), "a process not proven the service's was signalled");
+      assert.deepEqual(
+        outcome,
+        l.killed
+          ? { kind: 'cant-tell', sent: 'SIGKILL', killed: l.killed, reason: c.reason }
+          : { kind: 'cant-tell', sent: 'SIGTERM', reason: c.reason },
+      );
+      assert.equal(
+        describeStop(fakeLeader, outcome),
+        `sent SIGTERM to ${fakeWho}${l.killed ? `, then SIGKILL to process group ${String(LEADER)}` : ''}, but ${c.reason}`,
+      );
+    });
+  }
+  test(`a stop that could not ${c.what} once, and could when it asked again, stops as if ps had not failed`, async () => {
+    const processes = { [LEADER]: leaderEndingOn('SIGTERM'), [STRAY]: strayEndingOn('SIGKILL') };
+    const unfailing = fakeStop(processes);
+    const expected = await unfailing.stop();
+    const f = fakeStop(processes, c.once);
     const outcome = await f.stop();
+    assert.deepEqual(outcome, expected);
+    assert.deepEqual(f.sent, unfailing.sent);
+    assert.deepEqual(f.sent, [`group ${String(LEADER)} SIGTERM`, `${String(STRAY)} SIGTERM`, `${String(STRAY)} SIGKILL`]);
+    assert.deepEqual(outcome, { kind: 'stopped', signal: 'SIGKILL', killed: { group: false, pids: [STRAY] } });
+    assert.equal(f.live.size, 0);
+  });
+}
+
+const strayFates: { on: string; stray: FakeProcess; sent: string[]; outcome: StopOutcome; line: string }[] = [
+  {
+    on: 'SIGTERM',
+    stray: strayEndingOn('SIGTERM'),
+    sent: [`group ${String(LEADER)} SIGTERM`, `${String(STRAY)} SIGTERM`],
+    outcome: { kind: 'stopped', signal: 'SIGTERM' },
+    line: `stopped ${fakeWho}`,
+  },
+  {
+    on: 'SIGKILL only',
+    stray: strayEndingOn('SIGKILL'),
+    sent: [`group ${String(LEADER)} SIGTERM`, `${String(STRAY)} SIGTERM`, `${String(STRAY)} SIGKILL`],
+    outcome: { kind: 'stopped', signal: 'SIGKILL', killed: { group: false, pids: [STRAY] } },
+    line: `stopped ${fakeWho} with SIGKILL to processes ${String(STRAY)}, which SIGTERM did not end`,
+  },
+];
+for (const c of strayFates) {
+  test(`when the first read of start times after SIGTERM fails, a process outside the group that ends on ${c.on} is sent SIGTERM before any SIGKILL, and the line says what it was sent`, async () => {
+    const f = fakeStop({ [LEADER]: leaderEndingOn('SIGTERM'), [STRAY]: c.stray }, { starts: n => n === 1 });
+    const outcome = await f.stop();
+    assert.deepEqual(f.sent, c.sent);
+    assert.equal(f.live.size, 0);
+    assert.deepEqual(outcome, c.outcome);
+    assert.equal(describeStop(fakeLeader, outcome), c.line);
+  });
+}
+
+const leaderReads: { what: string; faults: Faults; proc: ServiceProcess; unread: string }[] = [
+  {
+    what: 'start time',
+    faults: { startsOf: { pid: LEADER, fails: () => true } },
+    proc: fakeLeader,
+    unread: 'ps could not read when it started',
+  },
+  {
+    what: 'working directory',
+    faults: {},
+    proc: { ...fakeLeader, cwd: '/srv/api' },
+    unread: 'its working directory could not be read',
+  },
+];
+for (const c of leaderReads) {
+  test(`a leader whose ${c.what} can't be read is left alone, and the stop and the inspection name that read`, async () => {
+    const f = fakeStop({ [LEADER]: leaderEndingOn('SIGTERM') }, c.faults);
+    const outcome = await f.stop(c.proc);
+    const reason = `pid ${String(LEADER)} could not be checked: ${c.unread}`;
     assert.deepEqual(f.sent, []);
-    assert.ok(f.live.has(STRAY) && f.live.has(LEADER));
-    assert.deepEqual(outcome, { kind: 'cant-tell', reason: c.reason });
-    assert.equal(
-      describeStop(fakeLeader, outcome),
-      `left api (pid ${String(LEADER)}, started ${FAKE_START} UTC) alone: ${c.reason}`,
-    );
+    assert.deepEqual(outcome, { kind: 'cant-tell', reason });
+    assert.equal(describeStop(c.proc, outcome), `left ${fakeWho} alone: ${reason}`);
+    const config: ServiceConfig = {
+      name: 'api',
+      type: 'api',
+      ports: null,
+      start: 'true',
+      cwd: '/srv/api',
+      ready: { kind: 'tcp', host: '127.0.0.1' },
+      timeoutMs: 1000,
+      dial: null,
+      platforms: null,
+    };
+    assert.ok(explainInspection(await inspectService(f.system, config, 1, c.proc)).startsWith(`${reason}; `));
   });
 }
 
