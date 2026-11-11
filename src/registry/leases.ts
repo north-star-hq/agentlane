@@ -66,7 +66,7 @@ export function leaseDevice(
     lease.runtimeName,
     holder.pid,
     holder.start,
-    lease.createdAt,
+    now,
   );
   db.prepare(
     `INSERT INTO device_leases (reservation, name, platform, device_id, device_type, device_type_name, runtime, runtime_name,
