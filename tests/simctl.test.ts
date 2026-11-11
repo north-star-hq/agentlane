@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { newestIphone, parseDeviceList, resolveSimSpec, simctlBackend } from '../src/devices/simctl.ts';
 import { UsageError } from '../src/registry/refusal.ts';
 import { CATALOG } from './support/fakes.ts';
+import { useOwnerFolders } from './support/isolate.ts';
 
 const LIVE = process.env.AGENTLANE_LIVE_SIMCTL === '1';
 
@@ -76,7 +77,8 @@ test('the device list keeps iOS simulators with their runtime, type and boot sta
 test(
   'live simctl: the defaults resolve on this Mac and the list sees every simulator',
   { skip: !LIVE && 'set AGENTLANE_LIVE_SIMCTL=1 to run against xcrun simctl' },
-  () => {
+  t => {
+    useOwnerFolders(t);
     const spec = simctlBackend.resolveSpec({});
     assert.match(spec.deviceTypeName, /^iPhone \d+/);
     assert.match(spec.runtimeName, /^iOS \d+/);

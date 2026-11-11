@@ -1,17 +1,17 @@
 import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import { tryLock, unlock } from '../../src/driver/lock.ts';
 import { identityOf, systemProcesses } from '../../src/processes.ts';
 import { tcpProbe } from '../../src/registry/ports.ts';
+import { hostTemp } from './isolate.ts';
 
 // Below the ephemeral ranges of Linux (32768 up) and macOS (49152 up), so no outgoing connection takes one.
 const FIRST = 20_000;
 const LAST = 31_999;
 export const BLOCK_SIZE = 32;
 const SLOTS = Math.floor((LAST - FIRST + 1) / BLOCK_SIZE);
-const RESERVATIONS = path.join(os.tmpdir(), 'agentlane-test-ports');
+const RESERVATIONS = path.join(hostTemp(), 'agentlane-test-ports');
 
 function bindable(port: number): Promise<boolean> {
   return new Promise(resolve => {

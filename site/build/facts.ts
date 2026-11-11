@@ -9,14 +9,15 @@ export interface PageSource {
 }
 
 /**
- * Set by the session-end hook for the detached process that does the release, and by doctor for the hook it runs;
- * nobody sets them by hand.
+ * Set by the session-end hook for the detached process that does the release, by doctor for the hook it runs, and by
+ * the test runner for the socket folder its tests use; nobody sets them by hand.
  */
 export const INTERNAL_VARIABLES = [
   'AGENTLANE_SESSION_END_OWNER',
   'AGENTLANE_SESSION_END_WAIT_MS',
   'AGENTLANE_SESSION_END_ONCE',
   'AGENTLANE_HOOK_PROBE',
+  'AGENTLANE_USER_TEMP',
 ];
 
 function sourceFiles(dir: string): string[] {

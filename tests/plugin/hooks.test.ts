@@ -279,14 +279,25 @@ test('setup runs the project’s setup hook in the worktree without claiming, an
       }),
     );
     const stateDir = path.join(root, 'state');
-    const env = { PATH: process.env.PATH, HOME: process.env.HOME, AGENTLANE_STATE_DIR: stateDir, AGENTLANE_LANE: 'stale' };
+    const sockets = path.join(root, 'sockets');
+    const env = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      AGENTLANE_STATE_DIR: stateDir,
+      AGENTLANE_USER_TEMP: sockets,
+      AGENTLANE_LANE: 'stale',
+    };
     const result = spawnSync(process.execPath, [CLI, 'setup'], { cwd: repo, encoding: 'utf8', env });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /to-stdout/);
     assert.equal(fs.readFileSync(path.join(repo, 'setup.out'), 'utf8'), 'installed\n');
     const vars = fs.readFileSync(path.join(repo, 'setup.env'), 'utf8').trim().split('\n').sort();
-    assert.deepEqual(vars, [`AGENTLANE_STATE_DIR=${stateDir}`, `AGENTLANE_WORKTREE=${fs.realpathSync(repo)}`]);
+    assert.deepEqual(vars, [
+      `AGENTLANE_STATE_DIR=${stateDir}`,
+      `AGENTLANE_USER_TEMP=${sockets}`,
+      `AGENTLANE_WORKTREE=${fs.realpathSync(repo)}`,
+    ]);
     assert.equal(fs.existsSync(path.join(stateDir, 'registry.sqlite')), false, 'no registry was created');
 
     fs.writeFileSync(
