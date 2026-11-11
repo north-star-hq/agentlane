@@ -934,3 +934,27 @@ test('restart fails loudly when the port cannot be rebound, and the lane keeps t
   assert.equal(again.lane.id, first.lane.id);
   assert.equal((await items()).port, API);
 });
+
+test("a service that fails to start and can't be stopped after keeps its record, and the failure says so", async t => {
+  const w = world(t);
+  w.write({
+    ...CONFIG,
+    services: {
+      ...CONFIG.services,
+      api: { type: 'api', start: 'exec sleep 60', ready: { kind: 'tcp' }, dial: { argument: '-apiBaseUrl' }, timeoutSeconds: 1 },
+    },
+  });
+  const blind = { ...realServiceSystem, running: () => undefined };
+  const failure = await up({ ...w.deps(), system: blind }, OPTIONS).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /failed to start, and could not be stopped after, so the lane keeps its record of it/);
+  const kept = readRegistryStatus({ dir: w.state, processes: systemProcesses }).lanes[0]?.processes.find(
+    p => p.service === 'api',
+  );
+  assert.ok(kept, 'the lane forgot a service that may still run');
+  assert.equal(alive(kept.pid), true);
+  process.kill(-kept.pid, 'SIGKILL');
+});
