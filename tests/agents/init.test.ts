@@ -89,6 +89,18 @@ function write(dir: string, file: string, text: string): void {
   fs.writeFileSync(path.join(dir, file), text);
 }
 
+test('the example app commits the agent files init writes for it, file by file', async () => {
+  const { dir, state, cleanup } = exampleCopy();
+  try {
+    const run = await init(dir, state);
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stdout, /for claude:/);
+    assert.equal(git(dir, 'status', '--porcelain', '--untracked-files=all'), '', run.stdout);
+  } finally {
+    cleanup();
+  }
+});
+
 test('init --all on a copy of the example app writes every agent’s files, and a second run changes nothing', async () => {
   const { dir, state, cleanup } = exampleCopy();
   try {
