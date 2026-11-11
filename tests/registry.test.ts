@@ -1556,6 +1556,96 @@ test('a claim whose device listing predates the boot of a lane that ended meanwh
   }
 });
 
+for (const end of ['release', 'park'] as const) {
+  test(`a claim whose device listing shows a lane's simulator booted, when the lane's ${end} shuts it down and another lane takes the last of the memory before the claim's lock, looks again rather than lease it for a second shutdown, so memory in use never passes the budget`, async () => {
+    const w = world({ poolSize: 2, memoryBudgetMb: 4000 });
+    try {
+      const pro = { device: { platform: 'ios', deviceType: 'iPhone 17 Pro', strict: true } } as const;
+      for (const [name, extra] of [
+        ['first', {}],
+        ['second', pro],
+      ] as const) {
+        const owner = w.procs.owner();
+        const made = await w.registry().claim(w.request(owner, w.folder(name), extra));
+        w.registry().release(refOf(made.lane), owner);
+      }
+      assert.equal(w.devices.all().length, 2);
+      const holder = w.procs.owner();
+      const held = (await w.registry().claim(w.request(holder, w.folder('held'), { boot: true }))).lane;
+      const device = held.device;
+      assert.ok(device);
+      w.devices.calls.length = 0;
+
+      let listings = 0;
+      const churn: PortProbe = {
+        listening: async () => {
+          listings++;
+          if (listings > 1) return new Set();
+          if (end === 'release') w.registry().release(refOf(held), holder);
+          else assert.ok(parkNow(w.registry(), held));
+          assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, false);
+          const taker = await w.registry().claim(w.request(w.procs.owner(), w.folder('taker'), pro));
+          assert.notEqual(taker.lane.device?.id, device.id);
+          return new Set();
+        },
+      };
+      const over: string[] = [];
+      const late = w
+        .registry({
+          ports: churn,
+          onStep: (step: Step) => {
+            if (step !== 'claim:lease-committed' && step !== 'claim:reserve-committed' && step !== 'claim:committed') return;
+            const used = busyMb(w.dir);
+            if (used > w.config.memoryBudgetMb) over.push(`${step}: ${String(used)} MB`);
+          },
+        })
+        .claim(w.request(w.procs.owner(), w.folder('late')));
+      await assert.rejects(late, (error: unknown) => error instanceof Refusal && error.code === 'pool-busy');
+      assert.deepEqual(over, []);
+      assert.equal(listings, 2, `it listed again once the ${end} had given the simulator back`);
+      assert.deepEqual(
+        w.devices.calls.filter(c => c === `shutdown ${device.id}`),
+        [`shutdown ${device.id}`],
+        `only the ${end} shut the simulator down`,
+      );
+      assert.equal(leaseRows(w.dir), 0);
+    } finally {
+      w.close();
+    }
+  });
+}
+
+test('a claim whose device listing shows a simulator booted that a release gave back still running, its shutdown failed, looks again and then shuts it down before it takes it', async () => {
+  const w = world({ poolSize: 1 });
+  try {
+    const holder = w.procs.owner();
+    const held = (await w.registry().claim(w.request(holder, w.folder('held'), { boot: true }))).lane;
+    const device = held.device;
+    assert.ok(device);
+    let listings = 0;
+    const churn: PortProbe = {
+      listening: () => {
+        listings++;
+        if (listings === 1) {
+          w.devices.failShutdown = true;
+          const notes: string[] = [];
+          w.registry().release(refOf(held), holder, notes);
+          w.devices.failShutdown = false;
+          assert.deepEqual(notes, [`could not shut down ${device.name}: shutdown failed (fake)`]);
+        }
+        return Promise.resolve(new Set<number>());
+      },
+    };
+    const late = await w.registry({ ports: churn }).claim(w.request(w.procs.owner(), w.folder('late')));
+    assert.equal(late.lane.device?.id, device.id);
+    assert.ok(late.notes.includes(`shut down unclaimed pool simulator ${device.name}`), late.notes.join('\n'));
+    assert.equal(w.devices.all().find(d => d.id === device.id)?.booted, false);
+    assert.equal(listings, 3, 'it looked again, shut the simulator down, then planned on a listing taken after');
+  } finally {
+    w.close();
+  }
+});
+
 for (const idle of ['simulator', 'emulator'] as const) {
   test(`a parked lane's ${idle} keeps its place in the pool and its memory until it is shut down, and then makes room for the next claim`, async () => {
     const w = world({ poolSize: 2, emulatorPoolSize: 2, memoryBudgetMb: 4000 });

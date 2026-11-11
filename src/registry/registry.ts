@@ -131,6 +131,7 @@ interface Verdicts {
   leases: ReadonlyMap<string, ProcessIdentity>;
   tickets: ReadonlySet<number>;
   known: ReadonlyMap<string, string>;
+  free: ReadonlyMap<string, string>;
   ended: number;
 }
 
@@ -395,14 +396,16 @@ export class Registry {
     }
     const reservations = new Map<string, ProcessIdentity>();
     const known = new Map<string, string>();
+    const free = new Map<string, string>();
     const devices = db.prepare(
-      `SELECT name, device_id, creator_pid, creator_start, EXISTS (SELECT 1 FROM device_leases l WHERE l.reservation = devices.name) AS leased
+      `SELECT name, device_id, claim_id, creator_pid, creator_start, EXISTS (SELECT 1 FROM device_leases l WHERE l.reservation = devices.name) AS leased
          FROM devices`,
     );
     for (const row of devices.all()) {
       const id = optText(row, 'device_id');
       if (id !== null) {
         known.set(text(row, 'name'), id);
+        if (optText(row, 'claim_id') === null) free.set(text(row, 'name'), id);
         continue;
       }
       if (int(row, 'leased') === 1) continue;
@@ -427,6 +430,7 @@ export class Registry {
       leases,
       tickets,
       known,
+      free,
       ended: (ended ? optInt(ended, 'seq') : null) ?? 0,
     };
   }
@@ -921,10 +925,21 @@ export class Registry {
     const now = this.clock.now();
     const retiring = this.landLeftovers(settling, listings, me, keeper, progress.notes);
     if (this.sweep(verdicts, now)) progress.found = true;
-    const { listed, leases } = this.reconcileAll(verdicts, backend, listings, me, keeper, now, stopped, progress.notes);
+    const { listed, leases, returnedSinceSnapshot } = this.reconcileAll(
+      verdicts,
+      backend,
+      listings,
+      me,
+      keeper,
+      now,
+      stopped,
+      progress.notes,
+    );
     this.step('claim:swept');
     if (retiring.length + leases.length > 0) return { kind: 'leased', leases: [...retiring, ...leases] };
-    if (request.device !== null && this.freedSinceListing(verdicts.ended, listings)) return { kind: 'relist' };
+    if (request.device !== null && (returnedSinceSnapshot || this.freedSinceListing(verdicts.ended, listings))) {
+      return { kind: 'relist' };
+    }
 
     const mine = db.prepare('SELECT * FROM claims WHERE owner_key = ? AND worktree = ?').get(caller.key, caller.worktree);
     if (mine) this.recognise(mine, request.owner);
@@ -1186,9 +1201,10 @@ export class Registry {
     now: number,
     stopped: Set<string>,
     notes: string[],
-  ): { listed: Map<string, BackendDevice> | null; leases: DeviceLease[] } {
+  ): { listed: Map<string, BackendDevice> | null; leases: DeviceLease[]; returnedSinceSnapshot: boolean } {
     let listed: Map<string, BackendDevice> | null = null;
     const leases: DeviceLease[] = [];
+    let returnedSinceSnapshot = false;
     for (const [platform, devices] of listings) {
       if (devices instanceof Error) {
         notes.push(`could not check the ${platform} pool: ${devices.message}`);
@@ -1207,6 +1223,10 @@ export class Registry {
         const name = text(row, 'name');
         const device = found.get(text(row, 'device_id'));
         if (stopped.has(name) || !device?.booted) continue;
+        if (verdicts.free.get(name) !== text(row, 'device_id')) {
+          returnedSinceSnapshot = true;
+          continue;
+        }
         const lease = leaseDevice(this.store.db, name, {
           reservation: this.leaseName(name, 'shutdown', devices),
           work: 'shutdown',
@@ -1220,7 +1240,7 @@ export class Registry {
         leases.push(lease);
       }
     }
-    return { listed, leases };
+    return { listed, leases, returnedSinceSnapshot };
   }
 
   private recoverDead(
@@ -1747,7 +1767,7 @@ export class Registry {
         : 'it did not wait (--timeout 0)';
     return new Refusal(
       'pool-busy',
-      `the device pool kept changing while this claim looked at it: during each of its last two listings a lane ended and left a device that listing may show in an old state; ${waited}`,
+      `the device pool kept changing while this claim looked at it: during each of its last two listings a device went back to the pool, and that listing may show it in an old state; ${waited}`,
       ends.length > 0 ? ends : [{ who: 'no lane the registry can see', folder: this.dir, since: formatTime(now) }],
       [
         `${CLI} claim --timeout 1800   (keep looking for up to 30 minutes)`,
