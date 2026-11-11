@@ -1368,12 +1368,13 @@ test('a prune that puts copies back never restores one another prune is deleting
       rmSync.mock.restore();
 
       assert.ok(second.results, `${race}: the second prune never ran`);
+      const atTheLanesPath = fs.existsSync(downloads) ? filesIn(downloads) : 'absent';
       const why = lanesFound(c.former, second.lane);
       if (race === 'puts back before the first checks again') {
+        assert.deepEqual(atTheLanesPath, files, race);
+        assert.deepEqual(fs.readdirSync(share), ['agent-env'], race);
         assert.deepEqual(outcomes(first), [[downloads, 'gone', `${aside} no longer exists`]], race);
         assert.deepEqual(outcomes(second.results), [[aside, 'kept', `${why}; put back at ${downloads}`]], race);
-        assert.deepEqual(filesIn(downloads), files, race);
-        assert.deepEqual(fs.readdirSync(share), ['agent-env'], race);
         continue;
       }
       const reported = {
@@ -1382,9 +1383,10 @@ test('a prune that puts copies back never restores one another prune is deleting
         'finds the lane at its first check': [[second.deleting, 'kept', why]],
         'finds the lane at its second check': [[second.deleting, 'kept', `${why}, found after it was moved aside`]],
       };
+      assert.equal(atTheLanesPath, 'absent', race);
+      assert.deepEqual(fs.readdirSync(share), [], race);
       assert.deepEqual(outcomes(first), [[downloads, 'deleted', null]], race);
       assert.deepEqual(outcomes(second.results), reported[race], race);
-      assert.deepEqual(fs.readdirSync(share), [], race);
     } finally {
       c.close();
     }
