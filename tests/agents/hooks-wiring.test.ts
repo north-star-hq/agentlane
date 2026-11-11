@@ -6,7 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { runAgentCommand } from '../../src/agents/cli.ts';
 import { agentHookChecks, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts';
-import { GUARDED_WORDS, hookCommand } from '../../src/agents/launcher.ts';
+import { GUARDED_WORDS, hookCommand, UNSPLIT_SED } from '../../src/agents/launcher.ts';
 import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
 import { writeHookMark } from '../../src/plugin/hook-mark.ts';
@@ -172,6 +172,17 @@ const SPLIT_NAMES = [
   'playwright\\-cli kill-all',
   "npx @play''wright/cli kill-all",
   `sh -c 'xcrun sim""ctl boot booted'`,
+  "a$''db shell",
+  "xcrun sim$'c'tl boot booted",
+  'xcrun sim\\\nctl boot booted',
+  `bash -c "a\\\ndb shell"`,
+];
+
+const PLAIN = [
+  'git status && pnpm test',
+  `printf 'a\\nb\\n' | grep -c "$HOME"`,
+  'cd src\ngit diff -- "it\'s.ts"',
+  "echo $'tab\\there' \\\n  && ls",
 ];
 
 test('the guard hooks init writes start no node process for a command with no device or browser tool in it', async () => {
@@ -203,10 +214,12 @@ test('the guard hooks init writes start no node process for a command with no de
     ];
     for (const { agent, command, args } of routes) {
       assert.ok(command, agent);
-      const quiet = sh(command, dir, env, input('git status && pnpm test'));
-      assert.equal(quiet.status, 0, `${agent}: ${quiet.stderr}`);
-      assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
-      assert.deepEqual(calls(log), [], `${agent} started the toolkit or node for a plain command`);
+      for (const plain of PLAIN) {
+        const quiet = sh(command, dir, env, input(plain));
+        assert.equal(quiet.status, 0, `${agent}: ${quiet.stderr}`);
+        assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
+        assert.deepEqual(calls(log), [], `${agent} started the toolkit or node for ${plain}`);
+      }
       for (const shell of ['xcrun simctl boot booted', ...SPLIT_NAMES]) {
         const device = sh(command, dir, env, input(shell));
         assert.equal(device.status, 0, `${agent}: ${device.stderr}`);
@@ -223,8 +236,65 @@ test('the guard hooks init writes start no node process for a command with no de
   }
 });
 
+const GUARDED_COMMANDS: Record<(typeof GUARDED_WORDS)[number], (name: string) => string> = {
+  simctl: name => `xcrun ${name} boot booted`,
+  adb: name => `${name} shell`,
+  emulator: name => `${name} -avd x`,
+  avdmanager: name => `${name} delete avd -n x`,
+  'playwright-cli': name => `${name} kill-all`,
+  '@playwright/cli': name => `npx ${name} kill-all`,
+  'agent-browser': name => `${name} --session x open`,
+};
+
+function splitsOf(word: string): string[] {
+  const cuts = ["''", '""', "$''", '\\', '\\\n'];
+  const at = Array.from({ length: word.length }, (_, i) => i);
+  const between = at.slice(1).flatMap(i => cuts.map(cut => word.slice(0, i) + cut + word.slice(i)));
+  const around = at.map(i => `${word.slice(0, i)}$'${word.slice(i, i + 1)}'${word.slice(i + 1)}`);
+  return [...between, ...around];
+}
+
+/** The `case` statement that decides whether a guard hook starts the toolkit, and the variable it reads the input from. */
+function filterOf(route: Agent | 'plugin'): { variable: string; filter: string } {
+  if (route === 'plugin') {
+    const script = /^ {2}case .*?\n {2}esac$/ms.exec(fs.readFileSync(HOOK_SH, 'utf8'));
+    assert.ok(script, 'hook.sh has its filter');
+    return { variable: 'input', filter: script[0] };
+  }
+  const settings = /^i=\$\(cat\); (case .*? esac);/s.exec(hookCommand(route, 'pre-tool-use'));
+  assert.ok(settings?.[1], `${route}'s hook has its filter`);
+  return { variable: 'i', filter: settings[1] };
+}
+
+test('every way of splitting a guarded tool name with quotes, backslashes or line continuations passes all seven guard filters', () => {
+  const f = fixture('hooks-split-names');
+  try {
+    const bare = GUARDED_WORDS.flatMap(word => splitsOf(word).map(split => GUARDED_COMMANDS[word](split)));
+    for (const command of bare) assert.notDeepEqual(aimsOf(command, {}, f.root), [], `the guard judges ${command}`);
+    const cases = bare.flatMap(command => [command, `sh -c '${command}'`, `bash -c "${command}"`]);
+    const inputs = path.join(f.root, 'inputs');
+    fs.writeFileSync(
+      inputs,
+      cases.map(command => `${JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: f.root })}\n`).join(''),
+    );
+    const routes = [...AGENTS, 'plugin' as const].map(filterOf);
+    const distinct = new Map(routes.map(route => [`${route.variable}\0${route.filter}`, route]));
+    for (const { variable, filter } of distinct.values()) {
+      const driver = `n=0; while IFS= read -r line; do n=$((n + 1)); ${variable}=$line; (\n${filter}\necho "$n"\n); done < "${inputs}"`;
+      const result = spawnSync('/bin/sh', ['-c', driver], { encoding: 'utf8', env: f.env() });
+      assert.equal(result.status, 0, result.stderr);
+      const passed = new Set(result.stdout.split('\n').filter(line => /^\d+$/.test(line)));
+      const skipped = cases.filter((_, at) => !passed.has(String(at + 1)));
+      assert.deepEqual(skipped, [], `the filter skips these:\n${filter}`);
+    }
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('the plugin’s hook script checks the same words as the hooks init writes', () => {
   const text = fs.readFileSync(HOOK_SH, 'utf8');
+  assert.ok(text.includes(`case $(printf '%s' "$input" | ${UNSPLIT_SED}) in`), 'hook.sh rejoins split names the same way');
   const pattern = /^\s*(\*simctl\*.*)\) ;;$/m.exec(text)?.[1] ?? '';
   assert.deepEqual(
     pattern.split('|').map(word => word.trim()),

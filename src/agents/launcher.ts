@@ -26,7 +26,13 @@ export const GUARDED_WORDS = [
   'agent-browser',
 ] as const;
 
-const UNQUOTED_INPUT = String.raw`$(printf %s "$i" | tr -d "'\"\\\\")`;
+/**
+ * The hook's input arrives as JSON, which writes a backslash as `\\` and a newline as `\n`. Dropping those, then every
+ * backslash, quote and `$` left, rejoins a tool name split by quotes, ANSI-C quotes, backslashes or line continuations.
+ */
+export const UNSPLIT_SED = String.raw`sed -e 's/\\\\//g' -e 's/\\n//g' -e 's/\\//g' -e "s/[\$'\"]//g"`;
+
+const UNSPLIT_INPUT = `$(printf %s "$i" | ${UNSPLIT_SED})`;
 
 function walkUp(start: string): string {
   return `d="${start}"; while [ ! -x "$d/${CLI}" ] && [ "$d" != / ]; do d=$(dirname "$d"); done`;
@@ -52,7 +58,7 @@ export function hookCommand(agent: Agent, event: HookEvent): string {
   const args = `hook ${event} --agent ${agent}`;
   if (event === 'session-end') return `${find}; if [ -x "$d/${CLI}" ]; then exec "$d/${CLI}" ${args}; fi; ${allow}`;
   const words = GUARDED_WORDS.map(word => `*${word}*`).join('|');
-  return `i=$(cat); case ${UNQUOTED_INPUT} in ${words}) ;; *) ${allow};; esac; ${find}; if [ -x "$d/${CLI}" ]; then printf '%s' "$i" | "$d/${CLI}" ${args}; exit; fi; ${allow}`;
+  return `i=$(cat); case ${UNSPLIT_INPUT} in ${words}) ;; *) ${allow};; esac; ${find}; if [ -x "$d/${CLI}" ]; then printf '%s' "$i" | "$d/${CLI}" ${args}; exit; fi; ${allow}`;
 }
 
 export function mcpLaunch(): { command: string; args: string[] } {

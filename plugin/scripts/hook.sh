@@ -3,7 +3,7 @@
 event=$1
 input=$(cat)
 if [ "$event" = pre-tool-use ]; then
-  case $(printf '%s' "$input" | tr -d "'\"\\\\") in
+  case $(printf '%s' "$input" | sed -e 's/\\\\//g' -e 's/\\n//g' -e 's/\\//g' -e "s/[\$'\"]//g") in
     *simctl* | *adb* | *emulator* | *avdmanager* | *playwright-cli* | *@playwright/cli* | *agent-browser*) ;;
     *) exit 0 ;;
   esac
