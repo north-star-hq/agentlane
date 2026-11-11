@@ -186,7 +186,7 @@ export interface ParkCandidate {
   ownerKey: string;
   worktree: string;
   park: LanePark | null;
-  /** The hold that keeps the lane up now, if its owner is alive; null when nothing holds it. */
+  /** The hold the lane's owner placed that has not ended; the sweep honours it only while that owner is not proven gone. */
   hold: LaneHold | null;
 }
 
