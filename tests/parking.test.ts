@@ -1,13 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import type { ProcessTable } from '../src/processes.ts';
 import { identityOf, systemProcesses } from '../src/processes.ts';
 import { DEFAULT_CONFIG, MINUTE_MS, parseConfig } from '../src/registry/config.ts';
-import { databasePath } from '../src/registry/paths.ts';
 import type { Registry } from '../src/registry/registry.ts';
 import { recordCall } from '../src/registry/touch.ts';
 import type { Lane } from '../src/registry/types.ts';
@@ -18,6 +16,7 @@ import { takeLane } from '../src/up/wake.ts';
 import { tempDir } from './support/fakes.ts';
 import type { World } from './support/world.ts';
 import { sawOwners, world } from './support/world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const PARK_MS = 30 * MINUTE_MS;
 
@@ -370,7 +369,7 @@ test("a parked lane's record is gone with the lane: a release ends it, parked or
     await w.clock.advance(PARK_MS);
     await runSweep(sweepDeps(w));
     w.registry().release(refOf(a.lane), owner);
-    const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+    const db = openRegistryReadOnly(w.dir);
     try {
       assert.equal(Number(db.prepare('SELECT COUNT(*) AS n FROM parks').get()?.n), 0);
     } finally {

@@ -34,7 +34,23 @@ function cell(text: string): string {
   return text.replaceAll('|', '\\|');
 }
 
+const ARGUMENT = String.raw`(?:--[a-z][a-z-]*(?: [0-9][0-9a-z]*\b)?|<[^>\s]+(?: [^>\s]+)*>|'[^']*'|"[^"]*"|-(?![\w-]))`;
+
+function examples(): RegExp {
+  const names = commands().map(c => c.name);
+  return new RegExp(
+    String.raw`((?<![\w/-])(?:(?:node_modules/\.bin/)?agentlane )?(?:${names.join('|')})(?: [a-z]+)?(?: ${ARGUMENT})+)`,
+  );
+}
+
 function prose(text: string): string {
+  return text
+    .split(examples())
+    .map((part, i) => (i % 2 === 1 ? code(part) : flagsInProse(part)))
+    .join('');
+}
+
+function flagsInProse(text: string): string {
   return text
     .split(
       /(--[a-z][a-z-]*(?: <[^>]+>)?|\$?AGENTLANE_[A-Z0-9_]*(?:<[A-Z]+>[A-Z0-9_]*)?|[A-Z0-9_]*<[^>\s]+(?: [^>\s]+)*>[A-Z0-9_]*)/,

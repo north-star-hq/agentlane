@@ -10,5 +10,33 @@
   "enabledPlugins": {
     "agentlane@agentlane": true
   },
-  "disabledMcpjsonServers": ["agentlane"]
+  "disabledMcpjsonServers": [
+    "agentlane"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "i=$(cat); case $(printf %s \"$i\" | sed -e h -e 's/\\\\\\\\//g' -e 's/\\\\n//g' -e x -e 's/\\\\\\\\\\\\\\\\//g' -e 's/\\\\\\\\n//g' -e G -e 's/\\\\//g' -e \"s/[\\$'\\\"]//g\" -e p -e :x -e h -e 's/{\\([-+0-9A-Za-z]*\\)\\.\\.[-+0-9A-Za-z.]*}/\\1/g' -e 's/{\\([^{},]*\\)\\(,[^{},]*\\)\\{0,8\\}}/\\1/g' -e p -e g -e ty -e :y -e 's/{[^{},]*,\\([^{},]*\\(,[^{},]*\\)\\{0,7\\}\\)}/{\\1}/g' -e tx -e d) in *simctl*|*adb*|*emulator*|*avdmanager*|*playwright-cli*|*@playwright/cli*|*agent-browser*) ;; *) exit 0;; esac; s=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; d=\"$s\"; while [ ! -x \"$d/node_modules/.bin/agentlane\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ ! -x \"$d/node_modules/.bin/agentlane\" ]; then d=$(git -C \"$s\" worktree list --porcelain 2>/dev/null | while IFS= read -r l; do w=${l#worktree }; if [ \"$w\" != \"$l\" ] && [ -x \"$w/node_modules/.bin/agentlane\" ]; then printf %s \"$w\"; break; fi; done); fi; if [ -x \"$d/node_modules/.bin/agentlane\" ]; then printf '%s' \"$i\" | \"$d/node_modules/.bin/agentlane\" hook pre-tool-use --agent claude; exit; fi; exit 0",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "prompt_input_exit|logout|other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "s=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; d=\"$s\"; while [ ! -x \"$d/node_modules/.bin/agentlane\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ ! -x \"$d/node_modules/.bin/agentlane\" ]; then d=$(git -C \"$s\" worktree list --porcelain 2>/dev/null | while IFS= read -r l; do w=${l#worktree }; if [ \"$w\" != \"$l\" ] && [ -x \"$w/node_modules/.bin/agentlane\" ]; then printf %s \"$w\"; break; fi; done); fi; if [ -x \"$d/node_modules/.bin/agentlane\" ]; then exec \"$d/node_modules/.bin/agentlane\" hook session-end --agent claude; fi; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
 }

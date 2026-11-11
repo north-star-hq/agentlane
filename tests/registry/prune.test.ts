@@ -42,6 +42,7 @@ import { FakeDevices, FakeProbe, FakeProcesses, tempDir } from '../support/fakes
 import { isolatedEnv, withProcessEnv } from '../support/isolated-env.ts';
 import { sharedRegistry, startClaimer, type StressOp } from '../support/stress-plan.ts';
 import { world, type World } from '../support/world.ts';
+import { readRegistry } from '../support/registry-read.ts';
 
 const SPEC: Readonly<Record<Platform, readonly string[]>> = {
   ios: [
@@ -1760,15 +1761,6 @@ test('prune keeps a simulator while this version shuts it down, deletes it to ma
 });
 
 const CLAIMER = path.join(import.meta.dirname, '..', 'support', 'stress-claimer.ts');
-
-function readRegistry<T>(dir: string, read: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true, timeout: 5000 });
-  try {
-    return read(db);
-  } finally {
-    db.close();
-  }
-}
 
 function waitUntil(done: () => boolean, what: string): void {
   const cell = new Int32Array(new SharedArrayBuffer(4));

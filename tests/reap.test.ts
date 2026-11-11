@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -17,7 +16,6 @@ import { MINUTE_MS } from '../src/registry/config.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { ownerKey } from '../src/registry/owner.ts';
 import { OWNER_CHECK_MS, REAP_RETRY_MS, RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
-import { databasePath } from '../src/registry/paths.ts';
 import type { Registry } from '../src/registry/registry.ts';
 import type { Lane, LaneStatus } from '../src/registry/types.ts';
 import { runRegistryCommand, type CliDeps } from '../src/registry-cli.ts';
@@ -32,6 +30,7 @@ import { FakeSim } from './devices/fake.ts';
 import { tempDir } from './support/fakes.ts';
 import type { World } from './support/world.ts';
 import { world } from './support/world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const PARK_MS = 30 * MINUTE_MS;
 const BUNDLE = 'com.example.fake';
@@ -114,7 +113,7 @@ function lines(file: string): string[] {
 }
 
 function history(w: World): { claim_id: string; reason: string }[] {
-  const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+  const db = openRegistryReadOnly(w.dir);
   try {
     return db
       .prepare('SELECT claim_id, reason FROM history ORDER BY seq')
@@ -908,7 +907,7 @@ test(
       } finally {
         old.close();
       }
-      const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+      const db = openRegistryReadOnly(w.dir);
       try {
         assert.deepEqual(
           db

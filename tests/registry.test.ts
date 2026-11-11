@@ -25,6 +25,7 @@ import type { FakeProcesses } from './support/fakes.ts';
 import { FakeProbe } from './support/fakes.ts';
 import type { World } from './support/world.ts';
 import { parkNow, waitForStep, world } from './support/world.ts';
+import { openRegistryReadOnly } from './support/registry-read.ts';
 
 const NO_DEVICE = { device: null } as const;
 const SHARED_BLOCKS = { metro: { first: 47600, last: 47603 }, api: { first: 47700, last: 47703 } };
@@ -54,7 +55,7 @@ function claimedBy(stdout: string): { id: string; device: string | null; serial:
 }
 
 function leaseRows(dir: string): number {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  const db = openRegistryReadOnly(dir);
   try {
     return Number(db.prepare('SELECT COUNT(*) AS n FROM device_leases').get()?.n);
   } finally {
@@ -929,7 +930,7 @@ test('a release whose simulator is slow to shut down holds neither the registry 
     await assert.rejects(registry.claim(laneRequest(s, 'taker', { platform: 'ios' })), { code: 'pool-busy' });
     assert.equal(s.sims.all().find(d => d.id === stopping)?.booted, true, 'the shutdown is still running');
 
-    const db = new DatabaseSync(databasePath(s.stateDir), { readOnly: true });
+    const db = openRegistryReadOnly(s.stateDir);
     try {
       assert.deepEqual(
         db.prepare('SELECT name FROM devices WHERE device_id IS NOT NULL AND claim_id IS NULL').all(),
@@ -1162,7 +1163,7 @@ async function releaseCutShort(w: World): Promise<{ id: string; name: string }> 
 }
 
 function poolRows(dir: string): { name: string; id: string | null }[] {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  const db = openRegistryReadOnly(dir);
   try {
     return db
       .prepare('SELECT name, device_id FROM devices ORDER BY name')
@@ -1350,7 +1351,7 @@ test('a stand-in name reused after an older snapshot is judged by the holder tha
 
     openProbe();
     await assert.rejects(late, { code: 'pool-busy' });
-    const held = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+    const held = openRegistryReadOnly(w.dir);
     try {
       assert.deepEqual(
         held
@@ -1469,7 +1470,7 @@ test("a release reads the process table only before it takes the registry's writ
 });
 
 function busyMb(dir: string): number {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  const db = openRegistryReadOnly(dir);
   try {
     const deleting = new Set(
       db
@@ -1566,7 +1567,7 @@ for (const idle of ['simulator', 'emulator'] as const) {
       const seen: { busy: number; free: boolean }[] = [];
       backend.during = call => {
         if (call !== 'shutdown') return;
-        const db = new DatabaseSync(databasePath(w.dir), { readOnly: true });
+        const db = openRegistryReadOnly(w.dir);
         try {
           const row = db.prepare('SELECT claim_id, device_id FROM devices WHERE name = ?').get(held.lane.device?.name ?? '');
           seen.push({ busy: busyMb(w.dir), free: row?.claim_id === null && row.device_id !== null });
@@ -1621,7 +1622,7 @@ function writeLocked(dir: string): boolean {
 }
 
 function committedLeasesOf(dir: string, holder: ProcessIdentity): number {
-  const db = new DatabaseSync(databasePath(dir), { readOnly: true });
+  const db = openRegistryReadOnly(dir);
   try {
     return Number(
       db
