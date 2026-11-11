@@ -10,7 +10,7 @@ import type { Ran } from '../src/driver/exec.ts';
 import type { EvidenceSystem } from '../src/evidence/device.ts';
 import { laneEvidence } from '../src/evidence/evidence.ts';
 import { readInProgress, writeInProgress } from '../src/evidence/files.ts';
-import { serveMcp } from '../src/mcp/server.ts';
+import { runDriverCommand } from '../src/driver-cli.ts';
 import type { ProcessTable } from '../src/processes.ts';
 import { identityOf, systemProcesses } from '../src/processes.ts';
 import { MINUTE_MS } from '../src/registry/config.ts';
@@ -159,14 +159,15 @@ test("with a dead owner and another session's MCP server running, the lane's ser
 
     const sweeps: Promise<SweepReport>[] = [];
     const input = new PassThrough();
-    const serving = serveMcp({
-      input,
+    const serving = runDriverCommand('mcp', [], {
+      env: { AGENTLANE_STATE_DIR: w.dir, PATH: process.env.PATH },
+      cwd: w.folder('b'),
+      stdout: () => undefined,
+      stderr: () => undefined,
+      stdin: input,
       output: new PassThrough(),
-      info: { name: 'agentlane', version: '0' },
-      tools: [],
-      call: () => Promise.reject(new Error('no tools here')),
-      every: {
-        ms: SWEEP_INTERVAL_MS,
+      processes: w.procs,
+      sweep: {
         run: () => {
           sweepTick({ dir: w.dir, clock: w.clock, processes: w.procs }, {}, () => sweeps.push(runSweep(sweepDeps(w))));
         },
@@ -192,7 +193,7 @@ test("with a dead owner and another session's MCP server running, the lane's ser
     assert.equal(statusOf(w, b.lane.id)?.park, null);
 
     input.end();
-    await serving;
+    assert.equal(await serving, 0);
   } finally {
     api.kill('SIGKILL');
     w.close();
