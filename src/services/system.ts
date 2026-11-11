@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ProcessTable } from '../processes.ts';
-import { systemProcesses } from '../processes.ts';
+import { runningStartTimes, systemProcesses } from '../processes.ts';
 
 export interface Descendant {
   pid: number;
@@ -11,6 +11,8 @@ export interface Descendant {
 
 export interface ServiceSystem {
   readonly processes: ProcessTable;
+  /** The start times of those of `pids` still running, by pid; a zombie is not running. */
+  running(pids: readonly number[]): ReadonlyMap<number, string> | undefined;
   spawnGroup(command: string, options: { cwd: string; env: NodeJS.ProcessEnv; log: string }): number;
   listeners(port: number): number[] | undefined;
   groups(pids: readonly number[]): ReadonlyMap<number, number> | undefined;
@@ -111,6 +113,7 @@ function deliver(target: number, signal: NodeJS.Signals): boolean {
 
 export const realServiceSystem: ServiceSystem = {
   processes: systemProcesses,
+  running: runningStartTimes,
 
   spawnGroup(command, options) {
     fs.mkdirSync(path.dirname(options.log), { recursive: true });

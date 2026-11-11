@@ -57,6 +57,7 @@ export async function startClaimedService(c: LaneServices, service: ServiceConfi
   try {
     const ready = await waitForService(deps.system, service, port, proc, deps.clock, log);
     c.registry.recordProcess(c.ref, ready);
+    if (ready.aliveAt !== undefined) c.registry.recordLeaderAlive(c.ref.id, ready, ready.aliveAt);
     return `started on ${String(port)} (pid ${String(proc.pid)}, log ${log})`;
   } catch (error) {
     await stopService(deps.system, proc, deps.clock);
