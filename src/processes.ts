@@ -19,6 +19,7 @@ export interface ProcessTable {
 
 const LSTART = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}`;
 const START_LINE = new RegExp(String.raw`^\s*(\d+)\s+(${LSTART})\s*$`);
+const RUNNING_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\S+)\s+(${LSTART})\s*$`);
 const INFO_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${LSTART})\s?(.*)$`);
 const START_ONLY = new RegExp(`^${LSTART}$`);
 
@@ -60,9 +61,28 @@ function lsofCwd(pid: number): string | undefined {
   return line?.slice(1);
 }
 
+function wantedPids(pids: readonly number[]): number[] {
+  return [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0);
+}
+
+/** The start times of those of `pids` still running. A zombie has exited, though ps lists it until it is reaped. */
+export function runningStartTimes(pids: readonly number[]): ReadonlyMap<number, string> | undefined {
+  const wanted = wantedPids(pids);
+  if (wanted.length === 0) return new Map();
+  const lines = ps('pid=,stat=,lstart=', wanted);
+  if (!lines) return undefined;
+  const table = new Map<number, string>();
+  for (const line of lines) {
+    const m = RUNNING_LINE.exec(line);
+    if (!m?.[1] || !m[2] || !m[3]) return undefined;
+    if (!m[2].startsWith('Z')) table.set(Number(m[1]), normalizeStart(m[3]));
+  }
+  return table;
+}
+
 export const systemProcesses: ProcessTable = {
   startTimes(pids) {
-    const wanted = [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0);
+    const wanted = wantedPids(pids);
     if (wanted.length === 0) return new Map();
     const lines = ps('pid=,lstart=', wanted);
     if (!lines) return undefined;

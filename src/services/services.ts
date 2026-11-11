@@ -33,7 +33,7 @@ export type StopOutcome =
   | { kind: 'already-gone' }
   | { kind: 'not-ours'; reason: string }
   | { kind: 'cant-tell'; reason: string; sent?: NodeJS.Signals }
-  | { kind: 'survived'; members: number[] };
+  | { kind: 'survived'; members: number[]; unproven?: number[] };
 
 export class ServiceFailed extends Error {
   readonly service: string;
@@ -48,7 +48,7 @@ export class ServiceFailed extends Error {
 const PROBE_TIMEOUT_MS = 2000;
 
 export function judgeLeader(system: ServiceSystem, proc: ServiceProcess): LeaderState {
-  const starts = system.processes.startTimes([proc.pid]);
+  const starts = system.running([proc.pid]);
   if (!starts) return 'cant-tell';
   const start = starts.get(proc.pid);
   if (start === undefined) return 'gone';
@@ -292,25 +292,29 @@ export async function stopService(
     group = [{ pid: proc.pid, start: proc.start }, ...found.filter(member => member.pid !== proc.pid)];
   }
   const strays = outsideGroup(system, proc.pid, leader === 'gone' ? group.map(member => member.pid) : [proc.pid]);
+  if ('unread' in strays) return { kind: 'cant-tell', reason: strays.unread };
   const proven = [...group, ...strays];
+  const provenPids = proven.map(p => p.pid);
   const left = (processes: readonly ProcessIdentity[]): number[] | undefined => {
-    const starts = system.processes.startTimes(processes.map(p => p.pid));
+    const starts = system.running(processes.map(p => p.pid));
     return starts === undefined ? undefined : processes.filter(p => starts.get(p.pid) === p.start).map(p => p.pid);
   };
-  const seen = { groupEveryPoll: true, lastOurs: proven.map(p => p.pid), lastInGroup: [] as number[] };
+  const seen = { groupEveryPoll: true, lastOurs: provenPids, lastInGroup: [] as number[] };
   const poll = (): StopPoll => {
     const provenLeft = left(proven);
     const inGroup = system.groupMembers(proc.pid);
     if (provenLeft) seen.lastOurs = provenLeft;
     if (inGroup !== undefined) seen.lastInGroup = inGroup;
-    const listed = inGroup !== undefined && inGroup.length > 0;
-    if (!listed) seen.groupEveryPoll = false;
-    if (listed && seen.groupEveryPoll) {
-      return { ours: provenLeft && [...inGroup, ...provenLeft.filter(pid => !inGroup.includes(pid))], unproven: [] };
+    if (inGroup === undefined || inGroup.length === 0) seen.groupEveryPoll = false;
+    if (provenLeft === undefined || inGroup === undefined) {
+      return { kind: 'unread', starts: provenLeft === undefined, group: inGroup === undefined };
     }
-    return { ours: provenLeft, unproven: inGroup && provenLeft && inGroup.filter(pid => !provenLeft.includes(pid)) };
+    if (seen.groupEveryPoll) {
+      return { kind: 'listed', inGroup, ours: [...inGroup, ...provenLeft.filter(pid => !inGroup.includes(pid))], unproven: [] };
+    }
+    return { kind: 'listed', inGroup, ours: provenLeft, unproven: inGroup.filter(pid => !provenLeft.includes(pid)) };
   };
-  const settled = (p: StopPoll) => p.ours?.length === 0 && p.unproven !== undefined;
+  const settled = (p: StopPoll) => p.kind === 'listed' && p.ours.length === 0;
   const waitSettled = async (ms: number): Promise<StopPoll> => {
     const until = clock.now() + ms;
     for (;;) {
@@ -319,29 +323,41 @@ export async function stopService(
       await clock.sleep(pollMs);
     }
   };
-  let sent: NodeJS.Signals = 'SIGTERM';
+  const killed = { group: false, pids: new Set<number>(), unread: false };
+  const sent = (): NodeJS.Signals => (killed.group || killed.pids.size > 0 ? 'SIGKILL' : 'SIGTERM');
   const outcome = (p: StopPoll): StopOutcome => {
-    if (p.ours === undefined || p.unproven === undefined) {
+    if (p.kind === 'unread') {
+      const failed = [
+        ...(p.starts ? [`read when processes ${provenPids.join(', ')} started`] : []),
+        ...(p.group ? [`list process group ${String(proc.pid)}`] : []),
+      ].join(', nor ');
       const pids = [...new Set([...seen.lastOurs, ...seen.lastInGroup])].join(' ');
-      const unlisted = `ps could not list what is left in process group ${String(proc.pid)}`;
       return {
         kind: 'cant-tell',
-        sent,
+        sent: sent(),
         reason:
           pids === ''
-            ? `${unlisted}, so it can't be proven stopped`
-            : `${unlisted}, so processes ${pids} can't be proven stopped; stop them with kill ${pids}`,
+            ? `ps could not ${failed}, so it can't be proven stopped`
+            : `ps could not ${failed}, so processes ${pids} can't be proven stopped; stop them with kill ${pids}`,
       };
     }
-    if (p.ours.length > 0) return { kind: 'survived', members: p.ours };
-    if (p.unproven.length > 0) {
-      return {
-        kind: 'cant-tell',
-        sent,
-        reason: `processes ${p.unproven.join(', ')} in a process group of id ${String(proc.pid)} can't be proven ours; stop them with kill ${p.unproven.join(' ')}`,
-      };
+    const sentKill = (pid: number) => killed.pids.has(pid) || (killed.group && p.inGroup.includes(pid));
+    const survivors = p.ours.filter(sentKill);
+    const unkilled = p.ours.filter(pid => !sentKill(pid));
+    if (unkilled.length > 0) {
+      const why = killed.unread ? ': ps could not read when they started, so they were' : ' and were';
+      const reason = [
+        `processes ${unkilled.join(', ')} remain${why} not sent SIGKILL; stop them with kill ${unkilled.join(' ')}`,
+        ...(survivors.length > 0 ? [`processes ${survivors.join(', ')} survived SIGKILL`] : []),
+        ...(p.unproven.length > 0 ? [unprovenLeft(proc.pid, p.unproven)] : []),
+      ];
+      return { kind: 'cant-tell', sent: sent(), reason: reason.join('; ') };
     }
-    return { kind: 'stopped', signal: sent };
+    if (survivors.length > 0) {
+      return { kind: 'survived', members: survivors, ...(p.unproven.length > 0 ? { unproven: p.unproven } : {}) };
+    }
+    if (p.unproven.length > 0) return { kind: 'cant-tell', sent: sent(), reason: unprovenLeft(proc.pid, p.unproven) };
+    return { kind: 'stopped', signal: sent() };
   };
   system.signalGroup(proc.pid, 'SIGTERM');
   for (const pid of left(strays) ?? []) system.signal(pid, 'SIGTERM');
@@ -350,24 +366,22 @@ export async function stopService(
   // A pid can't name a new process group while a group of that id lives (XBD 4.14), but polls only sample the group:
   // one listed with processes in it at every poll since SIGTERM may have emptied and been made anew between two polls
   // or since the last one. That window is bounded by one poll interval, not ruled out.
-  if (seen.groupEveryPoll) {
-    system.signalGroup(proc.pid, 'SIGKILL');
-    sent = 'SIGKILL';
-  }
-  for (const pid of left(proven) ?? []) {
-    system.signal(pid, 'SIGKILL');
-    sent = 'SIGKILL';
-  }
+  if (seen.groupEveryPoll) killed.group = system.signalGroup(proc.pid, 'SIGKILL');
+  const alive = left(proven);
+  killed.unread = alive === undefined;
+  for (const pid of alive ?? []) if (system.signal(pid, 'SIGKILL')) killed.pids.add(pid);
   return outcome(await waitSettled(2000));
 }
 
-interface StopPoll {
-  ours: number[] | undefined;
-  unproven: number[] | undefined;
+type StopPoll =
+  { kind: 'listed'; inGroup: number[]; ours: number[]; unproven: number[] } | { kind: 'unread'; starts: boolean; group: boolean };
+
+function unprovenLeft(pgid: number, pids: readonly number[]): string {
+  return `processes ${pids.join(', ')} in a process group of id ${String(pgid)} can't be proven ours; stop them with kill ${pids.join(' ')}`;
 }
 
 function withStarts(system: ServiceSystem, pids: readonly number[]): ProcessIdentity[] | undefined {
-  const starts = system.processes.startTimes(pids);
+  const starts = system.running(pids);
   if (!starts) return undefined;
   return pids.flatMap(pid => {
     const start = starts.get(pid);
@@ -394,19 +408,17 @@ function inOriginalGroup(proc: ServiceProcess, start: string): boolean {
 }
 
 /** The service's processes that left its process group, found while a process of the group still ties them to it. */
-function outsideGroup(system: ServiceSystem, pgid: number, roots: readonly number[]): ProcessIdentity[] {
+function outsideGroup(system: ServiceSystem, pgid: number, roots: readonly number[]): ProcessIdentity[] | { unread: string } {
   const below = new Map<number, number>();
   for (const root of roots) {
     if (below.has(root)) continue;
-    for (const d of system.descendants(root) ?? []) below.set(d.pid, d.pgid);
+    const descendants = system.descendants(root);
+    if (descendants === undefined) return { unread: `ps could not list the processes below pid ${String(root)}` };
+    for (const d of descendants) below.set(d.pid, d.pgid);
   }
   const pids = [...below].filter(([, group]) => group !== pgid).map(([pid]) => pid);
   if (pids.length === 0) return [];
-  const starts = system.processes.startTimes(pids);
-  return pids.flatMap(pid => {
-    const start = starts?.get(pid);
-    return start === undefined ? [] : [{ pid, start }];
-  });
+  return withStarts(system, pids) ?? { unread: `ps could not read when processes ${pids.join(', ')} started` };
 }
 
 export function describeStop(proc: ServiceProcess, outcome: StopOutcome): string {
@@ -422,6 +434,6 @@ export function describeStop(proc: ServiceProcess, outcome: StopOutcome): string
       if (outcome.sent === undefined) return `left ${who} alone: ${outcome.reason}`;
       return `sent ${outcome.sent === 'SIGKILL' ? 'SIGTERM, then SIGKILL,' : 'SIGTERM'} to ${who}, but ${outcome.reason}`;
     case 'survived':
-      return `${who} survived SIGKILL: processes ${outcome.members.join(', ')} remain`;
+      return `${who} survived SIGKILL: processes ${outcome.members.join(', ')} remain${outcome.unproven ? `; ${unprovenLeft(proc.pid, outcome.unproven)}` : ''}`;
   }
 }
