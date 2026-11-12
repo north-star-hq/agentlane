@@ -62,6 +62,16 @@ export function readUpRecord(dir: string): UpRecord | null {
   }
 }
 
+/**
+ * The folder a wake runs `up` from: the one holding the agentlane.json `up` last read for the lane, which can sit below
+ * the git root the lane is keyed by; the lane's worktree when no record names one, or that folder is gone.
+ */
+export function wakeFolder(stateDir: string, lane: { id: string; worktree: string }): string {
+  const config = readUpRecord(laneDir(stateDir, lane.id))?.config;
+  const folder = config ? path.dirname(config) : null;
+  return folder !== null && fs.existsSync(folder) ? folder : lane.worktree;
+}
+
 export function writeUpRecord(dir: string, record: UpRecord): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = recordFile(dir);

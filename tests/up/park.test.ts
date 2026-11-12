@@ -406,6 +406,62 @@ test('up on a parked lane brings it back and records it as awake', async t => {
   assert.equal(laneOf(w, first.lane.id).park, null);
 });
 
+/** A world whose agentlane.json sits in `app/` below the git root, as a monorepo or the example app has it. */
+function subfolderWorld(t: Parameters<typeof world>[0]): { w: World; app: string } {
+  const w = deviceWorld(t);
+  const app = path.join(w.project, 'app');
+  fs.mkdirSync(app);
+  fs.renameSync(path.join(w.project, 'agentlane.json'), path.join(app, 'agentlane.json'));
+  fs.copyFileSync(path.join(w.project, 'app.json'), path.join(app, 'app.json'));
+  return { w, app };
+}
+
+test('a call from the subfolder holding agentlane.json wakes a parked lane, though the lane is keyed by the git root', async t => {
+  const { w, app } = subfolderWorld(t);
+  const first = await up(w.deps({ cwd: app }), OPTIONS);
+  assert.equal(first.lane.worktree, w.project);
+  await parked(w, first.lane);
+  assert.equal(await execInLane(w.deps({ cwd: app }), ['true']), 0, w.lines.join('\n'));
+  const awake = laneOf(w, first.lane.id);
+  assert.equal(awake.park, null);
+  assert.equal(awake.device?.id, first.lane.device?.id);
+  assert.equal(w.sim.devices.get(first.lane.device?.id ?? '')?.info.state, 'Booted');
+});
+
+test('a lane parked with an up record an earlier build wrote, without the fields added since, wakes from its subfolder', async t => {
+  const { w, app } = subfolderWorld(t);
+  const first = await up(w.deps({ cwd: app }), OPTIONS);
+  await parked(w, first.lane);
+  fs.writeFileSync(
+    path.join(laneDir(w.state, first.lane.id), 'up.json'),
+    JSON.stringify({
+      version: 1,
+      lane: first.lane.id,
+      config: path.join(app, 'agentlane.json'),
+      platform: 'ios',
+      bundleId: BUNDLE,
+      launch: 'hook',
+      pinned: false,
+      updatedAt: Date.now(),
+    }),
+  );
+  assert.equal(await execInLane(w.deps({ cwd: app }), ['true']), 0, w.lines.join('\n'));
+  assert.equal(laneOf(w, first.lane.id).park, null);
+});
+
+test('a wake that finds no agentlane.json names the folder it searched, in the error and in the fix', async t => {
+  const { w, app } = subfolderWorld(t);
+  const first = await up(w.deps({ cwd: app }), OPTIONS);
+  await parked(w, first.lane);
+  fs.rmSync(path.join(app, 'agentlane.json'));
+  await assert.rejects(execInLane(w.deps({ cwd: app }), ['true']), (error: Error) => {
+    assert.match(error.message, new RegExp(`could not bring lane ${first.lane.id} back: no agentlane.json in ${app} `));
+    assert.match(error.message, new RegExp(`up in ${app} shows each step`));
+    return true;
+  });
+  assert.equal(laneOf(w, first.lane.id).park?.state, 'parked');
+});
+
 const SIGNIN_SITE = path.join(import.meta.dirname, '..', 'fixtures', 'signin-site');
 
 test("a browser lane's park stops its browser and its web service but keeps the login, and its next call opens both again", async t => {
