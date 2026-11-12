@@ -7,7 +7,7 @@ import { int, optInt, optText, text } from './store.ts';
 /** How long a lane stays parked, after its owner is found gone, for that owner's session to come back before it ends. */
 export const RETURN_WINDOW_MS = 30 * 60_000;
 /** How long a sighting of a lane's owner, by a check or by a call on the lane, spares the owner a check of its process. */
-export const OWNER_CHECK_MS = 4 * 60_000;
+export const OWNER_CHECK_MS = 3 * 60_000;
 /** How long an end of a lane may stand unfinished before the sweep asks whether the process ending it still runs. */
 export const REAP_RETRY_MS = 5 * 60_000;
 

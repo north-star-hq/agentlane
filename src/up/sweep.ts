@@ -38,7 +38,7 @@ export const SWEEP_COMMAND = 'sweep';
 /** How long after starting a sweeper the commands passing by leave the sweep to it. */
 export const SWEEP_RESPAWN_MS = 2 * 60_000;
 /** How often each running MCP server passes by, for every lane on the Mac. */
-export const SWEEP_INTERVAL_MS = 5 * 60_000;
+export const SWEEP_INTERVAL_MS = 60_000;
 export const SWEEP_LOG_MAX_BYTES = 1024 * 1024;
 /**
  * How old the moment a lane's service leader was last seen running may grow before a sweep is due to look again. A stop
@@ -134,9 +134,10 @@ function reapDue(lane: SweptLane, now: number): boolean {
  * Whether the sweep has work: an owner no check or call has shown alive lately, a lane whose owner is gone to park or
  * end, a lane no hold keeps up to park, or one a park or wake left partway; a service leader not seen running lately;
  * a device recorder an ended lane left marked as running. One read of the registry, plus the lane-folder call record
- * of each lane the registry has as unused and the lane folders' list; no process starts.
+ * of each lane the registry has as unused and the lane folders' list; no process starts. With `runningSince`, the start
+ * of a sweep still running, only an owner check that fell due after that start counts, since that sweep covers the rest.
  */
-export function sweepDue(site: SweepSite): boolean {
+export function sweepDue(site: SweepSite, runningSince?: number): boolean {
   if (!fs.existsSync(databasePath(site.dir))) return false;
   const now = (site.clock ?? systemClock).now();
   const registry = Registry.open({
@@ -151,6 +152,9 @@ export function sweepDue(site: SweepSite): boolean {
     const idleSince = now - registry.config.parkMs;
     const folders = laneFolderIds(site.dir);
     const lanes = registry.sweepList();
+    if (runningSince !== undefined) {
+      return lanes.some(l => unseen(site.dir, l, now) && !unseen(site.dir, l, runningSince));
+    }
     const gone = new Set(lanes.filter(l => l.gone).map(l => l.ref.id));
     if (lanes.some(l => (l.gone ? goneParkDue(l, now) || reapDue(l, now) : unseen(site.dir, l, now)))) return true;
     if (aliveRefreshDue(registry, readMark(site.dir), now)) return true;
@@ -164,15 +168,16 @@ export function sweepDue(site: SweepSite): boolean {
 }
 
 /**
- * The sweep every command runs as it passes by: when there is work and no sweeper started lately, it starts one with
- * `start`, which does the work in a process of its own, so the command never waits on it. It never fails the command.
+ * The sweep every command runs as it passes by: when there is work no sweeper started lately covers, it starts one
+ * with `start`, which does the work in a process of its own, so the command never waits on it. It never fails the
+ * command.
  */
 export function passBy(site: SweepSite, start: (dir: string) => void): boolean {
   try {
     const now = (site.clock ?? systemClock).now();
     const mark = readMark(site.dir);
-    if (mark?.finishedAt === null && now - mark.startedAt < SWEEP_RESPAWN_MS) return false;
-    if (!sweepDue(site)) return false;
+    const running = mark?.finishedAt === null && now - mark.startedAt < SWEEP_RESPAWN_MS ? mark.startedAt : undefined;
+    if (!sweepDue(site, running)) return false;
     writeMark(site.dir, { startedAt: now, finishedAt: null });
     start(site.dir);
     return true;
