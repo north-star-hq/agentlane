@@ -136,7 +136,7 @@ The session-end hook releases at once, with no window, because it reports that t
 
 ### The sweep
 
-There is no daemon and nothing to install. Every agentlane command checks, as it starts, whether the sweep has work to do, from one registry read. When it does, the command starts the sweep in a process of its own and carries on without waiting. Each running MCP server does the same every 5 minutes. The sweep:
+There is no daemon and nothing to install. Every agentlane command checks, as it starts, whether the sweep has work to do, from one registry read. When it does, the command starts the sweep in a process of its own and carries on without waiting. Each running MCP server does the same every minute. The sweep:
 
 - parks the lanes past the park window that no hold keeps up;
 - asks the process table about the owners that no call or check has shown alive in the last few minutes, and parks the lanes of those that are gone;

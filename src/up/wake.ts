@@ -10,6 +10,7 @@ import { tcpProbe } from '../registry/ports.ts';
 import { NotClaimed, Refusal } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
+import { wakeFolder } from './lane-files.ts';
 import { attemptId, deadHolder } from './park.ts';
 
 /** How long a call waits on another call parking or waking its lane. */
@@ -127,7 +128,7 @@ export async function enterLane(
   if (!wake) {
     throw new NotClaimed(
       `lane ${lane.id} is parked: it went unused, so its device went back to the pool and its services stopped, and this call can't bring them back`,
-      `${CLI} up   (run in ${lane.worktree}; it brings back ${describeRestarts(park.restarts)})`,
+      `${CLI} up   (run in ${wakeFolder(entry.stateDir, lane)}; it brings back ${describeRestarts(park.restarts)})`,
     );
   }
   const handle = await takeLane(entry, { id: lane.id, token: lane.token });
@@ -145,7 +146,7 @@ export async function enterLane(
     if (failure !== null) {
       throw new DriverError(
         `could not bring lane ${lane.id} back: ${messageOf(failure)}`,
-        `fix that and call again: the lane stays parked, and its next call tries again (${CLI} up in ${lane.worktree} shows each step)`,
+        `fix that and call again: the lane stays parked, and its next call tries again (${CLI} up in ${wakeFolder(entry.stateDir, lane)} shows each step)`,
       );
     }
   }

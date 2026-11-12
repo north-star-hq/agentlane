@@ -14,7 +14,7 @@ npx agentlane mcp
 
 The server speaks MCP over stdio. It finds the lane from the agent session that started it and the folder it runs in, so no tool takes a device id or a browser session, and no tool can reach another lane. A tool called before the session has a lane answers with the command that makes one. A tool called on a parked lane brings the lane back first, and every call counts toward the lane's last use.
 
-While it runs, the server checks every 5 minutes whether the lanes on the machine need the sweep, which parks unused lanes and ends those whose owner is gone, and starts it in a process of its own when they do, so its tool calls never wait on it. [What a lane holds](lanes.md#the-sweep) describes the sweep.
+While it runs, the server checks every minute whether the lanes on the machine need the sweep, which parks unused lanes and ends those whose owner is gone, and starts it in a process of its own when they do, so its tool calls never wait on it. [What a lane holds](lanes.md#the-sweep) describes the sweep.
 
 The server serves the whole agent session. When one session holds lanes in several folders, as parallel subagents in their own worktrees do, each subagent should run `look`, `run` and `screenshot` as shell commands from its own worktree, or pass them `--worktree <dir>`.
 

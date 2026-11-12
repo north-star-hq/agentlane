@@ -13,11 +13,13 @@ import { runDriverCommand } from '../src/driver-cli.ts';
 import type { ProcessTable } from '../src/processes.ts';
 import { identityOf, systemProcesses } from '../src/processes.ts';
 import { MINUTE_MS } from '../src/registry/config.ts';
+import { formatAge } from '../src/registry/format.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { ownerKey } from '../src/registry/owner.ts';
 import { OWNER_CHECK_MS, REAP_RETRY_MS, RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
 import type { Registry } from '../src/registry/registry.ts';
 import type { Lane, LaneStatus } from '../src/registry/types.ts';
+import { touchLane } from '../src/registry/touch.ts';
 import { runRegistryCommand, type CliDeps } from '../src/registry-cli.ts';
 import { realServiceSystem } from '../src/services/system.ts';
 import { resolveCallerLane } from '../src/driver/caller.ts';
@@ -145,7 +147,7 @@ function cliDeps(w: World, out: string[], over: Partial<CliDeps> = {}): CliDeps 
   };
 }
 
-test("with a dead owner and another session's MCP server running, the lane's servers and device are gone within one sweep interval", async () => {
+test("with a dead owner and another session's MCP server running, the lane's servers and device are gone at the server's first tick once the owner is due a check", async () => {
   const w = world();
   const api = service();
   try {
@@ -174,13 +176,22 @@ test("with a dead owner and another session's MCP server running, the lane's ser
       },
     });
 
+    const claimed = w.clock.now();
     await w.clock.advance(SWEEP_INTERVAL_MS - 1);
     assert.equal(sweeps.length, 0, 'no sweep before the interval');
-    assert.equal(running(api.pid ?? 0), true);
     await w.clock.advance(1);
-    assert.equal(sweeps.length, 1, 'the MCP server swept once the interval passed');
-    const report = await sweeps[0];
-    assert.deepEqual(report?.found, [{ lane: a.lane.id, state: 'dead' }]);
+    while (w.clock.now() - claimed < OWNER_CHECK_MS) {
+      const reports = await Promise.all(sweeps);
+      assert.deepEqual(
+        reports.flatMap(r => r.found),
+        [],
+        'no sweep checks the owner while the claim shows it alive lately',
+      );
+      assert.equal(running(api.pid ?? 0), true);
+      await w.clock.advance(SWEEP_INTERVAL_MS);
+    }
+    const report = await sweeps.at(-1);
+    assert.deepEqual(report?.found, [{ lane: a.lane.id, state: 'dead' }], 'the first tick once the owner was due a check');
 
     await until(() => !running(api.pid ?? 0));
     const lane = statusOf(w, a.lane.id);
@@ -925,3 +936,102 @@ test(
     }
   },
 );
+
+/** The docs' promise: while an agentlane MCP server runs, a dead owner's lane is found this soon after the death. */
+const FOUND_WITHIN_MS = 5 * MINUTE_MS;
+
+/**
+ * Shows a lane's owner alive by a call on the lane, or by another server's check of it, kills the owner a second later,
+ * and ticks one MCP server every SWEEP_INTERVAL_MS from `phase` after the death: how long after the death a sweep
+ * found the owner gone.
+ */
+async function foundAfterDeath(sighting: 'call' | 'check', phase: number): Promise<number> {
+  const w = world();
+  try {
+    const owner = w.procs.owner();
+    const { lane } = await w.registry().claim(w.request(owner, w.folder('a')));
+    await w.clock.advance(10 * MINUTE_MS);
+    const site = { dir: w.dir, clock: w.clock, processes: w.procs };
+    if (sighting === 'call') assert.equal(touchLane(site, refOf(lane), 'look'), true);
+    else assert.deepEqual((await runSweep(sweepDeps(w))).checked, [lane.id], "the other server's sweep checked the owner");
+    await w.clock.advance(1000);
+    kill(w, owner);
+    const died = w.clock.now();
+    await w.clock.advance(phase);
+    while (w.clock.now() - died <= 3 * FOUND_WITHIN_MS) {
+      const sweeps: Promise<SweepReport>[] = [];
+      sweepTick(site, {}, () => sweeps.push(runSweep(sweepDeps(w))));
+      const reports = await Promise.all(sweeps);
+      if (reports.some(r => r.found.some(f => f.lane === lane.id))) return w.clock.now() - died;
+      await w.clock.advance(SWEEP_INTERVAL_MS);
+    }
+    return Number.POSITIVE_INFINITY;
+  } finally {
+    w.close();
+  }
+}
+
+/** foundAfterDeath for ten phases of the server's ticks spread over one interval. */
+async function foundAtEachPhase(sighting: 'call' | 'check'): Promise<number[]> {
+  const found: number[] = [];
+  for (let phase = 0; phase < SWEEP_INTERVAL_MS; phase += SWEEP_INTERVAL_MS / 10) {
+    found.push(await foundAfterDeath(sighting, phase));
+  }
+  return found;
+}
+
+test('an owner that dies just after a call on its lane is found gone within 5 minutes by a running MCP server, whatever the phase of its ticks', async () => {
+  const found = await foundAtEachPhase('call');
+  assert.ok(
+    found.every(ms => ms <= FOUND_WITHIN_MS),
+    `found after ${found.map(formatAge).join(', ')}`,
+  );
+});
+
+test("an owner that dies just after another server's check is found gone within 5 minutes by a running MCP server, whatever the phase of its ticks", async () => {
+  const found = await foundAtEachPhase('check');
+  assert.ok(
+    found.every(ms => ms <= FOUND_WITHIN_MS),
+    `found after ${found.map(formatAge).join(', ')}`,
+  );
+});
+
+test('an owner check that falls due while an earlier sweep still runs starts a sweep of its own; work that sweep covers does not', async () => {
+  const w = world();
+  try {
+    const owner = w.procs.owner();
+    const { lane } = await w.registry().claim(w.request(owner, w.folder('a')));
+    await w.registry().claim(w.request(w.procs.owner(), w.folder('b')));
+    await w.clock.advance(10 * MINUTE_MS);
+    const site = { dir: w.dir, clock: w.clock, processes: w.procs };
+    assert.equal(touchLane(site, refOf(lane), 'look'), true);
+    await w.clock.advance(1000);
+    kill(w, owner);
+
+    await w.clock.advance(OWNER_CHECK_MS - 2000);
+    assert.equal(
+      passBy(site, () => undefined),
+      true,
+      "a sweep starts for b's owner and runs on",
+    );
+    assert.equal(
+      passBy(site, () => assert.fail('a second sweep started for the work the first covers')),
+      false,
+    );
+
+    await w.clock.advance(1000);
+    const sweeps: Promise<SweepReport>[] = [];
+    assert.equal(
+      passBy(site, () => sweeps.push(runSweep(sweepDeps(w)))),
+      true,
+      "a's owner fell due for a check after the running sweep started",
+    );
+    const [report] = await Promise.all(sweeps);
+    assert.ok(
+      report?.found.some(f => f.lane === lane.id),
+      JSON.stringify(report),
+    );
+  } finally {
+    w.close();
+  }
+});

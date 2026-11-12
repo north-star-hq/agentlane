@@ -1,7 +1,7 @@
 import { stateDir } from '../registry/paths.ts';
 import { Registry } from '../registry/registry.ts';
 import type { EnvDeps } from './deps.ts';
-import { laneDir, readUpRecord } from './lane-files.ts';
+import { laneDir, readUpRecord, wakeFolder } from './lane-files.ts';
 import { up } from './up.ts';
 import type { LaneWaker } from './wake.ts';
 
@@ -17,10 +17,11 @@ export function upWaker(deps: EnvDeps): LaneWaker {
     const state = stateDir(deps.env);
     const record = readUpRecord(laneDir(state, lane.id));
     if (record) {
+      const folder = wakeFolder(state, lane);
       for (const platform of record.platforms ?? [record.platform]) {
         await up(
-          { ...deps, cwd: lane.worktree },
-          { setup: false, cacheMode: 'use', waitMs: WAKE_WAIT_MS, worktree: lane.worktree, platform, waking: true },
+          { ...deps, cwd: folder },
+          { setup: false, cacheMode: 'use', waitMs: WAKE_WAIT_MS, worktree: folder, platform, waking: true },
         );
       }
       return;
