@@ -73,6 +73,10 @@ A lane now gives its simulator or emulator back when nobody uses it, and ends on
 - `prune --yes` reports what happened when its registry lock fails to commit after a step: a 0.2.x folder it took for removal is deleted and reported deleted, and one it put back for a 0.2.x lane is reported put back.
 - On Linux, a reap or release stops the services of a lane whose worktree folder was deleted. It used to leave them running, with `pid N is no longer in <folder>`, because Linux names a deleted working folder with ` (deleted)` after it.
 
+### Known issues
+
+- **An interactive Codex session's lane never ends on its own.** Codex runs a thread's commands under its shared `codex app-server`, so the lane records no process for its owner (`codex thread <id> (no process recorded)`) and the sweep can't tell when the thread is gone. The lane parks once it goes unused and stays parked, and `status` shows `left alone: its owner can't be judged`. To free it, run `agentlane release` in the lane's folder from the Codex thread that holds it, or `agentlane release --lane <id> --force` from any shell.
+
 ## 0.4.1
 
 ### Changed
