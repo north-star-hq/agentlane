@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -172,6 +172,18 @@ function firstLine(text: string): string {
   return text.trim().split('\n', 1)[0] ?? '';
 }
 
+// spawnSync reports EPIPE when the child exits before taking all its input, and still sets the status or signal it waited for.
+function wasWaitedFor(result: SpawnSyncReturns<string>): boolean {
+  const code = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EPIPE' && (result.status !== null || result.signal !== null);
+}
+
+export function hookExit(result: SpawnSyncReturns<string>): string {
+  if (result.error && !wasWaitedFor(result)) return `failed to run: ${result.error.message}`;
+  if (result.status === null) return `was stopped by ${String(result.signal)}`;
+  return `exited ${String(result.status)}${result.stderr.trim() ? `: ${firstLine(result.stderr)}` : ''}`;
+}
+
 function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJS.ProcessEnv): HookCheck {
   const name = `hooks ${agent}`;
   const token = crypto.randomBytes(8).toString('hex');
@@ -185,11 +197,7 @@ function probe(root: string, agent: Agent, route: Route, bin: string, env: NodeJ
   const last = readHookMark(stateDir(env), agent, root);
   const mark = last?.probe === token ? last : null;
   const how = `doctor ran the guard hook in ${route.where} on a command it allows, and it`;
-  const exit = result.error
-    ? `failed to run: ${result.error.message}`
-    : result.status === null
-      ? `was stopped by ${String(result.signal)}`
-      : `exited ${String(result.status)}${result.stderr.trim() ? `: ${firstLine(result.stderr)}` : ''}`;
+  const exit = hookExit(result);
   if (mark && result.status === 0) return { name, ok: true, detail: ran(mark, how), fix: '' };
   const toolkit = toolkitManifest(bin);
   const fix = missingFix(route, toolkit, agent) ?? `${CLI} init --agents ${agent}, then ${CLI} doctor`;

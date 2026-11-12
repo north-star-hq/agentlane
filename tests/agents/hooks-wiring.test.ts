@@ -6,7 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import { runAgentCommand } from '../../src/agents/cli.ts';
-import { agentHookChecks, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts';
+import { agentHookChecks, hookExit, MARK_MAX_AGE_MS } from '../../src/agents/hook-check.ts';
 import { GUARDED_WORDS, hookCommand, UNSPLIT_SED } from '../../src/agents/launcher.ts';
 import { toolVersion } from '../../src/agents/package.ts';
 import { aimsOf } from '../../src/plugin/aims.ts';
@@ -960,4 +960,24 @@ test('doctor says when the toolkit a hook runs is too old to leave a mark, and t
   } finally {
     f.cleanup();
   }
+});
+
+test("doctor names a hook's exit status and stderr, or its signal, when the hook exits before reading its input", () => {
+  const unread = 'x'.repeat(1 << 20);
+  const run = (command: string) => spawnSync('/bin/sh', ['-c', command], { input: unread, encoding: 'utf8' });
+
+  const missing = run('echo "sh: 1: agentlane: not found" >&2; exit 127');
+  assert.equal((missing.error as NodeJS.ErrnoException | undefined)?.code, 'EPIPE');
+  assert.equal(hookExit(missing), 'exited 127: sh: 1: agentlane: not found');
+
+  const killed = run('kill -TERM $$');
+  assert.equal((killed.error as NodeJS.ErrnoException | undefined)?.code, 'EPIPE');
+  assert.equal(hookExit(killed), 'was stopped by SIGTERM');
+
+  assert.equal(hookExit(run('cat >/dev/null; exit 0')), 'exited 0');
+  assert.match(hookExit(spawnSync('/no/such/shell', [], { input: unread, encoding: 'utf8' })), /^failed to run: .*ENOENT/);
+  assert.match(
+    hookExit(spawnSync('/bin/sh', ['-c', 'sleep 5'], { encoding: 'utf8', timeout: 100 })),
+    /^failed to run: .*ETIMEDOUT/,
+  );
 });
