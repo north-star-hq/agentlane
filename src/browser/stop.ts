@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Clock } from '../clock.ts';
+import { environmentOf } from '../processes.ts';
 import type { BrowserPaths } from './paths.ts';
 
 export interface ProcessEntry {
@@ -26,22 +27,6 @@ export interface BrowserMarks {
 
 const SEARCH_PATH = `${process.env.PATH ?? ''}:/usr/bin:/bin`;
 
-function readEnviron(pid: number): string | undefined {
-  if (process.platform === 'linux') {
-    try {
-      return fs.readFileSync(`/proc/${String(pid)}/environ`, 'utf8').replaceAll('\0', ' ');
-    } catch {
-      return undefined;
-    }
-  }
-  const result = spawnSync('ps', ['eww', '-o', 'command=', '-p', String(pid)], {
-    encoding: 'utf8',
-    env: { PATH: SEARCH_PATH, LC_ALL: 'C' },
-    timeout: 10_000,
-  });
-  return result.status === 0 ? result.stdout : undefined;
-}
-
 export const realBrowserProcesses: BrowserProcessSystem = {
   list() {
     const result = spawnSync('ps', ['-A', '-ww', '-o', 'pid=,ppid=,pgid=,args='], {
@@ -58,7 +43,7 @@ export const realBrowserProcesses: BrowserProcessSystem = {
     }
     return entries;
   },
-  environment: readEnviron,
+  environment: environmentOf,
   signal(pid, signal) {
     try {
       process.kill(pid, signal);

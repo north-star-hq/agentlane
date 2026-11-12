@@ -13,11 +13,43 @@ export const STATE_DIR_ENV = envName('STATE_DIR');
 export function stateDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[STATE_DIR_ENV];
   if (override) return path.resolve(override);
-  const xdg = env.XDG_STATE_HOME;
-  const base = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.local', 'state');
-  const own = path.join(base, TOOL);
-  const former = path.join(base, FORMER.tool);
+  const own = path.join(stateBase(env), TOOL);
+  const former = formerStateDir(env);
   return !fs.existsSync(databasePath(own)) && fs.existsSync(databasePath(former)) ? former : own;
+}
+
+function homeStateBase(env: NodeJS.ProcessEnv): string {
+  return path.join(env.HOME && path.isAbsolute(env.HOME) ? env.HOME : os.homedir(), '.local', 'state');
+}
+
+function stateBase(env: NodeJS.ProcessEnv): string {
+  const xdg = env.XDG_STATE_HOME;
+  return xdg && path.isAbsolute(xdg) ? xdg : homeStateBase(env);
+}
+
+function stateBases(env: NodeJS.ProcessEnv): string[] {
+  return [...new Set([stateBase(env), homeStateBase(env)])];
+}
+
+function formerStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(stateBase(env), FORMER.tool);
+}
+
+export const FORMER_STATE_DIR_ENV = `${FORMER.envPrefix}_STATE_DIR`;
+
+export function formerRegistryDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const override = env[FORMER_STATE_DIR_ENV];
+  return [
+    ...new Set([...(override ? [path.resolve(override)] : []), ...stateBases(env).map(base => path.join(base, FORMER.tool))]),
+  ];
+}
+
+export function isFormerRegistryDir(env: NodeJS.ProcessEnv, dir: string): boolean {
+  return path.basename(dir) === FORMER.tool || formerRegistryDirs(env).includes(dir);
+}
+
+export function registryDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  return [...new Set([stateDir(env), ...stateBases(env).map(base => path.join(base, TOOL)), ...formerRegistryDirs(env)])];
 }
 
 export interface DiskNames {

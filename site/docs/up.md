@@ -97,3 +97,5 @@ npx agentlane release
 ```
 
 `release` in the same folder stops exactly the processes `up` started, the browser and its driver included, runs the teardown hook and each resource's teardown, and frees the lane. The evidence folder stays. When the session ends, its hook does this for you.
+
+`up` on a [parked](lanes.md#parking) lane brings back its device, its services and its app on the same ports, with the same data.

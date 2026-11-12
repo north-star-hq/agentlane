@@ -10,7 +10,7 @@ import type { EngineConfig, EngineRequest, EngineResponse } from './engine.ts';
 import { DriverError } from './errors.ts';
 import { isAlive, tail } from './exec.ts';
 import { describeIdle, readDriverSettings, takeIdleStop, type IdleStop } from './idle.ts';
-import { ensureMaestro, findJdk17, MAESTRO_OVERRIDE_ENV } from './install.ts';
+import { ensureMaestro, findJdk17, MAESTRO_OVERRIDE_ENV, type InstallOptions } from './install.ts';
 import { liveHolder, lockHolder, tryLock } from './lock.ts';
 import { enginePaths, ensurePrivateDir, type EnginePaths } from './paths.ts';
 
@@ -29,8 +29,15 @@ export interface EngineTarget {
   progress?: (line: string) => void;
   /** Skips the install and JDK lookup; for tests. */
   toolchain?: Toolchain;
+  /** A JDK 17 home the caller already found, which skips the JDK lookup. */
+  javaHome?: string;
+  /** The Maestro release, its download and the JDK search; for tests. */
+  install?: Pick<InstallOptions, 'release' | 'download' | 'searchJdk17'>;
   /** Engine timings; for tests. `idleMs` overrides the Mac's driver.json. */
-  tuning?: Pick<EngineConfig, 'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'>;
+  tuning?: Pick<
+    EngineConfig,
+    'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'heartbeatMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'
+  >;
   /** For judging whether a release in progress still runs; the system's process table when absent. */
   processes?: ProcessTable;
 }
@@ -117,13 +124,17 @@ function send(paths: EnginePaths, request: EngineRequest, timeoutMs: number): Pr
   });
 }
 
-async function resolveToolchain(target: EngineTarget): Promise<Toolchain> {
+export async function resolveToolchain(target: EngineTarget): Promise<Toolchain> {
   if (target.toolchain) return target.toolchain;
-  const jdk = await findJdk17(target.env);
+  const javaHome = target.javaHome ?? (await findJdk17(target.env, target.install?.searchJdk17)).javaHome;
   const override = target.env[MAESTRO_OVERRIDE_ENV];
-  if (override) return { maestro: override, javaHome: jdk.javaHome };
-  const installed = await ensureMaestro({ env: target.env, ...(target.progress ? { log: target.progress } : {}) });
-  return { maestro: installed.binary, javaHome: jdk.javaHome };
+  if (override) return { maestro: override, javaHome };
+  const installed = await ensureMaestro({
+    ...target.install,
+    env: target.javaHome === undefined ? target.env : { ...target.env, JAVA_HOME: javaHome },
+    ...(target.progress ? { log: target.progress } : {}),
+  });
+  return { maestro: installed.binary, javaHome };
 }
 
 function refOf(lane: Lane): { id: string; token: string } {

@@ -109,7 +109,8 @@ export async function driverWorld(options: WorldOptions = {}): Promise<DriverWor
   const root = fs.realpathSync(tempDir('driver'));
   const stateDir = path.join(root, 'state');
   const worktree = path.join(root, 'work');
-  fs.mkdirSync(worktree, { recursive: true });
+  const home = path.join(root, 'home');
+  for (const dir of [worktree, home]) fs.mkdirSync(dir, { recursive: true });
   const owner = sleeper();
   let ownerIdentity: ProcessIdentity | undefined;
   await until(() => (ownerIdentity = identityOf(systemProcesses, owner.pid ?? 0)) !== undefined, 5000, 'the owner process');
@@ -142,7 +143,7 @@ export async function driverWorld(options: WorldOptions = {}): Promise<DriverWor
   const log = path.join(root, 'maestro-events.jsonl');
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
-    HOME: process.env.HOME,
+    HOME: home,
     FAKE_LOG: log,
     FAKE_STATE: path.join(root, 'screen.txt'),
     FAKE_START: options.start ?? 'settings',

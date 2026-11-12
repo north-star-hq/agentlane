@@ -10,8 +10,11 @@ import type { PortProbe } from '../registry/ports.ts';
 import type { ServiceSystem } from '../services/system.ts';
 import type { Toolchain } from './preflight.ts';
 
-/** Starts the lane's driver engine and reads the screen once, so the agent's first look is warm. */
-export type DriverStarter = (lane: Lane, stateDir: string) => Promise<void>;
+/**
+ * Starts the lane's driver engine and reads the screen once, so the agent's first look is warm. `javaHome` is a JDK 17
+ * home already found; the driver searches for one when it is absent.
+ */
+export type DriverStarter = (lane: Lane, stateDir: string, javaHome?: string) => Promise<void>;
 
 export interface EnvDeps {
   env: NodeJS.ProcessEnv;
@@ -31,6 +34,10 @@ export interface EnvDeps {
   evidence?: EvidenceSystem;
   clock: Clock;
   pollMs?: number;
+  /** How often a long `exec` command or `up` hook counts as a call on the lane while it runs; HEARTBEAT_MS when absent. */
+  heartbeatMs?: number;
   selfPid?: number;
   onCancel?: (cancel: () => void) => () => void;
+  /** Starts the sweep when it has work, as every command does at its start; a claim calls it when it finds work for it. */
+  passBy?: () => void;
 }

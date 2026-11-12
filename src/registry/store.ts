@@ -37,8 +37,70 @@ CREATE TABLE IF NOT EXISTS browsers (
   worktree TEXT NOT NULL,
   created_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS process_alive (
+  claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+  service TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  start TEXT NOT NULL,
+  alive_at INTEGER NOT NULL,
+  PRIMARY KEY (claim_id, service)
+) STRICT;
+CREATE TABLE IF NOT EXISTS device_leases (
+  reservation TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  device_type TEXT NOT NULL,
+  device_type_name TEXT NOT NULL,
+  runtime TEXT NOT NULL,
+  runtime_name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  work TEXT NOT NULL,
+  holder_pid INTEGER NOT NULL,
+  holder_start TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  console_port INTEGER
+) STRICT;
+CREATE TABLE IF NOT EXISTS parks (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+  state TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  parked_at INTEGER,
+  holder_pid INTEGER,
+  holder_start TEXT,
+  attempt TEXT,
+  restarts TEXT NOT NULL,
+  problems TEXT NOT NULL,
+  CHECK (state IN ('parking', 'parked', 'waking')),
+  CHECK ((holder_pid IS NULL) = (state = 'parked') AND (holder_pid IS NULL) = (holder_start IS NULL)
+    AND (holder_pid IS NULL) = (attempt IS NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS holds (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+  owner_key TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  until INTEGER NOT NULL,
+  CHECK (until > since)
+) STRICT;
+CREATE TABLE IF NOT EXISTS owner_checks (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(id) ON DELETE CASCADE,
+  owner_key TEXT NOT NULL,
+  checked_at INTEGER,
+  gone TEXT,
+  gone_at INTEGER,
+  reaper_pid INTEGER,
+  reaper_start TEXT,
+  reaping_since INTEGER,
+  attempt TEXT,
+  CHECK (gone IS NULL OR gone IN ('dead', 'pid-reused', 'worktree-gone')),
+  CHECK ((gone IS NULL) = (gone_at IS NULL)),
+  CHECK ((reaper_pid IS NULL) = (reaper_start IS NULL) AND (reaper_pid IS NULL) = (reaping_since IS NULL)
+    AND (reaper_pid IS NULL) = (attempt IS NULL)),
+  CHECK (reaper_pid IS NULL OR gone IS NOT NULL)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers'];
+const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds', 'owner_checks'];
 
 const SCHEMA = `
 CREATE TABLE claims (

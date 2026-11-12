@@ -57,10 +57,18 @@ export async function startClaimedService(c: LaneServices, service: ServiceConfi
   try {
     const ready = await waitForService(deps.system, service, port, proc, deps.clock, log);
     c.registry.recordProcess(c.ref, ready);
+    if (ready.aliveAt !== undefined) c.registry.recordLeaderAlive(c.ref.id, ready, ready.aliveAt);
     return `started on ${String(port)} (pid ${String(proc.pid)}, log ${log})`;
   } catch (error) {
-    await stopService(deps.system, proc, deps.clock);
-    c.registry.forgetProcess(c.ref, service.name);
-    throw error;
+    const outcome = await stopService(deps.system, proc, deps.clock);
+    if (outcome.kind === 'stopped' || outcome.kind === 'already-gone') {
+      c.registry.forgetProcess(c.ref, service.name);
+      throw error;
+    }
+    throw new ServiceFailed(
+      service.name,
+      `failed to start, and could not be stopped after, so the lane keeps its record of it: ${describeStop(proc, outcome)}\n${error instanceof Error ? error.message : String(error)}`,
+      null,
+    );
   }
 }

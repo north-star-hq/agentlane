@@ -45,6 +45,9 @@ function lane(
     ownerState: extra.ownerState ?? 'alive',
     idleMs: 120_000,
     deviceState: extra.deviceState ?? 'booted',
+    park: null,
+    hold: null,
+    ownerGone: null,
   };
 }
 
@@ -252,6 +255,25 @@ const ROWS: Row[] = [
   { name: 'emulator -list-avds', command: 'emulator -list-avds', expect: 'allow' },
   { name: 'avdmanager delete', command: 'avdmanager delete avd -n agentlane-emu-111111', expect: otherAndroid },
   { name: 'avdmanager list', command: 'avdmanager list avd', expect: 'allow' },
+  { name: 'adb spelled with locale quoting', command: 'a$"db" -s emulator-5554 shell ls', expect: otherAndroid },
+  { name: 'locale quoting inside bash -c', command: `bash -c 'a$"db" -s emulator-5554 shell ls'`, expect: otherAndroid },
+  { name: 'simctl spelled with locale quoting', command: `xcrun sim$"ctl" boot ${OTHER_UDID}`, expect: otherIos },
+  { name: 'locale quoting inside double quotes is a dollar sign', command: 'echo "a$"db', expect: 'allow' },
+  { name: 'adb spelled by a one-letter brace sequence', command: 'a{d..d}b -s emulator-5554 shell ls', expect: otherAndroid },
+  { name: 'a serial made by brace expansion', command: 'adb -s emulator-55{54,60} shell ls', expect: otherAndroid },
+  {
+    name: 'emulator reached through env by brace expansion',
+    command: 'e{nv,mulator} -avd agentlane-emu-111111',
+    expect: otherAndroid,
+  },
+  { name: 'a quoted brace is not expanded', command: "adb -s 'emulator-55{54,60}' shell ls", expect: 'allow' },
+  { name: 'a brace expansion that runs ab, not adb', command: 'a{,d}b -s emulator-5554 shell ls', expect: 'allow' },
+  { name: 'an assignment before a command is not brace expanded', command: 'X=a{d,}b env', expect: 'allow' },
+  {
+    name: 'a brace expansion of more than a thousand words is left as written',
+    command: 'adb -s emulator-5554 shell echo {1..100000}',
+    expect: otherAndroid,
+  },
 ];
 
 for (const row of ROWS) {

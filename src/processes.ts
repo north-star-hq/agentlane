@@ -19,7 +19,9 @@ export interface ProcessTable {
 
 const LSTART = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}`;
 const START_LINE = new RegExp(String.raw`^\s*(\d+)\s+(${LSTART})\s*$`);
+const RUNNING_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\S+)\s+(${LSTART})\s*$`);
 const INFO_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${LSTART})\s?(.*)$`);
+const START_ONLY = new RegExp(`^${LSTART}$`);
 
 function normalizeStart(lstart: string): string {
   return lstart.replace(/\s+/g, ' ');
@@ -27,6 +29,12 @@ function normalizeStart(lstart: string): string {
 
 export function describeStart(start: string): string {
   return `${start} UTC`;
+}
+
+/** The start time as milliseconds since the epoch, to the second `ps` reports; NaN when it isn't a `ps` start time. */
+export function startMs(start: string): number {
+  const normal = normalizeStart(start);
+  return START_ONLY.test(normal) ? Date.parse(describeStart(normal)) : Number.NaN;
 }
 
 function ps(columns: string, pids: readonly number[]): string[] | undefined {
@@ -42,6 +50,13 @@ function ps(columns: string, pids: readonly number[]): string[] | undefined {
   return undefined;
 }
 
+// Linux appends " (deleted)" to the /proc/<pid>/cwd link once the directory is removed (proc(5)).
+const DELETED_SUFFIX = ' (deleted)';
+
+export function cwdOfProcLink(link: string): string {
+  return link.endsWith(DELETED_SUFFIX) ? link.slice(0, -DELETED_SUFFIX.length) : link;
+}
+
 function lsofCwd(pid: number): string | undefined {
   const result = spawnSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
     encoding: 'utf8',
@@ -53,9 +68,28 @@ function lsofCwd(pid: number): string | undefined {
   return line?.slice(1);
 }
 
+function wantedPids(pids: readonly number[]): number[] {
+  return [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0);
+}
+
+/** The start times of those of `pids` still running. A zombie has exited, though ps lists it until it is reaped. */
+export function runningStartTimes(pids: readonly number[]): ReadonlyMap<number, string> | undefined {
+  const wanted = wantedPids(pids);
+  if (wanted.length === 0) return new Map();
+  const lines = ps('pid=,stat=,lstart=', wanted);
+  if (!lines) return undefined;
+  const table = new Map<number, string>();
+  for (const line of lines) {
+    const m = RUNNING_LINE.exec(line);
+    if (!m?.[1] || !m[2] || !m[3]) return undefined;
+    if (!m[2].startsWith('Z')) table.set(Number(m[1]), normalizeStart(m[3]));
+  }
+  return table;
+}
+
 export const systemProcesses: ProcessTable = {
   startTimes(pids) {
-    const wanted = [...new Set(pids)].filter(pid => Number.isInteger(pid) && pid > 0);
+    const wanted = wantedPids(pids);
     if (wanted.length === 0) return new Map();
     const lines = ps('pid=,lstart=', wanted);
     if (!lines) return undefined;
@@ -78,7 +112,7 @@ export const systemProcesses: ProcessTable = {
   cwd(pid) {
     if (process.platform === 'linux') {
       try {
-        return fs.readlinkSync(`/proc/${String(pid)}/cwd`);
+        return cwdOfProcLink(fs.readlinkSync(`/proc/${String(pid)}/cwd`));
       } catch {
         return undefined;
       }
@@ -86,6 +120,23 @@ export const systemProcesses: ProcessTable = {
     return lsofCwd(pid);
   },
 };
+
+/** A process's environment, where the OS shows it to its owner; undefined when it can't be read. */
+export function environmentOf(pid: number): string | undefined {
+  if (process.platform === 'linux') {
+    try {
+      return fs.readFileSync(`/proc/${String(pid)}/environ`, 'utf8').replaceAll('\0', ' ');
+    } catch {
+      return undefined;
+    }
+  }
+  const result = spawnSync('ps', ['eww', '-o', 'command=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { PATH: `${process.env.PATH ?? ''}:/usr/bin:/bin`, LC_ALL: 'C' },
+    timeout: 10_000,
+  });
+  return result.status === 0 ? result.stdout : undefined;
+}
 
 export function identityOf(table: ProcessTable, pid: number): ProcessIdentity | undefined {
   const start = table.startTimes([pid])?.get(pid);

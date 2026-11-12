@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+const NEWLINE = 0x0a;
+
 export type EvidenceTarget = 'device' | 'browser';
 
 export function evidenceStamp(at: Date = new Date()): string {
@@ -48,6 +50,10 @@ export interface InProgress {
   pid?: number;
   /** What `pid` ran, so a stop never signals a process that reused it. */
   command?: string;
+  /** When `pid` started, as ps prints it, so a sweep after the lane has ended can prove the recorder is that process. */
+  start?: string;
+  /** When a sweep last left the recorder of an ended lane running, because it could not prove it was the recorder. */
+  leftAt?: number;
   platform?: 'ios' | 'android';
   device?: string;
   /** Where an emulator's recording sits on the emulator until it is pulled. */
@@ -55,6 +61,8 @@ export interface InProgress {
   /** How far the driver's log and recorded steps reached when a device trace began. */
   driverLogBytes?: number;
   stepsBytes?: number;
+  /** The recorded steps' inode then, so a stop can tell the file was replaced. */
+  stepsIno?: number;
 }
 
 function stateFile(evidence: string, kind: 'video' | 'trace', target: EvidenceTarget): string {
@@ -75,6 +83,11 @@ export function writeInProgress(evidence: string, kind: 'video' | 'trace', state
   fs.writeFileSync(stateFile(evidence, kind, state.target), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 }
 
+/** Whether a device recording in the evidence folder is marked as running: its recorder may still write there. */
+export function deviceRecordingMarked(evidence: string): boolean {
+  return fs.existsSync(stateFile(evidence, 'video', 'device'));
+}
+
 export function clearInProgress(evidence: string, kind: 'video' | 'trace', target: EvidenceTarget): void {
   fs.rmSync(stateFile(evidence, kind, target), { force: true });
 }
@@ -88,6 +101,74 @@ export function readFrom(file: string, from: number): string {
     return '';
   }
   return data.subarray(data.length >= from ? from : 0).toString('utf8');
+}
+
+/** Where a device trace began in the recorded steps: their size and inode then, and the trace's start time. */
+export interface StepsMark {
+  bytes: number;
+  ino?: number | undefined;
+  startedAt: number;
+}
+
+/**
+ * The recorded runs, one JSON line each, that were recorded since `mark`. While the file is the one the trace saw,
+ * those are the lines past its offset. Once it was replaced (a cut, a clear), they are the whole lines after the last
+ * one whose `at` is before the trace's start; with none before it, the lines from the first that has an `at`, or every
+ * line when none has one, since a 0.4.1 engine of the lane records no `at`.
+ */
+export function runsSince(file: string, mark: StepsMark): string {
+  let data: Buffer;
+  let ino: number;
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      ino = fs.fstatSync(fd).ino;
+      data = fs.readFileSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+  const same =
+    (mark.ino === undefined || mark.ino === ino) &&
+    data.length >= mark.bytes &&
+    (mark.bytes === 0 || data[mark.bytes - 1] === NEWLINE);
+  if (same) return data.subarray(mark.bytes).toString('utf8');
+  const runs = data
+    .toString('utf8')
+    .split('\n')
+    .slice(0, -1)
+    .flatMap(line => {
+      const at = recordedAt(line);
+      return at === null ? [] : [{ line, at }];
+    });
+  const before = runs.findLastIndex(run => run.at !== undefined && run.at < mark.startedAt);
+  const timed = runs.findIndex(run => run.at !== undefined);
+  const from = before !== -1 ? before + 1 : Math.max(timed, 0);
+  return runs
+    .slice(from)
+    .map(run => `${run.line}\n`)
+    .join('');
+}
+
+function recordedAt(line: string): number | undefined | null {
+  try {
+    const run = JSON.parse(line) as unknown;
+    if (typeof run !== 'object' || run === null) return null;
+    const { at } = run as { at?: unknown };
+    return typeof at === 'number' ? at : undefined;
+  } catch {
+    return null;
+  }
+}
+
+export function inodeOf(file: string): number | undefined {
+  try {
+    return fs.statSync(file).ino;
+  } catch {
+    return undefined;
+  }
 }
 
 export function sizeOf(file: string): number {

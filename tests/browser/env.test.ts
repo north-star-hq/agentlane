@@ -37,7 +37,7 @@ test("the lane's playwright-cli runs the pinned CLI with every argument, and ref
 test("the lane's agent-browser refuses install and upgrade, and finds the pinned ffmpeg first on PATH", () => {
   const ffmpeg = tempDir('ffmpeg');
   fs.writeFileSync(path.join(ffmpeg, 'ffmpeg'), '#!/bin/sh\necho pinned ffmpeg\n', { mode: 0o755 });
-  const file = shim(agentBrowserShim(['/bin/sh', '-c', 'ffmpeg; echo "$@"', 'agent-browser'], ffmpeg));
+  const file = shim(agentBrowserShim(['/bin/sh', '-c', 'ffmpeg; echo "$@"', 'agent-browser'], ffmpeg, null));
   assert.deepEqual(run(file, 'open', 'http://localhost:1/'), {
     code: 0,
     out: 'pinned ffmpeg\nopen http://localhost:1/',
@@ -57,6 +57,16 @@ test("playwright-cli's global config gives the browser the lane's debugging port
     browser: { launchOptions: { args: string[] } };
   };
   assert.deepEqual(config.browser.launchOptions.args, ['--remote-debugging-port=41402']);
+});
+
+test("the lane's agent-browser launches the browser it names, over one the caller's environment names", () => {
+  const shell = "/data/browsers/chromium_headless_shell-1/it's here/shell";
+  const echo = ['/bin/sh', '-c', 'echo "$AGENT_BROWSER_EXECUTABLE_PATH"', 'agent-browser'];
+  const env = { ...process.env, AGENT_BROWSER_EXECUTABLE_PATH: '/elsewhere/shell' };
+  const named = spawnSync(shim(agentBrowserShim(echo, null, shell)), [], { encoding: 'utf8', env });
+  assert.equal(named.stdout.trim(), shell);
+  const unnamed = spawnSync(shim(agentBrowserShim(echo, null, null)), [], { encoding: 'utf8', env });
+  assert.equal(unnamed.stdout.trim(), '/elsewhere/shell');
 });
 
 test("agent-browser's socket folder moves to a short per-user one when the lane folder's path would be too long for a socket", () => {

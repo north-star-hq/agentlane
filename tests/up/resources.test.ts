@@ -13,7 +13,8 @@ import { laneDir } from '../../src/up/lane-files.ts';
 import type { EnvDeps } from '../../src/up/deps.ts';
 import { ResourceFailed } from '../../src/up/resources.ts';
 import { up } from '../../src/up/up.ts';
-import { alive, failures, OPTIONS, sleeper, until, WEB, world, type World } from '../support/up-world.ts';
+import { RETURN_WINDOW_MS } from '../../src/registry/owner-checks.ts';
+import { alive, clockAt, failures, foundGoneAt, OPTIONS, sleeper, until, WEB, world, type World } from '../support/up-world.ts';
 
 const SITE_SERVER = `import { createServer } from 'node:http';
 createServer((req, res) => res.end(JSON.stringify({ path: req.url, db: process.env.DATABASE_URL ?? null })))
@@ -150,7 +151,7 @@ test('the teardown recorded when create ran is the one release runs, after the c
   ]);
 });
 
-test('the resources of a lane whose owner died are torn down by the next claim that frees it', async t => {
+test('the resources of a lane whose owner died outlive the park that stops its services, and are torn down once the owner has stayed gone for 30 minutes', async t => {
   const w = world(t);
   const p = setUp(w);
   const owner = sleeper();
@@ -170,11 +171,25 @@ test('the resources of a lane whose owner died are torn down by the next claim t
     cli(w, out, caller(w), other),
   );
   assert.equal(code, 0, out.join(''));
-  assert.match(out.join(''), new RegExp(`freed lane ${result.lane.id} of process \\d+ in `));
+  const found = foundGoneAt(w, result.lane.id);
+
+  out.length = 0;
+  assert.equal(await runRegistryCommand('reap', [], cli(w, out, caller(w), other)), 0, out.join(''));
+  assert.match(out.join(''), new RegExp(`parked lane ${result.lane.id}, whose owner is gone`));
+  await until(() => !alive(site?.pid ?? 0));
+  assert.equal(fs.existsSync(path.join(p.dbs, `${result.lane.id}.db`)), true, 'the database went before the window ended');
+  assert.equal(
+    lines(p.trace).some(l => l.startsWith('teardown')),
+    false,
+  );
+
+  out.length = 0;
+  const later = { ...cli(w, out, caller(w), other), clock: clockAt(found + RETURN_WINDOW_MS) };
+  assert.equal(await runRegistryCommand('reap', [], later), 0, out.join(''));
+  assert.match(out.join(''), new RegExp(`ended lane ${result.lane.id}: its owner was found gone \\(owner dead\\)`));
   assert.match(out.join(''), new RegExp(`lane ${result.lane.id}: tore down resource db`));
   assert.deepEqual(lines(p.trace).slice(-1), [`teardown ${result.lane.id} ${dbOf(p, result.lane.id)} ${w.project}`]);
   assert.equal(fs.existsSync(path.join(p.dbs, `${result.lane.id}.db`)), false);
-  await until(() => !alive(site?.pid ?? 0));
   assert.deepEqual(status(w).teardowns, []);
 });
 
@@ -338,7 +353,14 @@ test("a resource whose worktree was deleted is torn down from the lane's log fol
     out.join(''),
   );
   const logs = laneDir(w.state, result.lane.id);
-  assert.match(out.join(''), /worktree gone/);
+  assert.equal(status(w).lanes.find(c => c.id === result.lane.id)?.ownerGone?.state, 'worktree-gone');
+  out.length = 0;
+  assert.equal(await runRegistryCommand('reap', [], cli(w, out, caller(w), other)), 0, out.join(''));
+  out.length = 0;
+  const later = { ...cli(w, out, caller(w), other), clock: clockAt(foundGoneAt(w, result.lane.id) + RETURN_WINDOW_MS) };
+  assert.equal(await runRegistryCommand('reap', [], later), 1, out.join(''));
+  assert.match(out.join(''), /ended lane .*: its owner was found gone \(worktree gone\)/);
+  assert.match(out.join(''), /PROBLEM: skipped the teardown hook: /, "the project's teardown hook went with its folder");
   assert.match(
     out.join(''),
     new RegExp(`tore down resource db \\(.*; ${w.project} is gone, so it ran in the lane's log folder\\)`),

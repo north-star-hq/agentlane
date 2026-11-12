@@ -2,12 +2,25 @@ import type { Clock } from '../clock.ts';
 import type { BackendDevice, DeviceBackend, Platform } from '../devices/backend.ts';
 import type { ProcessTable } from '../processes.ts';
 import type { RegistryConfig } from './config.ts';
-import { judgeProcess, ownerState, worktreeState } from './owner.ts';
+import { readHold } from './holds.ts';
+import { hostSession, isProven, judgeProcess, ownerState, worktreeState, type ProcessVerdict } from './owner.ts';
+import { readCheck, RETURN_WINDOW_MS } from './owner-checks.ts';
+import { readPark } from './parks.ts';
 import { pendingTeardowns } from './resources.ts';
 import { endedFromHistory, loadLaneInfo } from './rows.ts';
 import type { Store } from './store.ts';
 import { int, optText, text } from './store.ts';
-import type { LaneInfo, LaneStatus, DeviceState, PoolDeviceStatus, QueueEntry, StatusReport } from './types.ts';
+import type {
+  LaneGone,
+  LaneInfo,
+  LaneStatus,
+  DeviceState,
+  ParkStatus,
+  ProcessState,
+  PoolDeviceStatus,
+  QueueEntry,
+  StatusReport,
+} from './types.ts';
 
 export interface StatusSources {
   dir: string;
@@ -18,6 +31,12 @@ export interface StatusSources {
 }
 
 const RECENT_MS = 24 * 3_600_000;
+
+function processState(verdict: ProcessVerdict): ProcessState {
+  if (verdict === 'alive') return 'running';
+  if (verdict === 'cant-tell') return 'unknown';
+  return 'gone';
+}
 
 export function readStatus(store: Store | null, sources: StatusSources): StatusReport {
   const now = sources.clock.now();
@@ -38,7 +57,9 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     .all()
     .map(row => loadLaneInfo(db, text(row, 'id')))
     .filter((c): c is LaneInfo => c !== null);
-  const table = sources.processes.startTimes(lanes.flatMap(c => (c.owner.process ? [c.owner.process.pid] : [])));
+  const table = sources.processes.startTimes(
+    lanes.flatMap(c => [...(c.owner.process ? [c.owner.process.pid] : []), ...c.processes.map(p => p.pid)]),
+  );
   const listed = new Map<Platform, Map<string, BackendDevice> | null>();
   for (const backend of Object.values(sources.devices)) {
     if (db.prepare('SELECT 1 FROM devices WHERE platform = ? LIMIT 1').get(backend.platform) === undefined) continue;
@@ -55,12 +76,43 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     if (!device) return 'missing';
     return device.booted ? 'booted' : 'shutdown';
   };
-  report.lanes = lanes.map((lane): LaneStatus => ({
-    ...lane,
-    ownerState: ownerState(judgeProcess(lane.owner.process, table), worktreeState(lane.worktree)),
-    idleMs: now - lane.lastUsedAt,
-    deviceState: lane.device ? stateOf(lane.device.platform, lane.device.id) : null,
-  }));
+  const parkStatus = (id: string): ParkStatus | null => {
+    const park = readPark(db, id);
+    if (!park) return null;
+    return {
+      state: park.state,
+      since: park.since,
+      parkedAt: park.parkedAt,
+      by: park.holder?.pid ?? null,
+      restarts: park.restarts,
+      problems: park.problems,
+    };
+  };
+  const goneOf = (lane: LaneInfo): LaneGone | null => {
+    const gone = readCheck(db, lane.id, lane.ownerKey)?.gone ?? null;
+    if (!gone) return null;
+    return {
+      state: gone.state,
+      foundAt: gone.foundAt,
+      endsAt: gone.foundAt + RETURN_WINDOW_MS,
+      session: hostSession(lane.owner),
+      by: gone.reaper?.pid ?? null,
+    };
+  };
+  report.lanes = lanes.map((lane): LaneStatus => {
+    const owner = ownerState(judgeProcess(lane.owner.process, table), worktreeState(lane.worktree));
+    const ownerGone = goneOf(lane);
+    return {
+      ...lane,
+      processes: lane.processes.map(p => ({ ...p, state: processState(judgeProcess(p, table)) })),
+      ownerState: owner,
+      idleMs: now - lane.lastUsedAt,
+      deviceState: lane.device ? stateOf(lane.device.platform, lane.device.id) : null,
+      park: parkStatus(lane.id),
+      hold: isProven(owner) || ownerGone ? null : readHold(db, lane.id, lane.ownerKey, now),
+      ownerGone,
+    };
+  });
   report.pool = db
     .prepare('SELECT * FROM devices ORDER BY created_at, name')
     .all()

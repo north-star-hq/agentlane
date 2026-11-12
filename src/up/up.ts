@@ -13,7 +13,7 @@ import {
 import { realBrowserTools, type BrowserTools } from '../browser/tools.ts';
 import type { CachedBuildResult, CacheMode } from '../cache/build.ts';
 import { cachedBuild } from '../cache/build.ts';
-import { computeKey } from '../cache/key.ts';
+import { computeKey, type FileDigests } from '../cache/key.ts';
 import { BuildCache, cacheDirFor } from '../cache/store.ts';
 import { adbTools, type AdbTools } from '../devices/adb.ts';
 import {
@@ -51,18 +51,20 @@ import { resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
+import { keepTouching, recordCall } from '../registry/touch.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
-import { laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
+import { LANE_FILES_KEEP_MS, laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
 import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
+import { rememberAnswers } from './answers.ts';
 import type { EnvDeps } from './deps.ts';
 import type { DoctorReport } from './doctor.ts';
 import { bundlerPort, diagnose, dialArguments, reversePorts } from './doctor.ts';
 import { driverVariables } from './maestro-env.ts';
 import { androidBuildEnvironment, projectFindings, toolchainFindings, Unmet } from './preflight.ts';
-import { stopEndedLanes } from './release.ts';
 import { createResources, tearDownEndedResources } from './resources.ts';
+import { settleWake, takeLane, type LaneEntry, type WakeHandle } from './wake.ts';
 
 export interface UpOptions {
   setup: boolean;
@@ -70,6 +72,8 @@ export interface UpOptions {
   waitMs: number;
   worktree?: string | undefined;
   platform?: ProjectPlatform | undefined;
+  /** The caller is waking a parked lane, and holds it for that: the resources it made stay as they are. */
+  waking?: boolean | undefined;
 }
 
 export interface StepTime {
@@ -160,7 +164,17 @@ async function hook(ctx: Ctx, name: HookName, extraEnv: Record<string, string> =
   const log = hookLog(ctx.dir, name);
   ctx.deps.log(`${TOOL} up: ${name}: ${command}   (log: ${log})`);
   ctx.registry.touch(ctx.ref, `up: ${name}`);
-  return runHook(name, command, { cwd: ctx.config.dir, env: { ...ctx.env, ...extraEnv }, log });
+  const stopTouching = keepTouching(
+    { dir: ctx.registry.dir, processes: ctx.deps.processes, clock: ctx.deps.clock },
+    ctx.ref,
+    `up: ${name}`,
+    ctx.deps.heartbeatMs,
+  );
+  try {
+    return await runHook(name, command, { cwd: ctx.config.dir, env: { ...ctx.env, ...extraEnv }, log });
+  } finally {
+    stopTouching();
+  }
 }
 
 async function bootDevice(sim: SimTools, udid: string, reboot: boolean): Promise<string> {
@@ -231,6 +245,7 @@ async function buildApp(ctx: DeviceCtx, mode: CacheMode): Promise<BuildSummary> 
   }
   const cache = new BuildCache({ dir: await cacheDirFor(config.dir), config: cacheConfig });
   const builder = identityOf(ctx.deps.processes, process.pid);
+  const digests: FileDigests = new Map();
   return cachedBuild({
     cache,
     variant: config.app.variant,
@@ -248,6 +263,7 @@ async function buildApp(ctx: DeviceCtx, mode: CacheMode): Promise<BuildSummary> 
             : await ctx.deps.toolchain.androidToolchain(config.dir, env),
         ...(cacheConfig.envFile !== undefined ? { envFile: cacheConfig.envFile } : {}),
         env: ctx.env,
+        digests,
       }),
     install,
     build,
@@ -491,7 +507,7 @@ async function deviceSteps(
       async () => {
         registry.touch(ctx.ref, 'up: driver');
         try {
-          await deps.startDriver(lane, stateDir(deps.env));
+          await deps.startDriver(lane, stateDir(deps.env), (await deps.toolchain.findJava17(deps.env))?.home);
           return 'started; the first look is warm';
         } catch (error) {
           return `not started (${(error instanceof Error ? error.message : String(error)).split('\n')[0] ?? ''}); the first look starts it`;
@@ -565,7 +581,8 @@ function describeResources(made: { created: string[]; kept: string[] }): string 
   return parts.filter(p => p !== '').join('; ');
 }
 
-export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
+export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> {
+  const { deps, forgetDeviceStates } = rememberAnswers(given);
   const started = deps.clock.now();
   const run = new Run(deps);
   const start = options.worktree ?? deps.cwd;
@@ -595,17 +612,27 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
   }
 
   const state = stateDir(deps.env);
+  const registryConfig = withProjectBlocks(loadConfig(state), projectBlocks(config), config.file);
   const registry = Registry.open({
     dir: state,
     processes: deps.processes,
     ports: deps.ports,
     devices: deps.devices,
-    config: withProjectBlocks(loadConfig(state), projectBlocks(config), config.file),
+    config: registryConfig,
     clock: deps.clock,
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
+    ...(deps.passBy ? { sweepSoon: deps.passBy } : {}),
   });
+  let woken: WakeHandle | null = null;
+  const entry: LaneEntry = { stateDir: state, processes: deps.processes, clock: deps.clock };
   try {
     const owner = resolveOwner(deps.env, deps.processes, deps.selfPid);
+    const before = options.waking ? null : registry.takeBack(owner, folder.worktree);
+    if (before) {
+      const ref = { id: before.id, token: before.token };
+      recordCall(state, ref, deps.clock.now());
+      if (registry.parkOf(before.id)) woken = await takeLane(entry, ref);
+    }
     const outcome = await run.step(
       'claim',
       async () => {
@@ -636,14 +663,8 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
         `${o.created ? 'claimed lane' : 'reusing lane'} ${o.lane.id}: ${o.lane.device?.name ?? 'no device'}${o.lane.device ? ` (${o.lane.device.id})` : ''}${o.lane.browser ? `, a ${o.lane.browser.driver} browser` : ''}, ${o.lane.ports.map(p => `${p.service} ${String(p.port)}`).join(', ')}`,
     );
     for (const note of outcome.notes) deps.log(`${TOOL} up: ${note}`);
-    for (const e of [...outcome.freed, ...outcome.tookOver]) {
-      deps.log(
-        `${TOOL} up: ended lane ${e.id} of ${e.owner} in ${e.worktree} (${e.reason}, idle ${formatAge(e.endedAt - e.lastUsedAt)})`,
-      );
-    }
     const browsers = deps.browser ?? realBrowserTools;
     const ended = [
-      ...(await stopEndedLanes(deps, state, [...outcome.freed, ...outcome.tookOver])),
       ...(await stopEndedBrowsers(browsers, registry, state, deps.clock)),
       ...(await tearDownEndedResources(deps, registry, state)),
     ];
@@ -666,12 +687,7 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
       pinned: previous?.pinned ?? false,
       updatedAt: deps.clock.now(),
     });
-    pruneEndedLaneFiles(
-      state,
-      new Set([...registry.status().lanes.map(c => c.id), ...registry.pendingTeardowns().map(t => t.lane)]),
-      deps.clock.now(),
-      deps.env,
-    );
+    pruneEndedLaneFiles(state, registry.keptLaneIds(deps.clock.now() - LANE_FILES_KEEP_MS), deps.clock.now(), deps.env);
     const ctx: Ctx = {
       deps,
       registry,
@@ -728,7 +744,7 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
       throw error;
     }
     const booting = bootingWithSetup ?? (target ? startBoot(target) : null);
-    if (config.resources.length > 0) {
+    if (config.resources.length > 0 && !options.waking) {
       try {
         const made = await run.step('resources', () => createResources(ctx, ctx.lane), describeResources);
         ctx.lane = made.lane;
@@ -753,6 +769,7 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
     const fresh = registry.find(owner, folder.worktree);
     if (!fresh) throw new Error(`lane ${lane.id} ended while up was running`);
     registry.touch(ctx.ref, 'up: doctor');
+    forgetDeviceStates();
     const doctor = await run.step(
       'doctor',
       () =>
@@ -780,6 +797,7 @@ export async function up(deps: EnvDeps, options: UpOptions): Promise<UpResult> {
       doctor,
     };
   } finally {
+    if (woken) settleWake(entry, woken, null);
     registry.close();
   }
 }

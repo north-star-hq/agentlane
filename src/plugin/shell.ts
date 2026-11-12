@@ -10,13 +10,110 @@ export interface SimpleCommand {
 const SEPARATORS = new Set([';', '&', '|', '(', ')', '\n']);
 const RESERVED = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', '{', '}', 'time']);
 const HEADERS = new Set(['for', 'case', 'select', 'function']);
+const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const MAX_EXPANSIONS = 1000;
+
+const OPEN = Symbol('{');
+const COMMA = Symbol(',');
+const CLOSE = Symbol('}');
+type Piece = string | typeof OPEN | typeof COMMA | typeof CLOSE;
+
+interface Lexed {
+  word: Word;
+  braces: number[];
+}
+
+function piecesOf(text: string, braces: readonly number[]): Piece[] {
+  const unquoted = new Set(braces);
+  return text.split('').map((c, i) => {
+    if (!unquoted.has(i)) return c;
+    return c === '{' ? OPEN : c === ',' ? COMMA : CLOSE;
+  });
+}
+
+function textOf(pieces: readonly Piece[]): string {
+  return pieces.map(p => (p === OPEN ? '{' : p === COMMA ? ',' : p === CLOSE ? '}' : p)).join('');
+}
+
+function groupAt(pieces: readonly Piece[], open: number): { close: number; commas: number[] } | null {
+  let depth = 0;
+  const commas: number[] = [];
+  for (let i = open + 1; i < pieces.length; i++) {
+    const p = pieces[i];
+    if (p === OPEN) depth++;
+    else if (p === CLOSE) {
+      if (depth === 0) return { close: i, commas };
+      depth--;
+    } else if (p === COMMA && depth === 0) commas.push(i);
+  }
+  return null;
+}
+
+function sequence(body: readonly Piece[], limit: number): Piece[][] | null {
+  if (!body.every(p => typeof p === 'string')) return null;
+  const text = body.join('');
+  const numbers = /^([-+]?\d+)\.\.([-+]?\d+)(?:\.\.([-+]?\d+))?$/.exec(text);
+  const letters = /^([A-Za-z])\.\.([A-Za-z])(?:\.\.([-+]?\d+))?$/.exec(text);
+  const [, from = '', to = '', by = '1'] = numbers ?? letters ?? [];
+  if (from === '') return null;
+  const start = numbers ? Number(from) : from.charCodeAt(0);
+  const end = numbers ? Number(to) : to.charCodeAt(0);
+  const step = (Math.abs(Number(by)) || 1) * (end < start ? -1 : 1);
+  const width = /^[-+]?0\d/.test(from) || /^[-+]?0\d/.test(to) ? Math.max(from.length, to.length) : 0;
+  const term = (n: number) =>
+    !numbers ? String.fromCharCode(n) : n < 0 ? `-${String(-n).padStart(width - 1, '0')}` : String(n).padStart(width, '0');
+  const terms: Piece[][] = [];
+  for (let n = start; (step > 0 ? n <= end : n >= end) && terms.length <= limit; n += step) terms.push([term(n)]);
+  return terms;
+}
+
+function alternativesOf(pieces: readonly Piece[], open: number, close: number, commas: readonly number[], limit: number) {
+  if (commas.length === 0) return sequence(pieces.slice(open + 1, close), limit);
+  const cuts = [open, ...commas, close];
+  return cuts.slice(1).map((cut, i) => pieces.slice((cuts[i] ?? open) + 1, cut));
+}
+
+function expand(pieces: readonly Piece[], budget: { left: number }): Piece[][] | null {
+  for (let open = pieces.indexOf(OPEN); open !== -1; open = pieces.indexOf(OPEN, open + 1)) {
+    const group = groupAt(pieces, open);
+    if (group === null) continue;
+    const alternatives = alternativesOf(pieces, open, group.close, group.commas, budget.left);
+    if (alternatives === null) continue;
+    const words: Piece[][] = [];
+    for (const alternative of alternatives) {
+      const expanded = expand([...pieces.slice(0, open), ...alternative, ...pieces.slice(group.close + 1)], budget);
+      if (expanded === null) return null;
+      words.push(...expanded);
+    }
+    return words;
+  }
+  budget.left -= 1;
+  return budget.left < 0 ? null : [[...pieces]];
+}
+
+function expandBraces({ word, braces }: Lexed): Word[] {
+  if (braces.length === 0) return [word];
+  const expanded = expand(piecesOf(word.text, braces), { left: MAX_EXPANSIONS });
+  if (expanded === null) return [word];
+  return expanded.map(textOf).flatMap(text => (text === '' ? [] : [{ text, literal: word.literal }]));
+}
+
+/** Bash and zsh brace-expand every word of a simple command except the assignments that lead it. */
+function expandWords(lexed: readonly Lexed[]): Word[] {
+  let assigning = true;
+  return lexed.flatMap(entry => {
+    assigning &&= ASSIGNMENT_WORD.test(entry.word.text);
+    return assigning ? [entry.word] : expandBraces(entry);
+  });
+}
 
 class Lexer {
   private readonly src: string;
   private pos = 0;
   readonly commands: SimpleCommand[] = [];
-  private words: Word[] = [];
+  private words: Lexed[] = [];
   private word: Word | null = null;
+  private braces: number[] = [];
   private heredocs: string[] = [];
   private skipNextWord = false;
 
@@ -43,13 +140,15 @@ class Lexer {
   private endWord(): void {
     if (this.word === null) return;
     if (this.skipNextWord) this.skipNextWord = false;
-    else this.words.push(this.word);
+    else this.words.push({ word: this.word, braces: this.braces });
     this.word = null;
+    this.braces = [];
   }
 
   private endCommand(): void {
     this.endWord();
-    if (this.words.length > 0) this.commands.push({ words: this.words });
+    const words = expandWords(this.words);
+    if (words.length > 0) this.commands.push({ words });
     this.words = [];
   }
 
@@ -100,6 +199,10 @@ class Lexer {
       this.pos += 2;
       return;
     }
+    if (c === '$' && (this.peek(1) === "'" || this.peek(1) === '"')) {
+      this.pos++;
+      return;
+    }
     if (c === '$') {
       this.dollar();
       return;
@@ -108,14 +211,17 @@ class Lexer {
       this.backtick();
       return;
     }
+    if (c === '{' || c === ',' || c === '}') this.braces.push(this.word?.text.length ?? 0);
     this.append(c);
     this.pos++;
   }
 
   private redirection(): void {
     const fd = this.word !== null && /^\d+$/.test(this.word.text) ? this.word : null;
-    if (fd) this.word = null;
-    else this.endWord();
+    if (fd) {
+      this.word = null;
+      this.braces = [];
+    } else this.endWord();
     const c = this.peek();
     if (c === '<' && this.peek(1) === '<' && this.peek(2) !== '<') {
       this.pos += 2;
@@ -184,10 +290,6 @@ class Lexer {
       const stop = end === -1 ? this.src.length : end;
       this.append(`\${${this.src.slice(this.pos + 2, stop)}}`, false);
       this.pos = stop + 1;
-      return;
-    }
-    if (next === "'") {
-      this.pos++;
       return;
     }
     const name = /^[A-Za-z_][A-Za-z0-9_]*|^[0-9@*#?$!-]/.exec(this.src.slice(this.pos + 1));

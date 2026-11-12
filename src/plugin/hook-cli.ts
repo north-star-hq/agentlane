@@ -3,18 +3,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { systemClock } from '../clock.ts';
+import { rotateLog } from '../disk-limits.ts';
 import { envName, TOOL } from '../name.ts';
 import type { Agent, Owner } from '../registry/owner.ts';
 import { AGENTS, describeOwner, judgeProcess, ownerKey, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
-import { readRegistryStatus } from '../registry/registry.ts';
+import { tcpProbe } from '../registry/ports.ts';
+import { readRegistryStatus, Registry } from '../registry/registry.ts';
+import { recordCall, TOUCH_WAIT_MS } from '../registry/touch.ts';
+import type { LaneStatus } from '../registry/types.ts';
 import type { CliDeps } from '../registry-cli.ts';
 import { releaseEveryLaneOf, resolveFolder } from '../registry-cli.ts';
 import { commandUsage, groupUsage, type UsageGroup } from '../usage.ts';
+import type { HookEvent } from '../agents/launcher.ts';
+import { toolVersion } from '../agents/package.ts';
 import { aimsOf } from './aims.ts';
 import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
-import { guard } from './guard.ts';
+import { aimedOwnLanes, guard, type GuardContext } from './guard.ts';
+import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
+import { claimOnce } from './hook-once.ts';
 import { claudeSessionName } from './session-name.ts';
 
 export const HOOK_COMMANDS = ['hook'] as const;
@@ -36,12 +44,17 @@ export const HOOK_USAGE = groupUsage(HOOK_HELP);
 
 export const SESSION_END_OWNER_ENV = envName('SESSION_END_OWNER');
 export const SESSION_END_WAIT_ENV = envName('SESSION_END_WAIT_MS');
+export const SESSION_END_ONCE_ENV = envName('SESSION_END_ONCE');
 const OWNER_EXIT_WAIT_MS = 30_000;
 const OWNER_EXIT_POLL_MS = 250;
+const PLUGIN_AND_SETTINGS: ReadonlySet<Agent> = new Set(['claude']);
+export const SESSION_END_LOG_MAX_BYTES = 1024 * 1024;
 
 export interface HookDeps extends CliDeps {
   stdin: string;
   startWorker: (env: NodeJS.ProcessEnv, log: string) => void;
+  /** The toolkit's entry point, recorded in the hook's mark. */
+  toolkit?: string;
 }
 
 function selfOwner(deps: HookDeps): Owner | null {
@@ -73,15 +86,41 @@ function guardReply(raw: string, agent: Agent, deps: HookDeps): HookReply {
     devices: deps.devices,
     ...(deps.clock ? { clock: deps.clock } : {}),
   });
-  const verdict = guard(command, deps.env, {
+  const context: GuardContext = {
     self: owner ? ownerKey(owner) : null,
     cwd,
     lanes: report.lanes,
     now: report.now,
     worktreeOf,
     sessionName: lane => claudeSessionName(lane.owner, deps.env),
-  });
-  return verdict.allow ? convention.allow : convention.deny(verdict.reason);
+  };
+  const verdict = guard(command, deps.env, context);
+  if (!verdict.allow) return convention.deny(verdict.reason);
+  if (owner) recordCalls(owner, aimedOwnLanes(command, deps.env, context), deps);
+  return convention.allow;
+}
+
+/** Records an allowed simctl, adb, playwright-cli or agent-browser command on the caller's own lanes as a call on each. */
+function recordCalls(owner: Owner, lanes: readonly LaneStatus[], deps: HookDeps): void {
+  if (lanes.length === 0) return;
+  const dir = stateDir(deps.env);
+  let registry: Registry;
+  try {
+    registry = Registry.open({ dir, processes: deps.processes, ports: tcpProbe, devices: {}, lockWaitMs: TOUCH_WAIT_MS });
+  } catch {
+    return;
+  }
+  try {
+    const at = (deps.clock ?? systemClock).now();
+    for (const lane of lanes) {
+      const found = registry.find(owner, lane.worktree);
+      if (found?.id === lane.id) recordCall(dir, { id: found.id, token: found.token }, at);
+    }
+  } catch {
+    return;
+  } finally {
+    registry.close();
+  }
 }
 
 function preToolUse(raw: string, agent: Agent, deps: HookDeps): number {
@@ -133,12 +172,14 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
   const key = ownerKey(owner);
   const held = readRegistryStatus({ dir, processes: deps.processes, devices: {} }).lanes.filter(c => c.ownerKey === key);
   if (held.length === 0) return 0;
+  const once = PLUGIN_AND_SETTINGS.has(agent) ? ['session-end', input.sessionId ?? '', key] : null;
   const log = path.join(dir, 'session-end.log');
   const waits = convention.release !== 'at-once' && convention.release !== 'by-thread' && owner.process !== null;
   deps.startWorker(
     {
       ...deps.env,
       [SESSION_END_OWNER_ENV]: JSON.stringify(owner),
+      [SESSION_END_ONCE_ENV]: once ? JSON.stringify(once) : undefined,
       ...(waits ? { [SESSION_END_WAIT_ENV]: String(OWNER_EXIT_WAIT_MS) } : {}),
     },
     log,
@@ -153,6 +194,7 @@ function sessionEnd(input: HookInput, agent: Agent, deps: HookDeps): number {
 export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: string) => void {
   return (env, log) => {
     fs.mkdirSync(path.dirname(log), { recursive: true });
+    rotateLog(log, SESSION_END_LOG_MAX_BYTES);
     const fd = fs.openSync(log, 'a');
     try {
       const child = spawn(process.execPath, [cli, 'hook', 'session-end'], {
@@ -165,6 +207,41 @@ export function detachedWorker(cli: string): (env: NodeJS.ProcessEnv, log: strin
       fs.closeSync(fd);
     }
   };
+}
+
+const PROJECT_ENV: Partial<Record<Agent, string>> = { claude: 'CLAUDE_PROJECT_DIR', cursor: 'CURSOR_PROJECT_DIR' };
+
+function realEntry(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+function leaveMark(agent: Agent, event: HookEvent, deps: HookDeps): void {
+  try {
+    let cwd: string | null = null;
+    try {
+      cwd = readHookInput(deps.stdin).cwd;
+    } catch {
+      cwd = null;
+    }
+    const named = PROJECT_ENV[agent];
+    const project = named ? deps.env[named] : undefined;
+    writeHookMark(stateDir(deps.env), {
+      agent,
+      event,
+      project: project !== undefined && project !== '' ? project : (cwd ?? deps.cwd),
+      at: (deps.clock ?? systemClock).now(),
+      toolkit: realEntry(deps.toolkit ?? process.argv[1] ?? ''),
+      version: toolVersion(),
+      probe: deps.env[HOOK_PROBE_ENV] ?? null,
+      node: realEntry(process.execPath),
+    });
+  } catch {
+    return;
+  }
 }
 
 async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promise<boolean> {
@@ -180,10 +257,23 @@ async function ownerExited(owner: Owner, waitMs: number, deps: HookDeps): Promis
   }
 }
 
+function onceParts(raw: string | undefined): string[] | null {
+  if (raw === undefined) return null;
+  const parts: unknown = JSON.parse(raw);
+  if (!Array.isArray(parts) || !parts.every(part => typeof part === 'string'))
+    throw new Error(`${SESSION_END_ONCE_ENV} is not a list of strings`);
+  return parts;
+}
+
 async function releaseWorker(raw: string, deps: HookDeps): Promise<number> {
   const owner = parseOwner(raw);
   const clock = deps.clock ?? systemClock;
   const stamp = () => new Date(clock.now()).toISOString();
+  const once = onceParts(deps.env[SESSION_END_ONCE_ENV]);
+  if (once && !claimOnce(stateDir(deps.env), once, clock.now())) {
+    deps.stderr(`${stamp()} session end: another copy of this hook is already releasing the lanes of ${describeOwner(owner)}\n`);
+    return 0;
+  }
   const waitMs = Number(deps.env[SESSION_END_WAIT_ENV] ?? 0);
   if (waitMs > 0 && !(await ownerExited(owner, waitMs, deps))) {
     deps.stderr(
@@ -224,9 +314,13 @@ export async function runHookCommand(args: string[], deps: HookDeps): Promise<nu
   if (event === 'session-end') {
     const owner = deps.env[SESSION_END_OWNER_ENV];
     if (owner) return releaseWorker(owner, deps);
+    leaveMark(agent, event, deps);
     return sessionEnd(readHookInput(deps.stdin), agent, deps);
   }
-  if (event === 'pre-tool-use') return preToolUse(deps.stdin, agent, deps);
+  if (event === 'pre-tool-use') {
+    leaveMark(agent, event, deps);
+    return preToolUse(deps.stdin, agent, deps);
+  }
   deps.stderr(`${TOOL} hook: '${event ?? ''}' is not a hook\n\n${HOOK_USAGE}`);
   return 2;
 }

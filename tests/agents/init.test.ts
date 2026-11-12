@@ -4,10 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
-import { runAgentCommand } from '../../src/agents/cli.ts';
+import { INIT_BACKUPS_KEPT, runAgentCommand } from '../../src/agents/cli.ts';
+import { backupProject } from '../../src/disk-limits.ts';
 import { hookCommand, mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills, stubOf } from '../../src/agents/skills.ts';
 import { tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { recordingInstaller } from '../support/installer.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -87,6 +89,18 @@ function write(dir: string, file: string, text: string): void {
   fs.writeFileSync(path.join(dir, file), text);
 }
 
+test('the example app commits the agent files init writes for it, file by file', async () => {
+  const { dir, state, cleanup } = exampleCopy();
+  try {
+    const run = await init(dir, state);
+    assert.equal(run.code, 0, run.stderr);
+    assert.match(run.stdout, /for claude:/);
+    assert.equal(git(dir, 'status', '--porcelain', '--untracked-files=all'), '', run.stdout);
+  } finally {
+    cleanup();
+  }
+});
+
 test('init --all on a copy of the example app writes every agent’s files, and a second run changes nothing', async () => {
   const { dir, state, cleanup } = exampleCopy();
   try {
@@ -117,7 +131,11 @@ test('init --all on a copy of the example app writes every agent’s files, and 
     const settings = json(dir, '.claude/settings.json');
     assert.deepEqual(settings.enabledPlugins, { 'agentlane@agentlane': true }, 'the example’s own settings survive');
     assert.deepEqual(settings.disabledMcpjsonServers, ['agentlane']);
-    assert.equal(settings.hooks, undefined, 'the plugin already brings the Claude Code hooks');
+    assert.match(
+      JSON.stringify(settings.hooks),
+      /"PreToolUse".*--agent claude.*"SessionEnd".*--agent claude/,
+      'the hooks go in the settings beside the plugin',
+    );
     const ownSkills = fs.readdirSync(path.join(dir, '.agents/skills')).filter(name => !toolkitSkills.has(name));
     assert.ok(ownSkills.length > 0, 'the example has skills of its own');
     assert.deepEqual(
@@ -273,7 +291,7 @@ model = "o4-mini"
     assert.equal(fs.readlinkSync(path.join(dir, '.claude/skills/device')), '../../.agents/skills/device');
     assert.match(fs.readFileSync(path.join(dir, '.claude/skills/device/SKILL.md'), 'utf8'), /agentlane skills get device/);
 
-    const backups = path.join(state, 'init-backups', '2026-10-12T09-00-00-000Z-app');
+    const backups = path.join(state, 'init-backups', `2026-10-12T09-00-00-000Z-${backupProject(dir)}`);
     assert.ok(run.stdout.includes(`Backed up the files it changed in ${backups}.`), run.stdout);
     assert.equal(fs.readFileSync(path.join(backups, '.codex/config.toml'), 'utf8'), toml);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(backups, '.codex/hooks.json'), 'utf8')), legacy);
@@ -282,6 +300,98 @@ model = "o4-mini"
     const again = await init(dir, state, '--all');
     assert.equal(again.code, 0, again.stderr);
     assert.match(again.stdout, /Nothing to change/);
+  } finally {
+    cleanup();
+  }
+});
+
+test('init keeps the project’s newest backups, its own included, so the last init can be undone, and leaves other projects’ alone', async () => {
+  const { dir, state, cleanup } = project();
+  try {
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    const earlier = Array.from({ length: 7 }, (_, i) => `2026-10-0${String(i + 1)}T09-00-00-000Z-${backupProject(dir)}`);
+    for (const name of [...earlier, '2026-10-01T09-00-00-000Z-web', '2026-10-01T09-00-00-000Z-app'])
+      fs.mkdirSync(path.join(backups, name), { recursive: true });
+    const before = `${JSON.stringify({ mcpServers: { docs: { command: 'docs-mcp' } } }, null, 2)}\n`;
+    write(dir, '.mcp.json', before);
+    let stderr = '';
+    const code = await runAgentCommand('init', ['--agents', 'claude'], {
+      env,
+      cwd: dir,
+      install: recordingInstaller().install,
+      stdout: () => undefined,
+      stderr: text => (stderr += text),
+      now: () => Date.UTC(2026, 9, 12, 9, 0, 0),
+    });
+    assert.equal(code, 0, stderr);
+    const newest = `2026-10-12T09-00-00-000Z-${backupProject(dir)}`;
+    assert.deepEqual(fs.readdirSync(backups).sort(), [
+      '2026-10-01T09-00-00-000Z-app',
+      '2026-10-01T09-00-00-000Z-web',
+      ...earlier.slice(-(INIT_BACKUPS_KEPT - 1)),
+      newest,
+    ]);
+    assert.equal(fs.readFileSync(path.join(backups, newest, '.mcp.json'), 'utf8'), before, 'the last init can be undone');
+    assert.notEqual(fs.readFileSync(path.join(dir, '.mcp.json'), 'utf8'), before);
+  } finally {
+    cleanup();
+  }
+});
+
+async function initAt(dir: string, env: NodeJS.ProcessEnv, day: number): Promise<void> {
+  write(dir, '.mcp.json', `${JSON.stringify({ mcpServers: { docs: { command: `docs-${String(day)}` } } }, null, 2)}\n`);
+  let stderr = '';
+  const code = await runAgentCommand('init', ['--agents', 'claude'], {
+    env,
+    cwd: dir,
+    install: recordingInstaller().install,
+    stdout: () => undefined,
+    stderr: text => (stderr += text),
+    now: () => Date.UTC(2026, 9, day, 9, 0, 0),
+  });
+  assert.equal(code, 0, stderr);
+}
+
+test('init in one project never removes the backups of another project with the same folder name', async () => {
+  const { dir: a, state, cleanup } = project();
+  try {
+    const b = path.join(path.dirname(a), 'b', 'app');
+    fs.mkdirSync(b, { recursive: true });
+    git(b, 'init', '-q');
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    await initAt(b, env, 1);
+    const [ofB, ...more] = fs.readdirSync(backups);
+    assert.ok(ofB !== undefined && more.length === 0);
+    for (let day = 2; day <= INIT_BACKUPS_KEPT + 3; day++) await initAt(a, env, day);
+    const names = fs.readdirSync(backups).sort();
+    assert.ok(names.includes(ofB), `the other project's backup stays: ${names.join(', ')}`);
+    assert.equal(names.filter(name => name.endsWith(backupProject(a))).length, INIT_BACKUPS_KEPT);
+    assert.equal(fs.readFileSync(path.join(backups, ofB, '.mcp.json'), 'utf8').includes('docs-1'), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test('init keeps the backup it just wrote even when older backups carry later stamps', async () => {
+  const { dir, state, cleanup } = project();
+  try {
+    const env = hermeticEnv(path.dirname(state), { AGENTLANE_STATE_DIR: state });
+    const backups = path.join(state, 'init-backups');
+    const ahead = Array.from(
+      { length: INIT_BACKUPS_KEPT + 1 },
+      (_, i) => `2027-01-0${String(i + 1)}T09-00-00-000Z-${backupProject(dir)}`,
+    );
+    ahead.forEach((name, i) => {
+      fs.mkdirSync(path.join(backups, name), { recursive: true });
+      const at = new Date(Date.UTC(2026, 9, i + 1));
+      fs.utimesSync(path.join(backups, name), at, at);
+    });
+    await initAt(dir, env, 12);
+    const written = `2026-10-12T09-00-00-000Z-${backupProject(dir)}`;
+    assert.deepEqual(fs.readdirSync(backups).sort(), [...ahead.slice(-(INIT_BACKUPS_KEPT - 1)), written].sort());
+    assert.match(fs.readFileSync(path.join(backups, written, '.mcp.json'), 'utf8'), /docs-12/);
   } finally {
     cleanup();
   }
@@ -311,7 +421,7 @@ test('init refuses to replace a skill of the project’s own that shares a toolk
     const fixed = await init(dir, state, '--agents', 'claude');
     assert.equal(fixed.code, 0, fixed.stderr);
     assert.equal(fs.lstatSync(path.join(dir, '.claude/skills/dev-loop')).isSymbolicLink(), true);
-    const backups = path.join(state, 'init-backups', '2026-10-12T09-00-00-000Z-app');
+    const backups = path.join(state, 'init-backups', `2026-10-12T09-00-00-000Z-${backupProject(dir)}`);
     assert.equal(fs.readFileSync(path.join(backups, '.claude/skills/dev-loop/SKILL.md'), 'utf8'), stubOf(devLoop));
   } finally {
     cleanup();

@@ -21,6 +21,7 @@ export {
   GRADLE_WRAPPER_PROPERTIES,
   xcodeVersion,
   type AndroidToolchainOptions,
+  type FileDigests,
   type KeyOptions,
 } from './key.ts';
 export {

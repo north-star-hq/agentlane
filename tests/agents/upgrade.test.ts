@@ -139,7 +139,7 @@ test("where the project enables 0.2.x's plugin, init enables it under the new na
       agentlane: { source: { source: 'github', repo: 'north-star-hq/agent-env' } },
     });
     assert.deepEqual(settings.disabledMcpjsonServers, ['agentlane']);
-    assert.equal(settings.hooks, undefined);
+    assert.match(JSON.stringify(settings.hooks), /"PreToolUse".*--agent claude.*"SessionEnd".*--agent claude/);
     assert.deepEqual(keys(json(p, '.mcp.json').mcpServers), ['agentlane']);
     assert.deepEqual(formerNamesIn(p, ['north-star-hq/agent-env']), []);
     assert.equal(fs.existsSync(path.join(p.dir, '.github/hooks/agent-env.json')), false);

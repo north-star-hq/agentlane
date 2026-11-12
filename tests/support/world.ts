@@ -1,11 +1,13 @@
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { RegistryConfig } from '../../src/registry/config.ts';
 import { DEFAULT_CONFIG } from '../../src/registry/config.ts';
 import type { Owner } from '../../src/registry/owner.ts';
+import { NOTHING_TO_RESTART } from '../../src/registry/parks.ts';
 import type { RegistryOptions, Step } from '../../src/registry/registry.ts';
 import { Registry } from '../../src/registry/registry.ts';
-import type { LaneRequest } from '../../src/registry/types.ts';
+import type { LaneRef, LaneRequest } from '../../src/registry/types.ts';
 import { FakeClock, FakeDevices, FakeProbe, FakeProcesses, tempDir } from './fakes.ts';
 
 export interface World {
@@ -92,4 +94,21 @@ export function waitForStep(step: Step): { onStep: (s: Step) => void; reached: P
     },
     reached,
   };
+}
+
+/** Records every lane's owner as seen alive now, as the sweep does when the process table shows it running. */
+export function sawOwners(registry: Registry): void {
+  const seen = registry
+    .sweepList()
+    .filter(l => l.gone === null)
+    .map(l => ({ id: l.ref.id, ownerKey: l.ownerKey, process: l.owner.process }));
+  registry.noteOwners(seen, []);
+}
+
+/** Parks a lane at once through the registry alone, as the sweep's park does once the lane's services are stopped. */
+export function parkNow(registry: Registry, lane: LaneRef, notes: string[] = []): boolean {
+  const ref = { id: lane.id, token: lane.token };
+  const attempt = randomBytes(4).toString('hex');
+  if (!registry.beginPark(ref, Number.MAX_SAFE_INTEGER, attempt, null)) return false;
+  return registry.finishPark(ref, attempt, NOTHING_TO_RESTART, [], notes);
 }

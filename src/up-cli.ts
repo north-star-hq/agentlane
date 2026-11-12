@@ -15,6 +15,7 @@ import { ownerKey, resolveOwner } from './registry/owner.ts';
 import { stateDir } from './registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
 import { readRegistryStatus } from './registry/registry.ts';
+import { touchOwnLane } from './registry/touch.ts';
 import { resolveFolder } from './registry-cli.ts';
 import { ServiceFailed } from './services/services.ts';
 import { laneDir, readUpRecord } from './up/lane-files.ts';
@@ -198,10 +199,12 @@ async function runDoctor(args: string[], deps: EnvDeps, stdout: (text: string) =
   });
   const asked = parsePlatform(values.platform);
   const folder = resolveFolder(deps.cwd);
-  const key = ownerKey(resolveOwner(deps.env, deps.processes, deps.selfPid));
+  const owner = resolveOwner(deps.env, deps.processes, deps.selfPid);
+  const key = ownerKey(owner);
   const state = stateDir(deps.env);
   const status = readRegistryStatus({ dir: state, processes: deps.processes, devices: deps.devices, clock: deps.clock });
   const lane = status.lanes.find(c => c.ownerKey === key && c.worktree === folder.worktree) ?? null;
+  if (lane) touchOwnLane({ dir: state, processes: deps.processes, clock: deps.clock }, owner, folder.worktree, 'doctor');
   let config: ProjectConfig | null = null;
   let configProblem: string | null = null;
   const record = lane ? readUpRecord(laneDir(state, lane.id)) : null;
@@ -224,6 +227,7 @@ async function runDoctor(args: string[], deps: EnvDeps, stdout: (text: string) =
     folder: folder.worktree,
     platform: asked,
     installed: record?.installed,
+    park: lane?.park ?? null,
   });
   stdout(values.json ? `${JSON.stringify(result, null, 2)}\n` : renderDoctor(result));
   return result.ok ? 0 : EXIT_FAILED;

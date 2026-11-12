@@ -3,26 +3,26 @@ import type { ChildProcess } from 'node:child_process';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { HookDeps } from '../../src/plugin/hook-cli.ts';
 import { runHookCommand, SESSION_END_OWNER_ENV } from '../../src/plugin/hook-cli.ts';
 import { claudeSessionName } from '../../src/plugin/session-name.ts';
 import { identityOf, systemProcesses } from '../../src/processes.ts';
+import { databasePath } from '../../src/registry/paths.ts';
 import { tcpProbe } from '../../src/registry/ports.ts';
+import { laneDir, lastCallFile } from '../../src/up/lane-files.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { FakeDevices, tempDir } from '../support/fakes.ts';
+import { hermeticEnv } from '../support/hermetic.ts';
 import { portBlock } from '../support/ports.ts';
 
 const PORTS = await portBlock();
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 const CLI = path.join(ROOT, 'src', 'cli.ts');
-const SESSION_END_TIMEOUT_S = (
-  JSON.parse(fs.readFileSync(path.join(ROOT, 'plugin', 'hooks', 'claude.json'), 'utf8')) as {
-    hooks: { SessionEnd: [{ hooks: [{ timeout: number }] }] };
-  }
-).hooks.SessionEnd[0].hooks[0].timeout;
+const PLUGIN_SESSION_END_BUDGET_MS = 1_500;
 
 function sleeper(): ChildProcess {
   return spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
@@ -130,6 +130,47 @@ test('pre-tool-use denies an install on another session’s simulator, naming th
   }
 });
 
+test('pre-tool-use counts a command it allows on my own simulator as a call on my lane, and one aimed at no device as none', async () => {
+  const s = setup('hook-call');
+  const other = sleeper();
+  const me = sleeper();
+  try {
+    const env = { AGENTLANE_OWNER_PID: String(me.pid) };
+    await lane(s, { AGENTLANE_OWNER_PID: String(other.pid) }, s.folder('other'));
+    const mine = await lane(s, env, s.folder('mine'));
+    const status = () => readRegistryStatus({ dir: s.stateDir, processes: systemProcesses, devices: {} });
+    const own = status().lanes.find(c => c.worktree === s.folder('mine'));
+    assert.ok(own);
+    const lastCall = () => {
+      const file = lastCallFile(laneDir(s.stateDir, own.id));
+      return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as { at: number }).at : null;
+    };
+    fs.rmSync(lastCallFile(laneDir(s.stateDir, own.id)), { force: true });
+    const run = async (command: string) => {
+      const stdin = JSON.stringify({
+        session_id: 's',
+        cwd: s.folder('mine'),
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command },
+      });
+      const out: string[] = [];
+      assert.equal(await runHookCommand(['pre-tool-use'], deps(s, env, out, { stdin })), 0);
+      return out.join('');
+    };
+
+    assert.equal(await run('xcrun simctl list'), '');
+    assert.equal(lastCall(), null, 'a command aimed at no device counted');
+    const before = Date.now();
+    assert.equal(await run(`xcrun simctl openurl ${mine} https://example.com`), '');
+    assert.ok((lastCall() ?? 0) >= before, 'the command on my simulator did not count');
+  } finally {
+    other.kill('SIGKILL');
+    me.kill('SIGKILL');
+    fs.rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
 test('session-end releases every lane of the session in a worker, leaves other sessions’ lanes, and skips /clear', async () => {
   const s = setup('hook-end');
   const other = sleeper();
@@ -193,21 +234,43 @@ test('session-end --codex releases the ended thread’s lanes by the hook’s se
   }
 });
 
-test('session-end from the real CLI detaches a worker that outlives the hook and releases the lanes', async () => {
+test('the plugin’s session-end hook hands the release to a detached worker and returns within Claude Code’s budget, taking little longer than a hook that returns at once', async () => {
   const s = setup('hook-detached');
   const me = sleeper();
   try {
     const env = { AGENTLANE_OWNER_PID: String(me.pid) };
-    await lane(s, env, s.folder('x'), '--no-device');
-    const started = Date.now();
-    const result = spawnSync(process.execPath, [CLI, 'hook', 'session-end'], {
-      input: JSON.stringify({ hook_event_name: 'SessionEnd', reason: 'other' }),
-      encoding: 'utf8',
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, AGENTLANE_STATE_DIR: s.stateDir, ...env },
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stderr, /releasing 1 lane\(s\)/);
-    const hookMs = Date.now() - started;
+    const project = s.folder('x');
+    await lane(s, env, project, '--no-device');
+    const bin = path.join(project, 'node_modules', '.bin', 'agentlane');
+    fs.mkdirSync(path.dirname(bin), { recursive: true });
+    fs.writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${CLI}" "$@"\n`);
+    fs.chmodSync(bin, 0o755);
+    const sessionEnd = (reason: string) => {
+      const started = Date.now();
+      const result = spawnSync(path.join(ROOT, 'plugin', 'scripts', 'hook.sh'), ['session-end'], {
+        cwd: project,
+        input: JSON.stringify({ hook_event_name: 'SessionEnd', reason }),
+        encoding: 'utf8',
+        env: hermeticEnv(s.root, { AGENTLANE_STATE_DIR: s.stateDir, CLAUDE_PROJECT_DIR: project, ...env }),
+        timeout: 10_000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return { stderr: result.stderr, ms: Date.now() - started };
+    };
+    sessionEnd('clear');
+    const atOnce = sessionEnd('clear');
+    assert.equal(atOnce.stderr, '');
+    const db = new DatabaseSync(databasePath(s.stateDir), { timeout: 5000 });
+    db.exec('BEGIN IMMEDIATE');
+    let hook: { stderr: string; ms: number };
+    try {
+      hook = sessionEnd('other');
+      assert.match(hook.stderr, /releasing 1 lane\(s\) .* in the background/);
+      assert.deepEqual(laneIds(s), [project], 'the hook released the lane itself, or waited for the worker');
+    } finally {
+      db.exec('COMMIT');
+      db.close();
+    }
     const log = path.join(s.stateDir, 'session-end.log');
     const released = () => /released lane \w+ of process/.test(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '');
     const deadline = Date.now() + 10_000;
@@ -215,8 +278,12 @@ test('session-end from the real CLI detaches a worker that outlives the hook and
     assert.deepEqual(laneIds(s), []);
     assert.match(fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '(no log)', /released lane \w+ of process/);
     assert.ok(
-      hookMs < (SESSION_END_TIMEOUT_S * 1000) / 2,
-      `the hook returned in ${String(hookMs)} ms, against the ${String(SESSION_END_TIMEOUT_S)} s timeout the plugin declares`,
+      hook.ms < PLUGIN_SESSION_END_BUDGET_MS,
+      `the hook returned in ${String(hook.ms)} ms; Claude Code gives a plugin's session-end hook ${String(PLUGIN_SESSION_END_BUDGET_MS)} ms`,
+    );
+    assert.ok(
+      hook.ms - atOnce.ms < 500,
+      `the hook took ${String(hook.ms)} ms, ${String(hook.ms - atOnce.ms)} ms longer than one that returns at once`,
     );
   } finally {
     me.kill('SIGKILL');
@@ -276,14 +343,25 @@ test('setup runs the project’s setup hook in the worktree without claiming, an
       }),
     );
     const stateDir = path.join(root, 'state');
-    const env = { PATH: process.env.PATH, HOME: process.env.HOME, AGENTLANE_STATE_DIR: stateDir, AGENTLANE_LANE: 'stale' };
+    const sockets = path.join(root, 'sockets');
+    const env = {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      AGENTLANE_STATE_DIR: stateDir,
+      AGENTLANE_USER_TEMP: sockets,
+      AGENTLANE_LANE: 'stale',
+    };
     const result = spawnSync(process.execPath, [CLI, 'setup'], { cwd: repo, encoding: 'utf8', env });
     assert.equal(result.status, 0, result.stderr);
     assert.equal(result.stdout, '');
     assert.match(result.stderr, /to-stdout/);
     assert.equal(fs.readFileSync(path.join(repo, 'setup.out'), 'utf8'), 'installed\n');
     const vars = fs.readFileSync(path.join(repo, 'setup.env'), 'utf8').trim().split('\n').sort();
-    assert.deepEqual(vars, [`AGENTLANE_STATE_DIR=${stateDir}`, `AGENTLANE_WORKTREE=${fs.realpathSync(repo)}`]);
+    assert.deepEqual(vars, [
+      `AGENTLANE_STATE_DIR=${stateDir}`,
+      `AGENTLANE_USER_TEMP=${sockets}`,
+      `AGENTLANE_WORKTREE=${fs.realpathSync(repo)}`,
+    ]);
     assert.equal(fs.existsSync(path.join(stateDir, 'registry.sqlite')), false, 'no registry was created');
 
     fs.writeFileSync(

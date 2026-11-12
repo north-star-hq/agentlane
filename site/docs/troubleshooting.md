@@ -18,7 +18,7 @@ When `up` and `doctor` find no `agentlane.json`, or no agent wired, they say so 
 
 ## The pool is full
 
-Every simulator or emulator in the pool is held by a lane, and none is idle long enough to take over. `claim` and `up` wait in the queue for up to 600 seconds, naming the lanes ahead and the holders, then refuse with three ways out:
+Every simulator or emulator in the pool is held by a lane. No lane takes over another, but a lane that goes 30 minutes without a call parks and gives its device back, and the next claim in the queue gets it. `claim` and `up` wait in the queue for up to 600 seconds, naming the lanes ahead and the holders, then refuse with three ways out:
 
 ```text
 node_modules/.bin/agentlane claim --timeout 1800   (wait up to 30 minutes for a slot)
@@ -55,7 +55,7 @@ npx agentlane driver install --from ~/Downloads/maestro-2.11.0-agentlane.1.zip
 
 ## Releasing a stuck lane
 
-`release` in a folder frees that folder's lane for the session that holds it. A lane whose session has died is freed at the next `claim` or `up` anywhere on the machine. To free one by hand:
+`release` in a folder frees that folder's lane for the session that holds it. A lane whose session has died is parked within 5 minutes while an agentlane MCP server runs on the machine, or at the next agentlane command, and ends 30 minutes later. `npx agentlane reap` runs that sweep now. To free one by hand:
 
 ```sh
 npx agentlane status
@@ -64,6 +64,18 @@ npx agentlane release --lane 71d66b95 --force
 ```
 
 Without `--force`, `release --lane` frees your own lane or one whose owner is proven gone. `--force` frees it even when its owner is alive or can't be judged, so use it only when you know that session is finished. For a lane that has already ended, `release --lane` runs the teardowns still pending for it, and with `--force` drops the record of a teardown that fails again.
+
+## The app is gone after a break
+
+A lane that goes 30 minutes without a call is parked: its simulator or emulator shuts down and its servers stop, while it keeps its ports and data. `status` says since when, and `doctor` warns `parked`. The next call, such as `look`, `exec` or `up`, brings it back before it runs. To keep a lane up while someone looks at the app, hold it first:
+
+```sh
+npx agentlane keep --for 2h --reason "the user is reviewing the checkout screen"
+```
+
+## doctor fails `hooks <agent>`
+
+The agent's hooks can't reach the toolkit, so its guard doesn't run and its session's lanes aren't released when it ends. The line names the cause and the fix. Most often the project's dependencies aren't installed, so `node_modules/.bin/agentlane` is missing, or the hooks are older than this version: run `npx agentlane init` again and commit what it changes. In a project that enables the Claude Code plugin, `init` writes the hooks into `.claude/settings.json` too, so they run where the plugin isn't installed.
 
 ## The browser opens signed out
 

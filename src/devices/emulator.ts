@@ -3,13 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { rotateLog } from '../disk-limits.ts';
 import { JAVA_HOME_ENV } from '../hooks/env.ts';
 import { EMULATOR_NAME_PREFIX, FORMER } from '../name.ts';
 import { emulatorSerial } from '../registry/config.ts';
 import { isPoolName } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
 import type { BackendDevice, DeviceBackend, DeviceSpec, SpecRequest } from './backend.ts';
-import { DeviceBackendError } from './backend.ts';
+import { DeviceBackendError, DeviceRunningError } from './backend.ts';
 
 export const MAESTRO_DRIVER_PACKAGE = 'dev.mobile.maestro';
 export const DEFAULT_DEVICE_PROFILE = 'pixel_8';
@@ -17,6 +18,7 @@ export const EMULATOR_FLAGS = ['-no-window', '-no-audio', '-no-boot-anim'] as co
 
 const BOOT_TIMEOUT_MS = 300_000;
 const STOP_TIMEOUT_MS = 60_000;
+export const EMULATOR_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 
 export interface AndroidSdk {
@@ -39,6 +41,8 @@ export interface Avd {
   name: string;
   deviceType: string;
   runtime: string;
+  ini: string;
+  dir: string;
 }
 
 function isFile(file: string): boolean {
@@ -197,13 +201,15 @@ export function readAvds(home: string): Avd[] {
   }
   return files.map(file => {
     const name = file.slice(0, -'.ini'.length);
-    const pointer = readProperties(path.join(home, file));
-    const dir = pointer.get('path') ?? path.join(home, `${name}.avd`);
+    const ini = path.join(home, file);
+    const dir = readProperties(ini).get('path') ?? path.join(home, `${name}.avd`);
     const config = readProperties(path.join(dir, 'config.ini'));
     return {
       name,
       deviceType: config.get('hw.device.name') ?? '',
       runtime: sysdirToImage(config.get('image.sysdir.1') ?? ''),
+      ini,
+      dir,
     };
   });
 }
@@ -342,6 +348,8 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
           deviceType: avd.deviceType,
           runtime: avd.runtime,
           booted: live.has(avd.name),
+          stopped: !live.has(avd.name),
+          disk: { paths: [avd.ini, avd.dir], bytes: null },
           ...(serial ? { serial } : {}),
         };
       });
@@ -370,9 +378,10 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
       return name;
     },
 
-    delete(id) {
+    delete(id, whenRunning = 'shut-down') {
       assertPoolAvd(id);
-      backend.shutdown(id);
+      if (whenRunning === 'shut-down') backend.shutdown(id);
+      else if (!stopped(id)) throw new DeviceRunningError(id);
       const tool = sdk().avdmanager;
       const java = findJavaHome(options.env);
       if (!tool || !java) throw new DeviceBackendError(`deleting ${id} needs avdmanager and a JDK 17 or newer`);
@@ -415,6 +424,7 @@ export function createEmulatorBackend(options: EmulatorBackendOptions): DeviceBa
       if (live.get(id) !== serial) {
         if (live.has(id)) backend.shutdown(id);
         fs.mkdirSync(options.logDir, { recursive: true, mode: 0o700 });
+        rotateLog(log, EMULATOR_LOG_MAX_BYTES);
         const out = fs.openSync(log, 'a');
         const started = spawn(sdk().emulator, ['-avd', id, '-port', String(consolePort), ...EMULATOR_FLAGS], {
           detached: true,

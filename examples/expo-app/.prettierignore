@@ -6,3 +6,4 @@ build/
 web/test-results/
 web/playwright-report/
 web/.auth/
+.claude/settings.json

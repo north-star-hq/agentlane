@@ -2,6 +2,7 @@ import path from 'node:path';
 import { ENV_PREFIX, envName } from '../name.ts';
 import type { ProjectConfig } from '../project/config.ts';
 import { BUILT_IN_SERVICE_TYPES, WEB_PLATFORM } from '../project/schema.ts';
+import { USER_TEMP_ENV } from '../driver/paths.ts';
 import { OWNER_PID_ENV } from '../registry/owner.ts';
 import { STATE_DIR_ENV } from '../registry/paths.ts';
 import type { LaneInfo } from '../registry/types.ts';
@@ -25,7 +26,7 @@ export function evidenceDir(logsDir: string): string {
   return path.join(logsDir, 'evidence');
 }
 
-const SETTINGS = new Set([STATE_DIR_ENV, OWNER_PID_ENV, JAVA_HOME_ENV]);
+const SETTINGS = new Set([STATE_DIR_ENV, USER_TEMP_ENV, OWNER_PID_ENV, JAVA_HOME_ENV]);
 
 export function portVariable(service: string): string {
   return envName(`${service.toUpperCase().replaceAll('-', '_')}_PORT`);

@@ -13,11 +13,12 @@ export interface RegistryConfig {
   poolSize: number;
   emulatorPoolSize: number;
   memoryBudgetMb: number;
-  idleMs: number;
+  parkMs: number;
   blocks: Readonly<Record<string, PortBlock>>;
 }
 
 export const HOUR_MS = 3_600_000;
+export const MINUTE_MS = 60_000;
 
 export const DEVICE_MEMORY_MB: Readonly<Record<Platform, number>> = { ios: 4000, android: 3400 };
 
@@ -36,7 +37,7 @@ export const DEFAULT_CONFIG: RegistryConfig = {
   poolSize: 5,
   emulatorPoolSize: 5,
   memoryBudgetMb: 5 * DEVICE_MEMORY_MB.ios,
-  idleMs: 2 * HOUR_MS,
+  parkMs: 30 * MINUTE_MS,
   blocks: {
     metro: { first: 41100, last: 41119 },
     api: { first: 41200, last: 41219 },
@@ -56,7 +57,7 @@ function isPort(value: unknown): value is number {
 export function parseConfig(raw: unknown, source: string): RegistryConfig {
   const bad = (problem: string, fix: string) => new UsageError(`${source}: ${problem}`, fix);
   if (!isRecord(raw)) throw bad('the file is not a JSON object', `write an object such as {"poolSize": 5}`);
-  const known = ['poolSize', 'emulatorPoolSize', 'memoryBudgetGB', 'idleHours', 'ports'];
+  const known = ['poolSize', 'emulatorPoolSize', 'memoryBudgetGB', 'parkMinutes', 'idleHours', 'ports'];
   for (const key of Object.keys(raw)) {
     if (!known.includes(key)) throw bad(`unknown setting '${key}'`, `use only ${known.join(', ')}`);
   }
@@ -81,12 +82,18 @@ export function parseConfig(raw: unknown, source: string): RegistryConfig {
     }
     memoryBudgetMb = Math.round(raw.memoryBudgetGB * 1000);
   }
-  let idleMs = DEFAULT_CONFIG.idleMs;
-  if (raw.idleHours !== undefined) {
-    if (typeof raw.idleHours !== 'number' || !(raw.idleHours > 0)) {
-      throw bad('idleHours must be a positive number', 'set "idleHours": 2 (the default)');
+  let parkMs = DEFAULT_CONFIG.parkMs;
+  if (raw.parkMinutes !== undefined) {
+    if (typeof raw.parkMinutes !== 'number' || !(raw.parkMinutes > 0)) {
+      throw bad(
+        'parkMinutes must be a positive number',
+        `set "parkMinutes": ${String(DEFAULT_CONFIG.parkMs / MINUTE_MS)} (the default)`,
+      );
     }
-    idleMs = raw.idleHours * HOUR_MS;
+    parkMs = Math.round(raw.parkMinutes * MINUTE_MS);
+  }
+  if (raw.idleHours !== undefined && (typeof raw.idleHours !== 'number' || !(raw.idleHours > 0))) {
+    throw bad('idleHours must be a positive number', 'set "idleHours": 2, or remove it: only 0.4.1 and earlier read it');
   }
   const blocks: Record<string, PortBlock> = { ...DEFAULT_CONFIG.blocks };
   if (raw.ports !== undefined) {
@@ -110,7 +117,7 @@ export function parseConfig(raw: unknown, source: string): RegistryConfig {
     throw bad(`port blocks '${overlap[0]}' and '${overlap[1]}' overlap`, 'give each service type its own range of ports');
   const onEmulators = emulatorOverlap(blocks);
   if (onEmulators) throw bad(emulatorOverlapProblem(onEmulators), 'move that block clear of 5554-5585');
-  return { poolSize, emulatorPoolSize, memoryBudgetMb, idleMs, blocks };
+  return { poolSize, emulatorPoolSize, memoryBudgetMb, parkMs, blocks };
 }
 
 function emulatorOverlap(blocks: Readonly<Record<string, PortBlock>>): string | null {

@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { TestContext } from 'node:test';
+import type { Clock } from '../../src/clock.ts';
 import { systemClock } from '../../src/clock.ts';
 import type { DeviceInfo } from '../../src/devices/tools.ts';
 import { systemProcesses } from '../../src/processes.ts';
@@ -174,11 +175,13 @@ export function world(t: TestContext): World {
   const browser = new FakeBrowser(root);
   const env = {
     PATH: process.env.PATH,
-    HOME: process.env.HOME,
+    HOME: path.join(root, 'home'),
     AGENTLANE_STATE_DIR: state,
     ANDROID_HOME: sdk,
     CLAUDE_CONFIG_DIR: path.join(root, 'claude-config'),
     XDG_STATE_HOME: path.join(root, 'xdg-state'),
+    XDG_DATA_HOME: path.join(root, 'xdg-data'),
+    XDG_CONFIG_HOME: path.join(root, 'xdg-config'),
   };
   const processes = () =>
     readRegistryStatus({ dir: state, processes: systemProcesses, devices: { ios: devices, android: avds } }).lanes.flatMap(
@@ -225,6 +228,18 @@ export function world(t: TestContext): World {
 }
 
 export const OPTIONS: UpOptions = { setup: true, cacheMode: 'use', waitMs: 0 };
+
+/** A clock that reads `at` and sleeps for real, for a sweep run at a moment of the test's choosing. */
+export function clockAt(at: number): Clock {
+  return { now: () => at, sleep: ms => systemClock.sleep(ms) };
+}
+
+/** When a check found the lane's owner gone, as status shows it. */
+export function foundGoneAt(w: World, lane: string): number {
+  const gone = readRegistryStatus({ dir: w.state, processes: systemProcesses }).lanes.find(c => c.id === lane)?.ownerGone;
+  assert.ok(gone, `lane ${lane}'s owner was not found gone`);
+  return gone.foundAt;
+}
 
 export function failures(result: { doctor: { checks: { name: string; ok: boolean; detail: string }[] } }): string {
   return result.doctor.checks

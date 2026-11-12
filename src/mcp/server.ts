@@ -9,12 +9,32 @@ interface Message {
   params?: Record<string, unknown>;
 }
 
+/** Work the server does every `ms` while its input is open, between tool calls; `wait` stands in for the timer. */
+export interface Every {
+  ms: number;
+  run: () => void;
+  wait?: (ms: number) => Promise<void>;
+}
+
 export interface ServeOptions {
   input: NodeJS.ReadableStream;
   output: NodeJS.WritableStream;
   info: { name: string; version: string };
   tools: readonly ToolDefinition[];
   call: (name: string, args: Record<string, unknown>) => Promise<ToolResult>;
+  every?: Every;
+}
+
+function unrefSleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms).unref());
+}
+
+async function repeat(every: Every, open: () => boolean): Promise<void> {
+  const wait = every.wait ?? unrefSleep;
+  while (open()) {
+    await wait(every.ms);
+    if (open()) every.run();
+  }
 }
 
 /** A stdio MCP server: newline-delimited JSON-RPC, tools only. Resolves when the input closes and every call has answered. */
@@ -22,6 +42,8 @@ export function serveMcp(options: ServeOptions): Promise<void> {
   const send = (message: object) => options.output.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
   const lines = createInterface({ input: options.input });
   const inFlight = new Set<Promise<void>>();
+  let open = true;
+  if (options.every) void repeat(options.every, () => open);
   lines.on('line', line => {
     if (!line.trim()) return;
     let message: Message;
@@ -79,6 +101,7 @@ export function serveMcp(options: ServeOptions): Promise<void> {
   });
   return new Promise(resolve => {
     lines.on('close', () => {
+      open = false;
       void Promise.allSettled([...inFlight]).then(() => {
         resolve();
       });

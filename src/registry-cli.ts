@@ -16,20 +16,47 @@ import { describeStart, type ProcessTable } from './processes.ts';
 import { formatAge, formatTime, shellQuote } from './registry/format.ts';
 import type { Owner } from './registry/owner.ts';
 import { DEVICE_MEMORY_MB } from './registry/config.ts';
-import { describeOwner, describeState, isProven, ownerKey, resolveOwner } from './registry/owner.ts';
-import { databasePath, stateDir } from './registry/paths.ts';
+import { describeHostSession, describeOwner, describeState, isProven, ownerKey, resolveOwner } from './registry/owner.ts';
+import { RETURN_WINDOW_MS } from './registry/owner-checks.ts';
+import { databasePath, FORMER_STATE_DIR_ENV, STATE_DIR_ENV, stateDir } from './registry/paths.ts';
 import type { PortProbe } from './registry/ports.ts';
-import type { PruneResult } from './registry/prune.ts';
-import { describePruneResult, listPrunable, renderPruneListing } from './registry/prune.ts';
+import type { LeftoverResult, OrphanResult, PruneContext, PruneResult } from './registry/prune.ts';
+import {
+  deleteLeftovers,
+  deleteOrphan,
+  describeLeftoverResult,
+  describeOrphanResult,
+  describePruneResult,
+  listPrunable,
+  putBackAsideCopies,
+  renderPruneReport,
+  reportPrunable,
+  requireHome,
+} from './registry/prune.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
+import type { Kept } from './registry/registry.ts';
 import { readRegistryStatus, Registry } from './registry/registry.ts';
-import type { Lane, LaneOutcome, LaneStatus, EndedLane, ServiceRequest, StatusReport } from './registry/types.ts';
+import type { LaneHold } from './registry/holds.ts';
+import { DEFAULT_HOLD_MS, parseHoldTime } from './registry/holds.ts';
+import { recordCall } from './registry/touch.ts';
+import { describeRestarts } from './registry/parks.ts';
+import type {
+  Lane,
+  LaneGone,
+  LaneOutcome,
+  LaneStatus,
+  EndedLane,
+  ParkStatus,
+  ServiceRequest,
+  StatusReport,
+} from './registry/types.ts';
 import type { ServiceSystem } from './services/system.ts';
 import { realServiceSystem } from './services/system.ts';
 import type { Teardown } from './up/release.ts';
-import { pruneEndedLaneFiles } from './up/lane-files.ts';
-import { stopEndedLanes, tearDownLane } from './up/release.ts';
+import { LANE_FILES_KEEP_MS, pruneEndedLaneFiles } from './up/lane-files.ts';
+import { tearDownLane } from './up/release.ts';
 import { tearDownEndedResources } from './up/resources.ts';
+import { runSweep, SWEEP_INTERVAL_MS } from './up/sweep.ts';
 import { systemClock } from './clock.ts';
 import { claudeSessionName } from './plugin/session-name.ts';
 import { groupUsage, helpOf, type UsageGroup } from './usage.ts';
@@ -51,9 +78,11 @@ export interface CliDeps {
   adb?: AdbFactory;
   browser?: BrowserTools;
   evidence?: EvidenceSystem;
+  /** Starts the sweep when it has work, as every command does at its start; a claim calls it when it finds work for it. */
+  passBy?: () => void;
 }
 
-export const REGISTRY_COMMANDS = ['claim', 'release', 'status', 'lanes', 'touch', 'prune'] as const;
+export const REGISTRY_COMMANDS = ['claim', 'release', 'keep', 'status', 'lanes', 'touch', 'reap', 'prune'] as const;
 
 export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
   title: 'Lanes:',
@@ -84,16 +113,45 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
                --force               with an id: release it even if its owner is alive or can't be judged;
                                      for an ended lane, drop the record of a teardown that fails again
 `,
-    status: `  status     Every lane on this Mac: owner, folder, start, idle time, last action.
+    keep: `  keep       Hold this session's lane for this folder up while a person looks at the running
+             app, so it is not parked until the hold ends, however long since its last call:
+             ${TOOL} keep --for 2h --reason "the user is reviewing the checkout screen".
+             Running keep again replaces the hold. The hold ends with the lane, at release or when
+             the session ends, and status shows it with its reason and its end.
+               --for <time>          how long: minutes or hours, such as 45m, 2h or 1h30m (default 1h,
+                                     at most 24h)
+               --reason <text>       who is looking at what; status shows it (required)
+               --worktree <dir>      the folder whose lane to hold (default: this git worktree)
+`,
+    status: `  status     Every lane on this Mac: owner, folder, start, idle time, last action, and whether
+             it is held or parked.
 `,
     lanes: `  lanes      --json: the same as status, as JSON for tools.
 `,
     touch: `  touch      Record activity on this session's lane (--action <text>).
 `,
-    prune: `  prune      List the pool simulators and emulators no lane holds, 0.2.x's included; --yes
-             deletes them to free their disk. Each deletion takes the registry's lock and checks
-             again that no lane holds the device, so one claimed meanwhile is kept. A device the
-             registry has no record of is never deleted, even one named like a pool device.
+    reap: `  reap       Run the sweep now, for every lane on this Mac, and print what it did. Every ${TOOL}
+             command runs it in the background as it starts, and each running MCP server every
+             ${formatAge(SWEEP_INTERVAL_MS)}; reap is for running it on a schedule of your own, such as cron or
+             launchd. It asks the process table about the owners no call or check has shown alive
+             lately. A lane whose owner is gone is parked at once: its servers stop and its device goes
+             back to the pool. ${formatAge(RETURN_WINDOW_MS)} later it ends with everything release does, unless
+             the owner's Claude Code session or Codex thread calls on it from its folder first and takes
+             it back with its ports and resources. It also parks the lanes unused for the park window.
+               --json                print what it did as JSON
+`,
+    prune: `  prune      List what takes disk and nothing uses, each with its size; --yes deletes it:
+             the pool simulators and emulators no lane holds, 0.2.x's included; devices named
+             like pool devices that no registry prune reads records and that are shut down;
+             and, while no registry 0.2.x may use has a lane, the downloads 0.2.x left in
+             ~/.local/share/agent-env and its build cache in .git/agent-env of this repository
+             and of every folder a registry names. prune reads the registries in
+             ${STATE_DIR_ENV} and ${FORMER_STATE_DIR_ENV} when they are set, and in the
+             ${TOOL} and agent-env folders of $XDG_STATE_HOME and ~/.local/state. It
+             can't see a lane whose registry is in any other folder, so run prune with
+             the same variables that lane's ${TOOL} runs with. Each deletion locks those
+             registries and checks again, so a device a lane of either version claimed
+             meanwhile is kept.
                --yes                 delete them; without it, prune only lists
                --json                print the listing, and with --yes each result, as JSON
 `,
@@ -186,23 +244,65 @@ function renderOutcome(outcome: LaneOutcome, now: number, deps: CliDeps, json: b
     deps.stdout(`${JSON.stringify({ ...outcome, env: laneEnv(lane) }, null, 2)}\n`);
     return;
   }
-  for (const e of outcome.freed) deps.stderr(`${TOOL}: ${describeEnded(e, now)}\n`);
-  for (const e of outcome.tookOver) deps.stderr(`${TOOL}: ${describeEnded(e, now)}\n`);
   for (const note of outcome.notes) deps.stderr(`${TOOL}: ${note}\n`);
   const verb = outcome.created ? 'claimed lane' : 'reusing lane';
   deps.stderr(`${TOOL}: ${verb} ${lane.id} for ${describeOwner(lane.owner)} in ${lane.worktree}: ${describeLane(lane)}\n`);
   for (const [key, value] of Object.entries(laneEnv(lane))) deps.stdout(`export ${key}=${shellQuote(value)}\n`);
 }
 
+function renderKept(kept: Kept, deps: CliDeps): void {
+  const { lane, hold, replaced, park } = kept;
+  deps.stderr(
+    `${TOOL}: holding lane ${lane.id} until ${formatTime(hold.until)} (${formatAge(hold.until - hold.since)}): ${hold.reason}\n`,
+  );
+  if (replaced) deps.stderr(`${TOOL}: this replaces its hold until ${formatTime(replaced.until)}: ${replaced.reason}\n`);
+  if (park?.state === 'parked') {
+    deps.stderr(
+      `${TOOL}: lane ${lane.id} is parked; its next call brings back ${describeRestarts(park.restarts)}, and the hold keeps it up from then\n`,
+    );
+  } else if (park?.state === 'parking') {
+    deps.stderr(
+      `${TOOL}: lane ${lane.id} is being parked by pid ${String(park.holder?.pid ?? 'unknown')}; if it parks, its next call brings it back, and the hold keeps it up from then\n`,
+    );
+  }
+}
+
 export type SessionNames = (lane: LaneStatus) => string | null;
 
-function laneLines(c: LaneStatus, sessionName: SessionNames): string[] {
+function parkLines(park: ParkStatus, now: number): string[] {
+  const at = park.parkedAt ?? park.since;
+  const head =
+    park.state === 'parked'
+      ? `      parked       since ${formatTime(at)} (${formatAge(now - at)} ago); its next call brings back ${describeRestarts(park.restarts)}`
+      : `      ${park.state.padEnd(13)}since ${formatTime(park.since)}, by pid ${String(park.by ?? 'unknown')}`;
+  return [head, ...park.problems.map(p => `      problem      ${p}`)];
+}
+
+function goneLine(gone: LaneGone, c: LaneStatus, now: number): string {
+  const found = `      owner gone   ${describeState(gone.state)}, found ${formatTime(gone.foundAt)} (${formatAge(now - gone.foundAt)} ago)`;
+  if (gone.by !== null) return `${found}; pid ${String(gone.by)} is ending the lane`;
+  if (now >= gone.endsAt) return `${found}; the next sweep ends the lane`;
+  const session = describeHostSession(c.owner);
+  const ends = `the lane ends ${formatTime(gone.endsAt)} (in ${formatAge(gone.endsAt - now)})`;
+  return session
+    ? `${found}; ${ends} unless ${session} calls on it from its folder`
+    : `${found}; ${ends}, and nothing can take it back`;
+}
+
+function holdLine(hold: LaneHold, now: number): string {
+  return `      held         until ${formatTime(hold.until)} (${formatAge(hold.until - now)} left): ${hold.reason}`;
+}
+
+function laneLines(c: LaneStatus, sessionName: SessionNames, now: number): string[] {
   const state = c.ownerState === 'alive' ? 'alive' : describeState(c.ownerState).toUpperCase();
   const name = sessionName(c);
   const lines = [
     `  ${c.id}  ${describeOwner(c.owner)}${name ? ` "${name}"` : ''}  [${state}]`,
     `      folder       ${c.worktree}${c.projectRoot !== c.worktree ? `  (project ${c.projectRoot})` : ''}`,
     `      started      ${formatTime(c.createdAt)}   idle ${formatAge(c.idleMs)}   last action: ${c.lastAction}`,
+    ...(c.ownerGone ? [goneLine(c.ownerGone, c, now)] : []),
+    ...(c.hold ? [holdLine(c.hold, now)] : []),
+    ...(c.park ? parkLines(c.park, now) : []),
   ];
   if (c.device) {
     lines.push(
@@ -224,7 +324,9 @@ function laneLines(c: LaneStatus, sessionName: SessionNames): string[] {
     lines.push(`      resources    ${shown.join(', ')}`);
   }
   for (const p of c.processes)
-    lines.push(`      process      ${p.service} pid ${String(p.pid)} (started ${describeStart(p.start)})`);
+    lines.push(
+      `      process      ${p.service} pid ${String(p.pid)} (started ${describeStart(p.start)})  ${p.state === 'unknown' ? "can't tell" : p.state}`,
+    );
   if (c.ownerState === 'cant-tell')
     lines.push(`      left alone: its owner can't be judged; ${CLI} release --lane ${c.id} --force frees it`);
   return lines;
@@ -242,7 +344,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
   const { config } = report;
   const lines = [
     `${TOOL} registry: ${report.stateDir}`,
-    `pool: ${poolLine(report)}; idle lanes are reclaimable after ${formatAge(config.idleMs)} when the pool is full`,
+    `pool: ${poolLine(report)}; a lane is parked ${formatAge(config.parkMs)} after its last call, giving its device back, unless a hold keeps it up; a lane whose owner is gone is parked at once and ends ${formatAge(RETURN_WINDOW_MS)} later`,
     `ports: ${Object.entries(config.blocks)
       .map(([type, b]) => `${type} ${String(b.first)}-${String(b.last)}`)
       .join(', ')}`,
@@ -251,7 +353,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
   if (report.lanes.length === 0) lines.push('no lanes');
   else {
     lines.push(`lanes (${String(report.lanes.length)}):`);
-    for (const c of report.lanes) lines.push(...laneLines(c, sessionName));
+    for (const c of report.lanes) lines.push(...laneLines(c, sessionName, report.now));
   }
   if (report.queue.length > 0) {
     lines.push('', 'queue:');
@@ -323,6 +425,7 @@ function open(deps: CliDeps): Registry {
     devices: deps.devices,
     ...(deps.clock ? { clock: deps.clock } : {}),
     ...(deps.pollMs !== undefined ? { pollMs: deps.pollMs } : {}),
+    ...(deps.passBy ? { sweepSoon: deps.passBy } : {}),
   });
 }
 
@@ -397,7 +500,18 @@ async function pendingRelease(deps: CliDeps, registry: Registry, target: Release
   return teardowns.some(t => t.problems.length > 0 && !target.force) ? 1 : 0;
 }
 
+function takeBackIn(deps: CliDeps, who: Owner, worktree: string): void {
+  if (!fs.existsSync(databasePath(stateDir(deps.env)))) return;
+  const registry = open(deps);
+  try {
+    registry.takeBack(who, worktree);
+  } finally {
+    registry.close();
+  }
+}
+
 async function releaseLanes(deps: CliDeps, who: Owner, target: ReleaseTarget, json: boolean): Promise<number> {
+  if (target.folder !== null) takeBackIn(deps, who, target.folder);
   const teardowns = await tearDownTargets(deps, who, target);
   const registry = open(deps);
   const notes: string[] = [];
@@ -443,27 +557,77 @@ function releaseId(positionals: readonly string[], flag: string | undefined): st
   return bare ?? flag ?? null;
 }
 
+const PRUNE_LOCK_WAIT_MS = 30_000;
+
 function prune(deps: CliDeps, yes: boolean, json: boolean): number {
+  requireHome(deps.env);
   const dir = stateDir(deps.env);
+  const ctx: PruneContext = { env: deps.env, cwd: deps.cwd, lockWaitMs: PRUNE_LOCK_WAIT_MS };
   const registry = fs.existsSync(databasePath(dir)) ? open(deps) : null;
   try {
-    const listing = registry ? registry.prunable() : listPrunable(null, dir, deps.devices);
-    if (!json) deps.stdout(renderPruneListing(listing, yes));
+    const report = reportPrunable(registry ? registry.prunable() : listPrunable(null, dir, deps.devices), ctx);
+    if (!json) deps.stdout(renderPruneReport(report, yes));
+    const tell = (outcome: string, line: string) => {
+      if (json) return;
+      if (outcome === 'failed') deps.stderr(`${TOOL}: ${line}\n`);
+      else deps.stdout(`${line}\n`);
+    };
     const results: PruneResult[] = [];
-    if (yes && registry) {
-      for (const device of listing.free) {
-        const result = registry.pruneDevice(device);
-        results.push(result);
-        if (json) continue;
-        if (result.outcome === 'failed') deps.stderr(`${TOOL}: ${describePruneResult(result)}\n`);
-        else deps.stdout(`${describePruneResult(result)}\n`);
+    const orphanResults: OrphanResult[] = [];
+    let leftoverResults: LeftoverResult[] = [];
+    if (yes) {
+      if (registry) {
+        for (const device of report.free) {
+          const result = registry.pruneDevice(device);
+          results.push(result);
+          tell(result.outcome, describePruneResult(result));
+        }
       }
+      for (const device of report.orphans) {
+        const result = deleteOrphan(ctx, deps.devices[device.platform], device);
+        orphanResults.push(result);
+        tell(result.outcome, describeOrphanResult(result));
+      }
+      leftoverResults =
+        report.leftoversKept === null ? deleteLeftovers(ctx, report.leftovers) : putBackAsideCopies(ctx, report.leftovers);
+      for (const result of leftoverResults) tell(result.outcome, describeLeftoverResult(result));
     }
-    if (json) deps.stdout(`${JSON.stringify({ ...listing, ...(yes ? { results } : {}) }, null, 2)}\n`);
-    return results.some(r => r.outcome === 'failed') ? 1 : 0;
+    if (json) {
+      const done = yes ? { results, orphanResults, leftoverResults } : {};
+      deps.stdout(`${JSON.stringify({ ...report, ...done }, null, 2)}\n`);
+    }
+    return [...results, ...orphanResults, ...leftoverResults].some(r => r.outcome === 'failed') ? 1 : 0;
   } finally {
     registry?.close();
   }
+}
+
+async function reap(deps: CliDeps, json: boolean): Promise<number> {
+  const said: string[] = [];
+  const report = await runSweep({
+    dir: stateDir(deps.env),
+    env: deps.env,
+    processes: deps.processes,
+    system: deps.system ?? realServiceSystem,
+    clock: deps.clock ?? systemClock,
+    devices: deps.devices,
+    ports: deps.ports,
+    browser: deps.browser ?? realBrowserTools,
+    sim: deps.sim ?? null,
+    ...(deps.adb ? { adb: deps.adb } : {}),
+    ...(deps.evidence ? { evidence: deps.evidence } : {}),
+    log: line => said.push(line),
+  });
+  if (json) deps.stdout(`${JSON.stringify(report, null, 2)}\n`);
+  else {
+    for (const line of said) deps.stderr(`${TOOL}: ${line}\n`);
+    if (said.length === 0) {
+      const asked =
+        report.checked.length === 0 ? 'no owner was due a check' : `the owners of ${report.checked.join(', ')} are not gone`;
+      deps.stderr(`${TOOL}: nothing to park or end: ${asked}\n`);
+    }
+  }
+  return report.problems.length > 0 ? 1 : 0;
 }
 
 function now(deps: CliDeps): number {
@@ -517,18 +681,12 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
         renderOutcome(outcome, now(deps), deps, values.json);
         const state = stateDir(deps.env);
         const stopped = [
-          ...(await stopEndedLanes(teardownDeps(deps), state, [...outcome.freed, ...outcome.tookOver])),
           ...(await stopEndedBrowsers(teardownDeps(deps).browser, registry, state, teardownDeps(deps).clock)),
           ...(await tearDownEndedResources(teardownDeps(deps), registry, state)),
         ];
         for (const t of stopped)
           for (const line of [...t.notes, ...t.problems]) deps.stderr(`${TOOL}: lane ${t.lane}: ${line}\n`);
-        pruneEndedLaneFiles(
-          state,
-          new Set([...registry.status().lanes.map(c => c.id), ...registry.pendingTeardowns().map(t => t.lane)]),
-          now(deps),
-          deps.env,
-        );
+        pruneEndedLaneFiles(state, registry.keptLaneIds(now(deps) - LANE_FILES_KEEP_MS), now(deps), deps.env);
         return 0;
       } finally {
         stop?.();
@@ -573,6 +731,39 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
       );
       return 0;
     }
+    case 'keep': {
+      const { values } = parseArgs({
+        args,
+        strict: true,
+        options: { for: { type: 'string' }, reason: { type: 'string' }, worktree: { type: 'string' } },
+      });
+      const forMs = values.for === undefined ? DEFAULT_HOLD_MS : parseHoldTime(values.for);
+      const reason = values.reason?.trim() ?? '';
+      if (reason === '') {
+        throw new UsageError(
+          'keep needs --reason',
+          `say who is looking at what: ${CLI} keep --reason "the user is reviewing the checkout screen"`,
+        );
+      }
+      const who = owner();
+      const worktree = resolveFolder(values.worktree ?? deps.cwd).worktree;
+      const registry = open(deps);
+      try {
+        const lane = registry.takeBack(who, worktree);
+        if (!lane) {
+          throw new NotClaimed(
+            `${describeOwner(who)} holds no lane in ${worktree}`,
+            `${CLI} up   (run in ${worktree}; keep holds a lane that is up)`,
+          );
+        }
+        const ref = { id: lane.id, token: lane.token };
+        recordCall(stateDir(deps.env), ref, now(deps));
+        renderKept(registry.keep(ref, reason, forMs), deps);
+        return 0;
+      } finally {
+        registry.close();
+      }
+    }
     case 'touch': {
       const { values } = parseArgs({
         args,
@@ -588,6 +779,10 @@ async function dispatch(command: string, args: string[], deps: CliDeps): Promise
       } finally {
         registry.close();
       }
+    }
+    case 'reap': {
+      const { values } = parseArgs({ args, strict: true, options: { json: { type: 'boolean', default: false } } });
+      return reap(deps, values.json);
     }
     case 'prune': {
       const { values } = parseArgs({

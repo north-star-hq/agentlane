@@ -14,7 +14,7 @@ Pool devices belong to agentlane, not to a project: simulators named `agentlane-
 | Emulators          | 5       | `emulatorPoolSize`                          |
 | Memory budget      | 20 GB   | `memoryBudgetGB`, counted at 4 GB per simulator and 3.4 GB per emulator |
 
-The pool never touches a simulator or emulator you made yourself. Emulators run headless, without a window, audio or boot animation, and keep Android's Quick Boot snapshot, so a pool emulator that has booted once comes back in seconds. A lane releases its device by shutting it down.
+The pool never touches a simulator or emulator you made yourself. Emulators run headless, without a window, audio or boot animation, and keep Android's Quick Boot snapshot, so a pool emulator that has booted once comes back in seconds. A lane releases its device by shutting it down, and so does a lane that parks after 30 minutes without a call; the next call gets it, or another pool device, back.
 
 ## Device types and runtimes
 
@@ -72,14 +72,22 @@ On an emulator, `location clear`, `push` and `clipboard` have no adb equivalent 
 
 ## Pruning the pool
 
-Pool devices take disk. `prune` lists the ones no lane holds, and `prune --yes` deletes them:
+Pool devices take disk. `prune` lists what takes disk and nothing uses, each with its size, and `prune --yes` deletes it:
 
 ```sh
 npx agentlane prune
 npx agentlane prune --yes
 ```
 
-Each deletion takes the registry's lock and checks again that no lane holds the device, so one claimed in the meantime is kept. A device the registry has no record of is never deleted, even one named like a pool device. The next lane after a prune waits while a new device is created, so prune when you want the disk back; cleaning up after your own work is `release`.
+- The pool simulators and emulators no lane holds. One that is booted, starting or stopping is shut down first.
+- Simulators and emulators named like pool devices (`agentlane-pool-*`, `agentlane-emu-*`, `agent-env-pool-*`, `agent-env-emu-*`) that no registry records. prune deletes one of these only while it is shut down, and never shuts one down to delete it.
+- What 0.2.x left: its Maestro and browser downloads in `~/.local/share/agent-env`, and its build cache in `.git/agent-env` of this repository and of every folder a registry names. prune deletes them only while no registry 0.2.x may use has a lane or a waiting claim.
+
+A device that a release or a claim is shutting down or deleting is kept, and the listing names the process doing it. Each deletion locks the registries and checks again that none of them records the device, so a device a lane of either version claimed in the meantime is kept.
+
+prune reads the registries in `$AGENTLANE_STATE_DIR` and `$AGENT_ENV_STATE_DIR` when they are set, and in the `agentlane` and `agent-env` folders of `$XDG_STATE_HOME` and `~/.local/state`. It can't see a lane whose registry is in any other folder, so run it with the same variables as the agentlane that lane runs.
+
+The next lane after a prune waits while a new device is created, so prune when you want the disk back; cleaning up after your own work is `release`.
 
 ## Sharing a Mac with 0.2.x
 

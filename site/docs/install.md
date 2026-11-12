@@ -1,7 +1,7 @@
 ---
 title: "Install for your agent"
 short: "What init detects, installs and writes for each agent, and the Claude Code plugin."
-summary: "agentlane works the same from Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity. `npx agentlane init` finds the agents your project uses, adds agentlane as a dev dependency, and writes each agent's own files from one source: the skills, the MCP server and the hooks. Claude Code can load agentlane as a plugin instead."
+summary: "agentlane works the same from Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity. `npx agentlane init` finds the agents your project uses, adds agentlane as a dev dependency, and writes each agent's own files from one source: the skills, the MCP server and the hooks. In Claude Code, a plugin can bring the skills and the MCP server instead; the hooks always go in the project's settings."
 ---
 
 ## One command
@@ -65,7 +65,7 @@ The hooks and the MCP server that `init` writes run `node_modules/.bin/agentlane
 
 ## What init writes
 
-Every agent gets the same skills, the same MCP server and the same two hooks, in the file and format that agent reads.
+Every agent gets the same skills, the same MCP server and the same two hooks, in the file and format that agent reads. Antigravity, which has no session-end event, gets the guard hook only.
 
 | Agent          | Skills                                                  | MCP server                | Guard and release hooks                         |
 | -------------- | ------------------------------------------------------- | ------------------------- | ----------------------------------------------- |
@@ -86,11 +86,11 @@ Each agent asks you once to trust what `init` wrote. `init` prints these notes a
 
 ### Claude Code
 
-Claude Code asks once to approve the MCP server in `.mcp.json`. The hooks are in `.claude/settings.json`: the guard on `Bash` and `Monitor` commands, and the release on `SessionEnd`, with a 10-second budget.
+Claude Code asks once to approve the MCP server in `.mcp.json`. The hooks are in `.claude/settings.json`, with or without the plugin: the guard on `Bash` and `Monitor` commands, and the release on `SessionEnd`, with a 10-second budget.
 
 ### Codex
 
-Codex reads `.codex/` only in a trusted project. It runs each hook only after you review and trust it with `/hooks`, and again whenever the hook changes.
+Codex reads `.codex/` only in a trusted project. It runs each hook only after you review and trust it with `/hooks`, and again whenever the hook changes, as it does when an upgrade's `init` rewrites it.
 
 ### Cursor
 
@@ -106,11 +106,11 @@ Gemini CLI warns when the project's hooks change, and asks before it activates a
 
 ### Antigravity
 
-Antigravity has no session-end hook. Its lanes are freed once Antigravity exits and the next claim on the machine reaps them.
+Antigravity gets the guard hook only, because it has no session-end event. Its lanes are parked 30 minutes after their last call, and end 30 minutes after the sweep finds Antigravity gone. [The device guard and session hooks](guard.md#per-agent) says why its `Stop` event isn't used.
 
 ## The Claude Code plugin
 
-In Claude Code, agentlane can come from a plugin instead of the files `init` writes. The plugin brings the same skills, the MCP server as `plugin:agentlane:device`, the guard and release hooks, and `agentlane` on the Bash tool's PATH. It starts the MCP server from the project's own `node_modules/.bin/agentlane`, so the tools and the CLI are always the same version.
+In Claude Code, the skills and the MCP server can come from a plugin instead of the files `init` writes. The plugin brings the same skills, the MCP server as `plugin:agentlane:device`, its own copy of the guard and release hooks, and `agentlane` on the Bash tool's PATH. It starts the MCP server from the project's own `node_modules/.bin/agentlane`, so the tools and the CLI are always the same version.
 
 Install agentlane in the project as above, then commit this to `.claude/settings.json`:
 
@@ -123,7 +123,9 @@ Install agentlane in the project as above, then commit this to `.claude/settings
 }
 ```
 
-Start setup with `/agentlane:setup`. Wherever Claude Code loads the plugin (the project's settings, your user settings, or `--plugin-dir` in the session that runs `init`), `init` leaves Claude Code to the plugin and removes the copies an earlier `init` wrote. `agentlane doctor` warns when a project wires Claude Code twice.
+Start setup with `/agentlane:setup`. Wherever Claude Code loads the plugin (the project's settings, your user settings, or `--plugin-dir` in the session that runs `init`), `init` leaves the skills and the MCP server to the plugin and removes the copies of its skills an earlier `init` wrote.
+
+`init` still writes the hooks into `.claude/settings.json`. Claude Code runs them there whether or not the plugin is installed on the machine, and gives the session-end hook its declared 10 seconds, where a plugin's session-end hook gets 1.5. Where the plugin's hooks run too, both guards give the same answer, and the session's lanes are released once. `agentlane doctor` warns when a project wires Claude Code's skills or MCP server twice, and when the project enables the plugin but Claude Code hasn't installed it on this machine.
 
 The same plugin folder holds manifests for Codex (`.codex-plugin/plugin.json`), Cursor (`.cursor-plugin/plugin.json`) and Gemini CLI (`gemini-extension.json`). They bring the skills and the MCP server. The hooks still come from `init`, because hooks don't carry over between agents.
 

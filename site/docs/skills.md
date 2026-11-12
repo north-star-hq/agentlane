@@ -43,7 +43,7 @@ It isn't done until its own instructions, followed from a fresh lane, brought ea
 
 ## dev-loop
 
-The contract for running a project's app as an agent: one lane per session and folder, `up` from a bare worktree to the running app, `doctor` before trusting an instance, `exec` for commands that need the lane's variables, `restart` to change one service's environment, and `release` when done. It also says what counts as proof. Exercise the real user path, capture the action and the resulting state, read side effects back, and prove a behaviour with a committed flow or test that the next reader can replay. Interactive probing finds the steps; it never stands in for that run.
+The contract for running a project's app as an agent: one lane per session and folder, `up` from a bare worktree to the running app, `doctor` before trusting an instance, `exec` for commands that need the lane's variables, `restart` to change one service's environment, `keep` to hold the lane up while the user looks at the running app, and `release` when done. It also says what counts as proof. Exercise the real user path, capture the action and the resulting state, read side effects back, and prove a behaviour with a committed flow or test that the next reader can replay. Interactive probing finds the steps; it never stands in for that run.
 
 ## drive
 

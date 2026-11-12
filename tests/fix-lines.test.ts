@@ -17,6 +17,8 @@ const NOT_A_COMMAND_TO_RUN = [
   /`\$\{TOOL\} init --check: /,
   /`\$\{TOOL\} up refused before any build/,
   /another \$\{TOOL\} run\b/,
+  /PROBE_COMMAND = `echo \$\{TOOL\} doctor /,
+  /run npx \$\{TOOL\} init\b/,
 ];
 
 function sources(dir: string): string[] {

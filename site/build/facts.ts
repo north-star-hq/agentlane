@@ -8,8 +8,17 @@ export interface PageSource {
   markdown: string;
 }
 
-/** Set by the session-end hook for the detached process that does the release; nobody sets them by hand. */
-export const INTERNAL_VARIABLES = ['AGENTLANE_SESSION_END_OWNER', 'AGENTLANE_SESSION_END_WAIT_MS'];
+/**
+ * Set by the session-end hook for the detached process that does the release, by doctor for the hook it runs, and by
+ * the test runner for the socket folder its tests use; nobody sets them by hand.
+ */
+export const INTERNAL_VARIABLES = [
+  'AGENTLANE_SESSION_END_OWNER',
+  'AGENTLANE_SESSION_END_WAIT_MS',
+  'AGENTLANE_SESSION_END_ONCE',
+  'AGENTLANE_HOOK_PROBE',
+  'AGENTLANE_USER_TEMP',
+];
 
 function sourceFiles(dir: string): string[] {
   return fs

@@ -11,6 +11,15 @@ import { DriverError } from './errors.ts';
 import { runCommand, tail } from './exec.ts';
 import { tryLock, unlock } from './lock.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from './release.ts';
+import {
+  compareVersions,
+  laneToolsOf,
+  removeOlderVersions,
+  systemCommandLines,
+  type CommandLines,
+  type LaneTools,
+  type OlderVersion,
+} from './superseded.ts';
 
 export interface Jdk {
   javaHome: string;
@@ -31,8 +40,12 @@ export interface InstallOptions {
   from?: string;
   download?: Downloader;
   processes?: ProcessTable;
+  commandLines?: CommandLines;
+  laneTools?: LaneTools;
   log?: (line: string) => void;
   lockWaitMs?: number;
+  /** Where to look for JDK 17 past the environment; the system's places when absent. */
+  searchJdk17?: JdkSearch;
 }
 
 export interface Installed {
@@ -61,8 +74,32 @@ export function dataDir(env: NodeJS.ProcessEnv): string {
   return path.join(base, TOOL);
 }
 
+/** The data folder when the environment names it, by XDG_DATA_HOME or HOME, rather than by the OS's idea of home. */
+export function namedDataDir(env: NodeJS.ProcessEnv): string | undefined {
+  const xdg = env.XDG_DATA_HOME;
+  return (xdg && path.isAbsolute(xdg)) || env.HOME ? dataDir(env) : undefined;
+}
+
 export function maestroHome(env: NodeJS.ProcessEnv, release: MaestroRelease = MAESTRO_RELEASE): string {
   return path.join(dataDir(env), 'maestro', release.version);
+}
+
+function lockOf(base: string, version: string): string {
+  return path.join(base, `.${version}.lock`);
+}
+
+/** The builds this toolkit installed beside the pinned one that are older than it. */
+function olderBuilds(base: string, release: MaestroRelease): OlderVersion[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(base);
+  } catch {
+    return [];
+  }
+  return names
+    .filter(name => !name.startsWith('.') && compareVersions(name, release.version) < 0)
+    .filter(name => readMarker(path.join(base, name))?.version === name)
+    .map(name => ({ dir: path.join(base, name), lock: lockOf(base, name) }));
 }
 
 function binaryIn(home: string): string {
@@ -106,39 +143,69 @@ async function javaSettings(home: string): Promise<{ spec: string | undefined; j
   };
 }
 
-/** Finds JDK 17: AGENTLANE_JAVA_HOME, then the way maestro/build.sh does, JAVA_HOME, java_home -v 17 and Homebrew's openjdk@17. */
-export async function findJdk17(env: NodeJS.ProcessEnv): Promise<Jdk> {
-  let candidate: string | undefined;
-  let origin: string;
-  const named = env[JAVA_HOME_ENV] ? JAVA_HOME_ENV : env.JAVA_HOME ? 'JAVA_HOME' : undefined;
-  if (named) {
-    candidate = env[named];
-    origin = `${named}=${candidate ?? ''}`;
-  } else {
-    const javaHome = await runCommand('/usr/libexec/java_home', ['-v', '17'], { timeoutMs: 10_000 });
-    if (javaHome.code === 0 && javaHome.stdout.trim()) {
-      candidate = javaHome.stdout.trim();
-      origin = '/usr/libexec/java_home -v 17';
-    } else {
-      const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
-      if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
-        const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
-        if (brew.code === 0 && brew.stdout.trim()) prefixes.unshift(brew.stdout.trim());
-      }
-      candidate = prefixes.find(prefix => isExecutable(path.join(prefix, 'bin', 'java')));
-      origin = `Homebrew's openjdk@17 (${candidate ?? 'not installed'})`;
+/** A place JDK 17 might be installed, and what to call it in a message. */
+export interface JdkCandidate {
+  home: string;
+  origin: string;
+}
+
+export type JdkSearch = () => Promise<JdkCandidate | undefined>;
+
+export const JAVA_HOME_TOOL = '/usr/libexec/java_home';
+
+/** The JDK 17 macOS has registered. Without -F, java_home prints the default JDK when none matches. */
+export async function registeredJdk17(tool = JAVA_HOME_TOOL): Promise<string | undefined> {
+  const found = await runCommand(tool, ['-F', '-v', '17'], { timeoutMs: 10_000 });
+  return found.code === 0 && found.stdout.trim() ? found.stdout.trim() : undefined;
+}
+
+/** The way maestro/build.sh looks: java_home -F -v 17, then Homebrew's openjdk@17. */
+export const systemJdk17: JdkSearch = async () => {
+  const registered = await registeredJdk17();
+  if (registered !== undefined) return { home: registered, origin: `${JAVA_HOME_TOOL} -F -v 17` };
+  const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
+  if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
+    const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
+    if (brew.code === 0 && brew.stdout.trim()) prefixes.unshift(brew.stdout.trim());
+  }
+  const home = prefixes.find(prefix => isExecutable(path.join(prefix, 'bin', 'java')));
+  return home === undefined ? undefined : { home, origin: `Homebrew's openjdk@17 (${home})` };
+};
+
+function javaProblem(origin: string, spec: string | undefined): string | undefined {
+  if (spec === undefined) return `${origin} has no working bin/java`;
+  if (spec !== '17') return `${origin} is Java ${spec}`;
+  return undefined;
+}
+
+export async function findJdk17(env: NodeJS.ProcessEnv, search: JdkSearch = systemJdk17): Promise<Jdk> {
+  const pinned = env[JAVA_HOME_ENV];
+  if (pinned) {
+    const origin = `${JAVA_HOME_ENV}=${pinned}`;
+    const settings = await javaSettings(pinned);
+    const problem = javaProblem(origin, settings.spec);
+    if (problem !== undefined) {
+      throw new DriverError(
+        `${problem}, and Maestro runs on JDK 17`,
+        `${JDK_FIX}, or unset ${JAVA_HOME_ENV} so ${TOOL} finds one`,
+      );
     }
+    return { javaHome: settings.javaHome ?? pinned, origin };
   }
-  if (!candidate) throw new DriverError('no JDK 17 found; Maestro runs on JDK 17', JDK_FIX);
-  const fix = named ? `${JDK_FIX}, or unset ${named} so ${TOOL} finds one` : JDK_FIX;
-  const settings = await javaSettings(candidate);
-  if (settings.spec === undefined) {
-    throw new DriverError(`${origin} has no working bin/java`, fix);
+  let skipped: string | undefined;
+  if (env.JAVA_HOME) {
+    const origin = `JAVA_HOME=${env.JAVA_HOME}`;
+    const settings = await javaSettings(env.JAVA_HOME);
+    skipped = javaProblem(origin, settings.spec);
+    if (skipped === undefined) return { javaHome: settings.javaHome ?? env.JAVA_HOME, origin };
   }
-  if (settings.spec !== '17') {
-    throw new DriverError(`${origin} is Java ${settings.spec}, and Maestro runs on JDK 17`, fix);
-  }
-  return { javaHome: settings.javaHome ?? candidate, origin };
+  const found = await search();
+  const passedOver = skipped === undefined ? '' : ` (${skipped})`;
+  if (!found) throw new DriverError(`no JDK 17 found${passedOver}; Maestro runs on JDK 17`, JDK_FIX);
+  const settings = await javaSettings(found.home);
+  const problem = javaProblem(found.origin, settings.spec);
+  if (problem !== undefined) throw new DriverError(`${problem}${passedOver}, and Maestro runs on JDK 17`, JDK_FIX);
+  return { javaHome: settings.javaHome ?? found.home, origin: found.origin };
 }
 
 export async function sha256Of(file: string): Promise<string> {
@@ -230,14 +297,17 @@ async function unpack(release: MaestroRelease, zip: string, into: string, jdk: J
   }
 }
 
-/** Installs the pinned Maestro build on first use: download, check against the pinned sha256, unpack, check --version. */
+/**
+ * Installs the pinned Maestro build on first use: download, check against the pinned sha256, unpack, check --version.
+ * Then removes the older builds it installed that no running process or lane uses.
+ */
 export async function ensureMaestro(options: InstallOptions): Promise<Installed> {
   const release = options.release ?? MAESTRO_RELEASE;
   const ready = installedMaestro(options.env, release);
   if (ready && options.from === undefined) return ready;
   const started = Date.now();
   const log = options.log ?? (() => undefined);
-  const jdk = await findJdk17(options.env);
+  const jdk = await findJdk17(options.env, options.searchJdk17);
   const home = maestroHome(options.env, release);
   const base = path.dirname(home);
   fs.mkdirSync(base, { recursive: true, mode: 0o700 });
@@ -245,7 +315,7 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
   const processes = options.processes ?? systemProcesses;
   const me = identityOf(processes, process.pid);
   if (!me) throw new Error(`ps could not read this process's start time (pid ${String(process.pid)})`);
-  const lock = path.join(base, `.${release.version}.lock`);
+  const lock = lockOf(base, release.version);
   const deadline = Date.now() + (options.lockWaitMs ?? INSTALL_LOCK_WAIT_MS);
   let announced = false;
   for (;;) {
@@ -280,6 +350,14 @@ export async function ensureMaestro(options: InstallOptions): Promise<Installed>
     if (fs.existsSync(home)) fs.renameSync(home, path.join(work, 'previous'));
     fs.renameSync(unpacked, home);
     log(`installed Maestro ${release.version} in ${home}`);
+    removeOlderVersions(olderBuilds(base, release), {
+      root: namedDataDir(options.env),
+      me,
+      processes,
+      commandLines: options.commandLines ?? systemCommandLines,
+      laneTools: options.laneTools ?? laneToolsOf(options.env),
+      log,
+    });
     return { home, binary: binaryIn(home), version: release.version, installedNow: true, ms: Date.now() - started };
   } finally {
     fs.rmSync(work, { recursive: true, force: true });

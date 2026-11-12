@@ -37,7 +37,7 @@ npx agentlane init --agents claude,codex
 ```
 
 > [!TIP]
-> In Claude Code you can load agentlane as a plugin instead. `init` then leaves Claude Code to the plugin. [Install for your agent](install.md) covers both.
+> In Claude Code you can load agentlane as a plugin instead. `init` then leaves Claude Code's skills and MCP server to the plugin, and still writes the hooks into `.claude/settings.json`. [Install for your agent](install.md) covers both.
 
 ## 2. Ask your agent to set the project up
 
@@ -79,7 +79,11 @@ The agent runs `node_modules/.bin/agentlane up`. In a fresh worktree, `up` claim
 
 ## 4. When you're done
 
-When the agent's session ends, the session-end hook releases its lane: it stops the lane's servers, runs the teardown of its data and frees its device. Antigravity has no session-end hook, so its lane is freed the next time any agent claims a lane after the session has exited. To end a lane yourself, run this in the worktree that holds it:
+When the agent's session ends, the session-end hook releases its lane: it stops the lane's servers, runs the teardown of its data and frees its device. A session that crashes, or runs in Antigravity, which has no session-end hook, leaves its lane to agentlane's sweep, which parks the lane within minutes of finding the session gone and ends it 30 minutes later.
+
+A lane nobody calls on for 30 minutes is parked before that: its servers stop and its device goes back to the pool, and the agent's next call brings them back with the same data. When the agent leaves the app running for you to look at, it holds the lane with `agentlane keep` and tells you until when.
+
+To end a lane yourself, run this in the worktree that holds it:
 
 ```sh
 npx agentlane release

@@ -45,13 +45,14 @@ import { ensureMaestro, findJdk17, installedMaestro } from './driver/install.ts'
 import { enginePaths } from './driver/paths.ts';
 import { MAESTRO_RELEASE } from './driver/release.ts';
 import type { LookArgs, RunArgs, ScreenshotArgs } from './driver/session.ts';
-import { serveMcp } from './mcp/server.ts';
+import { serveMcp, type Every } from './mcp/server.ts';
 import { createToolHandler, TOOLS } from './mcp/tools.ts';
 import { CLI, TOOL } from './name.ts';
 import type { ProcessTable } from './processes.ts';
-import { tcpProbe } from './registry/ports.ts';
 import { NotClaimed, Refusal, UsageError } from './registry/refusal.ts';
-import { Registry } from './registry/registry.ts';
+import { touchLane } from './registry/touch.ts';
+import { SWEEP_INTERVAL_MS } from './up/sweep.ts';
+import { enterLane, type LaneWaker } from './up/wake.ts';
 import { groupUsage, helpOf, type UsageGroup } from './usage.ts';
 
 export interface DriverCliDeps {
@@ -67,6 +68,10 @@ export interface DriverCliDeps {
   adb?: AdbFactory;
   browser?: BrowserTools;
   evidence?: EvidenceSystem;
+  /** Brings a parked lane back before a call on it runs; without it, a call on a parked lane is refused. */
+  wake?: LaneWaker;
+  /** The sweep `mcp` runs every SWEEP_INTERVAL_MS, for every lane on the Mac; `wait` stands in for the timer. */
+  sweep?: Omit<Every, 'ms'>;
 }
 
 export const DRIVER_COMMANDS = ['look', 'run', 'screenshot', 'record', 'evidence', 'driver', 'browser', 'device', 'mcp'] as const;
@@ -146,6 +151,21 @@ function stamp(): string {
 
 function laneFor(deps: DriverCliDeps, worktree: string | undefined, need: Caller['need'] = 'device'): CallerLane {
   return resolveCallerLane({ env: deps.env, cwd: deps.cwd, worktree, processes: deps.processes, need });
+}
+
+/** The caller's lane for a call on it: the call is recorded, and a parked lane is brought back first. */
+async function enter(deps: DriverCliDeps, worktree: string | undefined, need: Caller['need'] = 'device'): Promise<CallerLane> {
+  const resolved = resolveCallerLane({ env: deps.env, cwd: deps.cwd, worktree, processes: deps.processes, need, counts: true });
+  const lane = await enterLane(
+    { stateDir: resolved.stateDir, processes: deps.processes },
+    resolved.lane,
+    resolved.park,
+    deps.wake,
+    line => {
+      deps.stderr(`${TOOL}: ${line}\n`);
+    },
+  );
+  return { ...resolved, lane, park: null };
 }
 
 /** The lane's browser when asked for, or when the lane holds no device; else null, for the device. */
@@ -252,16 +272,16 @@ async function look(args: string[], deps: DriverCliDeps): Promise<number> {
       throw new UsageError(`--depth ${values.depth} is not a level count`, 'pass --depth 2');
     lookArgs.depth = depth;
   }
-  const resolved = laneFor(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
+  const resolved = await enter(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
   const browser = values.device ? null : browserTarget(deps, resolved, values.browser);
   if (browser) {
     notOnBrowser({ bounds: values.bounds, raw: values.raw }, 'look');
+    touch(deps, resolved, 'look: browser');
     const page = await lookAtBrowser(browser, {
       interactiveOnly: values.interactive,
       ...(lookArgs.within === undefined ? {} : { within: lookArgs.within }),
       ...(lookArgs.depth === undefined ? {} : { depth: lookArgs.depth }),
     });
-    touch(deps, resolved, 'look: browser');
     if (values.json) {
       deps.stdout(
         `${JSON.stringify({ ok: true, text: page.text, url: page.url, title: page.title, driver: page.driver, shown: page.shown, interactive: page.interactive }, null, 2)}\n`,
@@ -319,7 +339,7 @@ async function run(args: string[], deps: DriverCliDeps): Promise<number> {
       throw new UsageError(`no flow file at ${file}`, 'pass the path of a Maestro flow');
     runArgs.file = file;
   }
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
   const driverLogFrom = sizeOf(enginePaths(resolved.stateDir, resolved.lane.id).log);
   const response = await callEngine(targetOf(deps, resolved), { op: 'run', args: runArgs });
   let screenshot: string | undefined;
@@ -361,12 +381,12 @@ async function screenshot(args: string[], deps: DriverCliDeps): Promise<number> 
     shotArgs.scale = scale;
   }
   if (values.crop !== undefined) shotArgs.crop = parseCrop(values.crop);
-  const resolved = laneFor(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
+  const resolved = await enter(deps, values.worktree, values.device ? 'device' : values.browser ? 'browser' : 'either');
   const browser = values.device ? null : browserTarget(deps, resolved, values.browser);
   if (browser) {
     notOnBrowser({ scale: values.scale, crop: values.crop }, 'screenshot');
-    const file = await screenshotBrowser(browser, values.out === undefined ? undefined : path.resolve(deps.cwd, values.out));
     touch(deps, resolved, 'screenshot: browser');
+    const file = await screenshotBrowser(browser, values.out === undefined ? undefined : path.resolve(deps.cwd, values.out));
     if (values.json) deps.stdout(`${JSON.stringify({ ok: true, file, mimeType: 'image/png' }, null, 2)}\n`);
     else deps.stdout(`Screenshot of the lane's browser saved to ${file}\n`);
     return 0;
@@ -398,7 +418,7 @@ async function record(args: string[], deps: DriverCliDeps): Promise<number> {
   ) {
     throw new UsageError('record takes save <file>, show or clear', `${CLI} record save flows/probe.yaml`);
   }
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
   const response = await callEngine(targetOf(deps, resolved), {
     op: 'record',
     args: { action, ...(file === undefined ? {} : { file: path.resolve(deps.cwd, file) }) },
@@ -447,7 +467,7 @@ async function driver(args: string[], deps: DriverCliDeps): Promise<number> {
       return 0;
     }
     case 'start': {
-      const resolved = laneFor(deps, values.worktree);
+      const resolved = await enter(deps, values.worktree);
       const started = Date.now();
       const response = await callEngine(targetOf(deps, resolved), { op: 'look', args: { interactiveOnly: true } });
       const seconds = (Date.now() - started) / 1000;
@@ -481,6 +501,7 @@ async function driver(args: string[], deps: DriverCliDeps): Promise<number> {
     }
     case 'stop': {
       const resolved = laneFor(deps, values.worktree);
+      touch(deps, resolved, 'driver stop');
       const stopped = await stopEngine(resolved.stateDir, resolved.lane);
       deps.stdout(
         stopped ? `Stopped the driver for lane ${resolved.lane.id}.\n` : `No driver ran for lane ${resolved.lane.id}.\n`,
@@ -545,7 +566,9 @@ async function evidence(args: string[], deps: DriverCliDeps): Promise<number> {
   const [what = 'list', action, ...rest] = positionals;
   if (rest.length > 0) throw new UsageError(`unexpected ${rest.join(' ')}`, EVIDENCE_FIX);
   const asked: EvidenceTarget | undefined = values.browser ? 'browser' : values.device ? 'device' : undefined;
-  const resolved = laneFor(deps, values.worktree, asked ?? 'either');
+  const resolved =
+    what === 'list' ? laneFor(deps, values.worktree, asked ?? 'either') : await enter(deps, values.worktree, asked ?? 'either');
+  if (what !== 'list') touch(deps, resolved, `evidence ${what}${action ? ` ${action}` : ''}`);
   const ctx = evidenceContext(deps, resolved);
   const folder = laneEvidence(resolved.stateDir, resolved.lane.id);
   let kept: Kept;
@@ -586,7 +609,6 @@ async function evidence(args: string[], deps: DriverCliDeps): Promise<number> {
     default:
       throw new UsageError(`'evidence ${what}' is not an evidence command`, EVIDENCE_FIX);
   }
-  touch(deps, resolved, `evidence ${what}${action ? ` ${action}` : ''}`);
   if (values.json) deps.stdout(`${JSON.stringify({ ok: kept.problems.length === 0, ...kept }, null, 2)}\n`);
   else {
     deps.stdout(`${said}\n${kept.notes.map(n => `  ${n}\n`).join('')}`);
@@ -660,7 +682,8 @@ async function device(args: string[], deps: DriverCliDeps): Promise<number> {
     options: { worktree: { type: 'string' } },
   });
   const [control, ...rest] = positionals;
-  const resolved = laneFor(deps, values.worktree);
+  const resolved = await enter(deps, values.worktree);
+  touch(deps, resolved, control === undefined ? 'device' : `device ${control}`);
   const claimed = resolved.lane.device;
   if (claimed?.platform === 'android') {
     if (!claimed.serial)
@@ -671,7 +694,6 @@ async function device(args: string[], deps: DriverCliDeps): Promise<number> {
     const adb = adbTools(deps, claimed.serial);
     await requireEmulatorBooted(adb);
     const said = await androidControl(adb, positionals);
-    touch(deps, resolved, `device ${control ?? ''}`);
     deps.stdout(`${said}\n`);
     return 0;
   }
@@ -755,7 +777,6 @@ async function device(args: string[], deps: DriverCliDeps): Promise<number> {
       const [action, ...words] = rest;
       if (action === 'get' && words.length === 0) {
         deps.stdout(await controls.readClipboard(udid));
-        touch(deps, resolved, 'device clipboard');
         return 0;
       }
       if (action !== 'set' || words.length === 0) notAControl(positionals, `${CLI} device clipboard set <text> | get`);
@@ -777,7 +798,6 @@ async function device(args: string[], deps: DriverCliDeps): Promise<number> {
     default:
       notAControl(positionals, `${CLI} device location|permission|appearance|push|clipboard|open ...`);
   }
-  touch(deps, resolved, `device ${control}`);
   deps.stdout(`${said}\n`);
   return 0;
 }
@@ -883,12 +903,7 @@ async function androidControl(adb: AdbTools, positionals: readonly string[]): Pr
 }
 
 function touch(deps: DriverCliDeps, resolved: CallerLane, action: string): void {
-  const registry = Registry.open({ dir: resolved.stateDir, processes: deps.processes, ports: tcpProbe, devices: {} });
-  try {
-    registry.touch({ id: resolved.lane.id, token: resolved.lane.token }, action);
-  } finally {
-    registry.close();
-  }
+  touchLane({ dir: resolved.stateDir, processes: deps.processes }, { id: resolved.lane.id, token: resolved.lane.token }, action);
 }
 
 async function mcp(args: string[], deps: DriverCliDeps): Promise<number> {
@@ -898,7 +913,13 @@ async function mcp(args: string[], deps: DriverCliDeps): Promise<number> {
     output: deps.output,
     info: { name: TOOL, version: packageVersion() },
     tools: TOOLS,
-    call: createToolHandler({ env: deps.env, cwd: deps.cwd, processes: deps.processes }),
+    call: createToolHandler({
+      env: deps.env,
+      cwd: deps.cwd,
+      processes: deps.processes,
+      ...(deps.wake ? { wake: deps.wake } : {}),
+    }),
+    ...(deps.sweep ? { every: { ms: SWEEP_INTERVAL_MS, ...deps.sweep } } : {}),
   });
   return 0;
 }

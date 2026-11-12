@@ -2,6 +2,8 @@ import type { BrowserDriverName } from '../browser/kinds.ts';
 import type { Platform } from '../devices/backend.ts';
 import type { RegistryConfig } from './config.ts';
 import type { Owner, OwnerState, ProvenState } from './owner.ts';
+import type { LaneHold } from './holds.ts';
+import type { ParkRestarts, ParkState } from './parks.ts';
 
 export interface ServiceRequest {
   name: string;
@@ -13,6 +15,8 @@ export interface DeviceRequest {
   deviceType?: string | undefined;
   runtime?: string | undefined;
   strict?: boolean | undefined;
+  /** The pool device to take when it is free and fits, such as the one a parked lane gave back. */
+  prefer?: string | undefined;
 }
 
 export interface BrowserRequest {
@@ -79,6 +83,8 @@ export interface ServiceProcess {
   pid: number;
   start: string;
   cwd: string | null;
+  /** The last moment, in ms since the epoch, a check found this pid running with this start time. */
+  aliveAt?: number;
 }
 
 export type ResourceValues = Record<string, string>;
@@ -161,8 +167,6 @@ export interface EndedLane {
 export interface LaneOutcome {
   lane: Lane;
   created: boolean;
-  tookOver: EndedLane[];
-  freed: EndedLane[];
   notes: string[];
   /** The driver the lane's browser had before this lane changed it; null when it kept its driver. */
   replacedDriver: BrowserDriverName | null;
@@ -170,10 +174,52 @@ export interface LaneOutcome {
 
 export type DeviceState = 'booted' | 'shutdown' | 'missing' | 'unknown';
 
+export type ProcessState = 'running' | 'gone' | 'unknown';
+
+export interface ProcessStatus extends ServiceProcess {
+  /**
+   * running while a process with this pid and the recorded start time runs; gone when no process has this pid, or
+   * another process has taken it since; unknown when ps could not tell.
+   */
+  state: ProcessState;
+}
+
+export interface ParkStatus {
+  state: ParkState;
+  since: number;
+  parkedAt: number | null;
+  /** The pid parking or waking the lane; null once it is parked. */
+  by: number | null;
+  restarts: ParkRestarts;
+  problems: string[];
+}
+
 export interface LaneStatus extends LaneInfo {
+  processes: ProcessStatus[];
   ownerState: OwnerState;
   idleMs: number;
   deviceState: DeviceState | null;
+  /** Null while the lane is awake. */
+  park: ParkStatus | null;
+  /** What keeps the lane up past the park window, and until when; null when nothing does, or its owner is gone. */
+  hold: LaneHold | null;
+  /** Null unless a check found the lane's owner gone; the lane is then parked until it ends. */
+  ownerGone: LaneGone | null;
+}
+
+export interface LaneGone {
+  /** What the check found: the owner's process dead, its pid taken by another process, or the lane's folder gone. */
+  state: ProvenState;
+  foundAt: number;
+  /** When the lane ends, with what release does, unless `session` comes back before. */
+  endsAt: number;
+  /**
+   * The host's session id (Claude Code's session id, or a Codex thread's id) whose next call from the lane's folder takes
+   * the lane back with its data; null when nothing can.
+   */
+  session: string | null;
+  /** The pid ending the lane now that its window has passed; null until one does. */
+  by: number | null;
 }
 
 export interface PoolDeviceStatus {

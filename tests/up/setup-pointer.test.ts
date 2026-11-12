@@ -57,7 +57,7 @@ test('up and doctor with a config that fails validation name the field and the s
   namesSetup(doctor.text, 'doctor');
 });
 
-test('up and doctor in a project no agent is wired to warn with the setup skill, and stay ready', async t => {
+test('up and doctor in a project no agent is wired to warn with the setup skill and stay ready, and doctor drops the pointer once the project enables the Claude plugin, failing its hooks while Claude Code has not installed it', async t => {
   const w = world(t);
   fs.writeFileSync(path.join(w.project, 'site.mjs'), SITE_SERVER);
   w.write(WEB_ONLY);
@@ -80,7 +80,14 @@ test('up and doctor in a project no agent is wired to warn with the setup skill,
     JSON.stringify({ enabledPlugins: { 'agentlane@agentlane': true } }),
   );
   const withPlugin = await run(w, 'doctor');
-  assert.equal(withPlugin.code, 0, withPlugin.text);
   assert.doesNotMatch(withPlugin.text, /no agent's|setup skill/, 'a project that enables the plugin is wired for Claude Code');
-  assert.match(withPlugin.text, /wiring claude: /);
+  assert.match(
+    withPlugin.text,
+    /warn {2}wiring claude: the project enables the agentlane plugin in \.claude\/settings\.json, but Claude Code hasn't installed it on this Mac/,
+  );
+  assert.match(
+    withPlugin.text,
+    /FAIL {2}hooks claude: .* is enabled but not installed on this Mac\n {8}fix: node_modules\/\.bin\/agentlane init --agents claude/,
+  );
+  assert.equal(withPlugin.code, 1, 'no hook runs while Claude Code has not installed the plugin the project enables');
 });
