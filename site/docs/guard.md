@@ -50,7 +50,7 @@ When a session ends, the release hook frees every lane the session holds, in eve
 
 Where Claude Code runs both the plugin's hooks and the ones in `.claude/settings.json`, both guards give the same answer, and the session's lanes are released once. In Claude Code, `/clear` and `/resume` keep the lanes, because the Claude Code process that owns them is still running.
 
-No agent fires a hook when it crashes, is killed or loses its terminal. A lane whose session ended that way is found by the sweep: within 5 minutes while an agentlane MCP server runs on the machine, otherwise at the next agentlane command. The sweep parks the lane at once and ends it 30 minutes later, unless the session comes back first. [What a lane holds](lanes.md#when-the-owner-is-gone) has the rules.
+A session that crashes or is killed with SIGKILL fires no hook. Claude Code does fire its session-end hook when its terminal closes. A lane whose session ended without the hook is found by the sweep: within 5 minutes while an agentlane MCP server runs on the machine, otherwise at the next agentlane command. The sweep parks the lane at once and ends it 30 minutes later, unless the session comes back first. [What a lane holds](lanes.md#when-the-owner-is-gone) has the rules.
 
 ## Per agent
 
