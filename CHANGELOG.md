@@ -2,7 +2,7 @@
 
 Newest first.
 
-## Unreleased
+## 0.5.0
 
 A lane now gives its simulator or emulator back when nobody uses it, and ends on its own once its session is gone, whether or not the session ran `release` or its session-end hook fired. The hooks move into every agent's project settings, plugin or not, and `doctor` proves they run. `prune` and the tool installs leave less on disk. This version runs beside 0.4.1 on the same Mac; "Sharing a Mac with 0.4.1" lists what 0.4.1 still does differently.
 
@@ -75,7 +75,8 @@ A lane now gives its simulator or emulator back when nobody uses it, and ends on
 
 ### Known issues
 
-- **An interactive Codex session's lane never ends on its own.** Codex runs a thread's commands under its shared `codex app-server`, so the lane records no process for its owner (`codex thread <id> (no process recorded)`) and the sweep can't tell when the thread is gone. The lane parks once it goes unused and stays parked, and `status` shows `left alone: its owner can't be judged`. To free it, run `agentlane release` in the lane's folder from the Codex thread that holds it, or `agentlane release --lane <id> --force` from any shell.
+- **An interactive Codex session's lane ends only through Codex's session-end hook.** Codex runs a thread's commands under its shared `codex app-server`, so the lane records no process for its owner (`codex thread <id> (no process recorded)`) and the sweep can't tell when the thread is gone. The hook `init` writes into `.codex/hooks.json` releases the lane when the app server unloads the thread. When that hook doesn't run, for example because the project's hooks aren't trusted, the lane parks once it goes unused and stays parked, and `status` shows `left alone: its owner can't be judged`. To free it, run `agentlane release` in the lane's folder from the Codex thread that holds it, or `agentlane release --lane <id> --force` from any shell.
+- **A Codex app server restart releases the lanes of Codex sessions that are still open.** When the app server stops or restarts, through `codex app-server daemon restart` or its own updater, it runs the session-end hook for every thread it has loaded, and the hook releases each thread's lane at once. 0.4.1 does the same. The session's next `up` or `claim` gives it a new lane.
 
 ## 0.4.1
 
