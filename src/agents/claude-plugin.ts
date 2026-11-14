@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FORMER, TOOL } from '../name.ts';
@@ -84,10 +85,22 @@ function sameDir(a: unknown, b: string): boolean {
   }
 }
 
+/** The folder itself and, inside a git worktree, the repository's main checkout. */
+function checkoutsOf(root: string, env: NodeJS.ProcessEnv): string[] {
+  const result = spawnSync('git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    encoding: 'utf8',
+    env,
+  });
+  if (result.status !== 0) return [root];
+  const common = result.stdout.trim();
+  return path.basename(common) === '.git' ? [root, path.dirname(common)] : [root];
+}
+
 /**
  * Where Claude Code loads the enabled plugin from on this Mac. Claude Code records what it installed in
  * `plugins/installed_plugins.json` under its config folder: format 2 maps `<plugin>@<marketplace>` to a list of
- * installs, each with a `scope`, a `projectPath` for project and local scopes, and an `installPath`.
+ * installs, each with a `scope`, a `projectPath` for project and local scopes, and an `installPath`. A project-scope
+ * install also loads in the git worktrees of the checkout it names (Claude Code 2.1.325).
  */
 export function claudePluginInstall(root: string, env: NodeJS.ProcessEnv): PluginInstall | null {
   const session = sessionPluginDir(env);
@@ -98,13 +111,15 @@ export function claudePluginInstall(root: string, env: NodeJS.ProcessEnv): Plugi
   if (!fs.existsSync(file)) return { kind: 'not-installed', keys };
   const plugins = jsonObjectAt(file)?.plugins;
   if (typeof plugins !== 'object' || plugins === null) return { kind: 'unknown' };
+  let checkouts: string[] | undefined;
   for (const key of keys) {
     const listed: unknown = (plugins as Record<string, unknown>)[key];
     const installs = Array.isArray(listed) ? (listed as unknown[]) : listed === undefined ? [] : [listed];
     for (const install of installs) {
       if (typeof install !== 'object' || install === null) continue;
       const { scope, projectPath, installPath } = install as Record<string, unknown>;
-      const here = scope === undefined || scope === 'user' || sameDir(projectPath, root);
+      checkouts ??= checkoutsOf(root, env);
+      const here = scope === undefined || scope === 'user' || checkouts.some(dir => sameDir(projectPath, dir));
       if (here && typeof installPath === 'string') return { kind: 'loaded', dir: installPath };
     }
   }

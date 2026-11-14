@@ -195,7 +195,7 @@ export async function inspectService(
   const leader = check?.state ?? 'not-started';
   const listeners = listenersOn(system, port, leader === 'alive' && proc ? proc.pid : null);
   const probe = await probeReady(service.ready, port);
-  const ours = listeners !== null && listeners.length > 0 && listeners.every(l => l.ours);
+  const ours = listeners === null || (listeners.length > 0 && listeners.every(l => l.ours));
   return {
     service: service.name,
     port,
@@ -211,7 +211,12 @@ export async function inspectService(
 
 export function explainInspection(inspection: ServiceInspection): string {
   const parts = [inspection.leaderDetail];
-  if (inspection.listeners === null) parts.push(`the listener on ${String(inspection.port)} could not be read`);
+  if (inspection.listeners === null)
+    parts.push(
+      inspection.healthy
+        ? `the listener on ${String(inspection.port)} could not be read, so its ready check stands for it`
+        : `the listener on ${String(inspection.port)} could not be read`,
+    );
   else if (inspection.listeners.length === 0) parts.push(`nothing listens on ${String(inspection.port)}`);
   else {
     const foreign = inspection.listeners.filter(l => !l.ours);

@@ -173,6 +173,27 @@ test('a service starts in its own group, is ready and ours, and its working dire
   assert.equal(system.groups([proc.pid])?.get(proc.pid), proc.pid, 'the service leads its own process group');
 });
 
+test('a running service that answers its ready check stays healthy when its listener cannot be read, and is unhealthy once it stops answering', async t => {
+  const p = project(t);
+  const port = await freePort();
+  const config = p.service('SVC_PORT="$SVC_PORT" exec node server.mjs');
+  const proc = p.start(config, port);
+  const ready = await waitForService(system, config, port, proc, systemClock, p.log);
+  const blind: ServiceSystem = { ...system, listeners: () => undefined };
+
+  const seen = await inspectService(blind, config, port, ready);
+  assert.equal(seen.listeners, null);
+  assert.equal(seen.healthy, true, explainInspection(seen));
+  assert.match(
+    explainInspection(seen),
+    new RegExp(`the listener on ${String(port)} could not be read, so its ready check stands for it`),
+  );
+
+  await stopService(system, ready, systemClock);
+  const gone = await inspectService(blind, config, port, ready);
+  assert.equal(gone.healthy, false, explainInspection(gone));
+});
+
 test('stop ends every process in the group the toolkit started, verified by pid and start time', async t => {
   const p = project(t);
   const port = await freePort();

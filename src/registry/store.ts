@@ -236,11 +236,13 @@ function untilFree<T>(deadline: number, action: () => T, onTimeout: () => Error)
   }
 }
 
+export const UNIDENTIFIED = 'an unidentified caller';
+
 export class Store {
   readonly db: DatabaseSync;
   readonly dir: string;
   private readonly lockWaitMs: number;
-  actor: Actor = { who: 'an unidentified caller', folder: process.cwd() };
+  actor: Actor = { who: UNIDENTIFIED, folder: process.cwd() };
 
   private constructor(dir: string, db: DatabaseSync, lockWaitMs: number) {
     this.dir = dir;

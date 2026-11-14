@@ -36,6 +36,7 @@ export const STATUS_BAR_PIN_FIELDS: Readonly<StatusBarFields> = {
 };
 
 const LOCATION_FRESH_MS = 3000;
+const LOCATION_UNHEARD = 'locationd reports a location only while an app is receiving one';
 const LOCATION_HEARD_MS = 300_000;
 const COORDINATE_TOLERANCE = 5e-8;
 
@@ -56,6 +57,7 @@ export interface HygieneStepCheck {
   wanted: string;
   got: string;
   ok: boolean;
+  unconfirmed?: string;
 }
 
 export interface HygieneCheck {
@@ -73,6 +75,7 @@ export interface HygieneStepReport {
   ok: boolean;
   tries?: string;
   error?: string;
+  unconfirmed?: string;
 }
 
 export interface HygieneReport {
@@ -108,6 +111,7 @@ interface Step<T> {
   apply(): Promise<void>;
   readBack(): Promise<T | undefined>;
   tries?(): string;
+  unheard?: string;
 }
 
 export function sameCoordinate(a: Coordinate | undefined, b: Coordinate): boolean {
@@ -133,6 +137,10 @@ export function statusBarPinned(fields: StatusBarFields | undefined): boolean {
 function formatStatusBar(fields: StatusBarFields | undefined): string {
   const entries = Object.entries(fields ?? {});
   return entries.length === 0 ? 'no overrides' : entries.map(([key, value]) => `${key} ${value}`).join(', ');
+}
+
+function formatWindow(ms: number): string {
+  return ms % 60_000 === 0 ? `${String(ms / 60_000)} min` : `${String(Math.round(ms / 1000))} s`;
 }
 
 function message(error: unknown): string {
@@ -182,6 +190,7 @@ function steps(tools: SimTools, udid: string, options: HygieneOptions): Step<unk
     },
     tries: () =>
       `after setting it ${String(sets)} time${sets === 1 ? '' : 's'} over ${String(Math.round((tools.now().getTime() - locationSetAt.getTime()) / 1000))} s`,
+    unheard: LOCATION_UNHEARD,
   };
 
   const keyboardStep: Step<boolean> = {
@@ -233,10 +242,18 @@ function steps(tools: SimTools, udid: string, options: HygieneOptions): Step<unk
 export async function checkHygiene(tools: SimTools, udid: string, options: HygieneOptions = {}): Promise<HygieneCheck> {
   await requireBooted(tools, udid);
   const checks: HygieneStepCheck[] = [];
-  for (const step of steps(tools, udid, { locationLookbackMs: LOCATION_HEARD_MS, ...options })) {
+  const lookbackMs = options.locationLookbackMs ?? LOCATION_HEARD_MS;
+  for (const step of steps(tools, udid, { ...options, locationLookbackMs: lookbackMs })) {
     try {
       const got = await step.read();
-      checks.push({ step: step.name, wanted: step.wanted, got: step.format(got), ok: step.matches(got) });
+      const unheard = got === undefined ? step.unheard : undefined;
+      checks.push({
+        step: step.name,
+        wanted: step.wanted,
+        got: step.format(got),
+        ok: step.matches(got) || unheard !== undefined,
+        ...(unheard ? { unconfirmed: `nothing read back in the last ${formatWindow(lookbackMs)}; ${unheard}` } : {}),
+      });
     } catch (error) {
       checks.push({ step: step.name, wanted: step.wanted, got: `unreadable (${message(error)})`, ok: false });
     }
@@ -258,7 +275,9 @@ export async function applyHygiene(tools: SimTools, udid: string, options: Hygie
       }
       await step.apply();
       const after = await step.readBack();
-      const ok = step.matches(after);
+      const unheard = after === undefined ? step.unheard : undefined;
+      const ok = step.matches(after) || unheard !== undefined;
+      const tries = step.tries?.();
       reports.push({
         step: step.name,
         wanted: step.wanted,
@@ -266,7 +285,8 @@ export async function applyHygiene(tools: SimTools, udid: string, options: Hygie
         after: step.format(after),
         changed: true,
         ok,
-        ...(!ok && step.tries ? { tries: step.tries() } : {}),
+        ...(!ok && tries ? { tries } : {}),
+        ...(unheard ? { unconfirmed: `nothing read back${tries ? ` ${tries}` : ''}; ${unheard}` } : {}),
       });
     } catch (error) {
       reports.push({

@@ -50,6 +50,7 @@ export class FakeSim implements SimTools {
   readonly devices = new Map<string, Device>();
   locationLagMs = 0;
   lostLocationSets = 0;
+  heardElsewhere: Coordinate | undefined;
   crashesOnLaunch = false;
   private clock = CLOCK.getTime();
 
@@ -117,6 +118,7 @@ export class FakeSim implements SimTools {
   readLocation(udid: string, since: Date): Promise<Coordinate | undefined> {
     this.call('readLocation', udid, since.toISOString());
     const { location } = this.booted(udid);
+    if (this.heardElsewhere) return Promise.resolve({ ...this.heardElsewhere });
     const visible =
       location !== undefined && location.visibleAt <= this.clock && since.getTime() <= (location.heardAt ?? this.clock);
     return Promise.resolve(visible ? { ...location.coordinate } : undefined);

@@ -385,9 +385,10 @@ export async function diagnose(deps: EnvDeps, input: DoctorInput): Promise<Docto
         name: 'hygiene',
         ok: hygiene.ok,
         detail: hygiene.ok
-          ? hygiene.steps.map(s => `${s.step} ${s.got}`).join('; ')
+          ? hygiene.steps.map(s => (s.unconfirmed ? `${s.step} unconfirmed: ${s.unconfirmed}` : `${s.step} ${s.got}`)).join('; ')
           : off.map(s => `${s.step} reads ${s.got}, not ${s.wanted}`).join('; '),
         fix: UP,
+        ...(hygiene.ok && hygiene.steps.some(s => s.unconfirmed) ? { warning: true } : {}),
       });
     } catch (error) {
       checks.push({ name: 'hygiene', ok: false, detail: message(error), fix: UP });

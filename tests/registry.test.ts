@@ -13,7 +13,7 @@ import type { RegistryConfig } from '../src/registry/config.ts';
 import { allLeases, endLease, leaseDevice } from '../src/registry/leases.ts';
 import type { Owner } from '../src/registry/owner.ts';
 import { RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
-import { databasePath } from '../src/registry/paths.ts';
+import { databasePath, lockHolderPath } from '../src/registry/paths.ts';
 import type { PortProbe } from '../src/registry/ports.ts';
 import { Refusal } from '../src/registry/refusal.ts';
 import type { Registry, Step } from '../src/registry/registry.ts';
@@ -645,6 +645,19 @@ test('release by id refuses a live or unjudgeable owner, frees a proven one, and
     assert.equal(w.registry().releaseById(dead.lane.id, me, false).reason, 'dead');
     assert.equal(w.registry().releaseById(unknown.lane.id, me, true).reason, 'forced');
     assert.equal(w.registry().status().lanes.length, 1);
+  } finally {
+    w.close();
+  }
+});
+
+test('a touch from a caller nothing named yet names itself by its action and lane in the lock holder record', async () => {
+  const w = world();
+  try {
+    const owner = w.procs.owner();
+    const out = await w.registry().claim(w.request(owner, w.folder('a'), NO_DEVICE));
+    w.registry().touch({ id: out.lane.id, token: out.lane.token }, 'exec: sh');
+    const holder = JSON.parse(fs.readFileSync(lockHolderPath(w.dir), 'utf8')) as { who: string };
+    assert.equal(holder.who, `agentlane exec: sh, on lane ${out.lane.id}`);
   } finally {
     w.close();
   }
