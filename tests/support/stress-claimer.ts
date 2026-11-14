@@ -81,7 +81,9 @@ async function main(): Promise<void> {
     journal(`start ${call}`);
     const gate = plan.gate;
     if (gate?.calls.includes(call)) {
-      fs.writeFileSync(gateEntered(gate, call), target);
+      const entered = gateEntered(gate, call);
+      fs.writeFileSync(`${entered}.tmp`, target);
+      fs.renameSync(`${entered}.tmp`, entered);
       const deadline = Date.now() + GATE_LIMIT_MS;
       while (!fs.existsSync(gateOpen(gate, call))) {
         if (Date.now() > deadline) fail(EXIT_GATE_NEVER_OPENED, `the ${call} gate stayed shut`);
