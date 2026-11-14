@@ -140,22 +140,41 @@ test('a location set the simulator drops reads back nothing a few times, is set 
   assert.equal(sim.calls.filter(call => call.startsWith('readLocation')).length, 1 + 8 + 8 + 1);
 });
 
-test('a location that never reads back fails once every set and read is spent, naming them, with no real waiting', async () => {
+test('a location locationd never reports is set every time it may be, then counts as set but unconfirmed, with no real waiting', async () => {
   const sim = new FakeSim();
   sim.addDevice();
   sim.faults.add('location');
 
-  const error = await applyHygiene(sim, UDID, {
+  const report = await applyHygiene(sim, UDID, {
     locationReadAttempts: 4,
     locationPollMs: 250,
     locationSetAttempts: 2,
-  }).catch((caught: unknown) => caught);
+  });
 
-  assert.ok(error instanceof HygieneError);
-  assert.match(error.message, /location reads back nothing, not 37\.3349,-122\.009 after setting it 2 times over 2 s/);
+  const location = step(report, 'location');
+  assert.equal(location.ok, true);
+  assert.equal(location.after, 'nothing');
+  assert.equal(
+    location.unconfirmed,
+    'nothing read back after setting it 2 times over 2 s; locationd reports a location only while an app is receiving one',
+  );
   assert.equal(sim.calls.filter(call => call.startsWith('setLocation')).length, 2);
   assert.equal(sim.calls.filter(call => call === 'sleep 250').length, 8);
-  assert.equal(step(error.report, 'keyboard').ok, true);
+  assert.equal(step(report, 'keyboard').ok, true);
+});
+
+test('a location read back at another coordinate fails once every set is spent, naming what was read', async () => {
+  const sim = new FakeSim();
+  sim.addDevice();
+  sim.heardElsewhere = TEL_AVIV;
+
+  const error = await applyHygiene(sim, UDID, { locationReadAttempts: 2, locationPollMs: 250 }).catch(
+    (caught: unknown) => caught,
+  );
+
+  assert.ok(error instanceof HygieneError);
+  assert.match(error.message, /location reads back 32\.07,34\.78, not 37\.3349,-122\.009 after setting it 3 times over 2 s/);
+  assert.equal(step(error.report, 'location').unconfirmed, undefined);
 });
 
 test('keyboard and appearance writes that do not take are reported per step', async () => {
@@ -250,7 +269,7 @@ test('checkHygiene reports each setting without changing any', async () => {
   assert.deepEqual(
     before.steps.map(entry => [entry.step, entry.ok]),
     [
-      ['location', false],
+      ['location', true],
       ['keyboard', false],
       ['keyboard-intro', false],
       ['status-bar', false],
@@ -277,7 +296,15 @@ test('checkHygiene accepts a location last delivered minutes ago, which applyHyg
 
   if (device.location) device.location.heardAt = sim.now().getTime() - 600_000;
   const [silent] = (await checkHygiene(sim, UDID, { location: TEL_AVIV })).steps;
-  assert.deepEqual([silent?.step, silent?.ok, silent?.got], ['location', false, 'nothing']);
+  assert.deepEqual(
+    [silent?.step, silent?.ok, silent?.got, silent?.unconfirmed],
+    [
+      'location',
+      true,
+      'nothing',
+      'nothing read back in the last 5 min; locationd reports a location only while an app is receiving one',
+    ],
+  );
 
   if (device.location) device.location.heardAt = sim.now().getTime() - 60_000;
   const report = await applyHygiene(sim, UDID, { location: TEL_AVIV });

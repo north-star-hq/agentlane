@@ -2,6 +2,17 @@
 
 Newest first.
 
+## 0.5.1
+
+Three checks no longer fail things that work, and the registry's lock holder names its caller.
+
+### Fixed
+
+- **A simulator location nothing reports no longer stops `up`.** locationd reports the simulated location only while an app is receiving one, so on a simulator where no app is, capture hygiene read nothing back after setting the location three times, failed, and `up` stopped before it launched the app. `up` now counts that location as set and says it is unconfirmed: `hygiene: applied location (unconfirmed: nothing read back after setting it 3 times over 46 s; locationd reports a location only while an app is receiving one)`. `doctor` warns instead of failing. A location read back at another coordinate still fails.
+- **`up` keeps a running service whose listener can't be read.** When `lsof` timed out, `up` and `doctor` counted a dev server whose process was alive and whose ready check passed as failed, and `up` stopped and restarted it. Its ready check now stands for it, and `up` says `the listener on <port> could not be read`.
+- **`doctor` sees the Claude Code plugin from a git worktree.** A project-scope install also loads in the git worktrees of the checkout it was installed for, and `doctor` warned there that Claude Code hadn't installed the plugin.
+- **The registry's lock holder names an `exec` and other lane touches.** A busy refusal named a long `exec` as "an unidentified caller"; it now reads, for example, `agentlane exec: sh, on lane ab2ea94d`.
+
 ## 0.5.0
 
 A lane now gives its simulator or emulator back when nobody uses it, and ends on its own once its session is gone, whether or not the session ran `release` or its session-end hook fired. The hooks move into every agent's project settings, plugin or not, and `doctor` proves they run. `prune` and the tool installs leave less on disk. This version runs beside 0.4.1 on the same Mac; "Sharing a Mac with 0.4.1" lists what 0.4.1 still does differently.

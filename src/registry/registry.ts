@@ -59,7 +59,7 @@ import {
 import { loadLane, ownerFromRow, processesOf } from './rows.ts';
 import { readStatus } from './status.ts';
 import type { Row } from './store.ts';
-import { int, optInt, optText, Store, text } from './store.ts';
+import { int, optInt, optText, Store, text, UNIDENTIFIED } from './store.ts';
 import type {
   Lane,
   ClaimedPort,
@@ -2145,6 +2145,8 @@ export class Registry {
   }
 
   touch(ref: LaneRef, action: string): Lane {
+    if (this.store.actor.who === UNIDENTIFIED)
+      this.store.actor = { ...this.store.actor, who: `${TOOL} ${action}, on lane ${ref.id}` };
     return this.store.write(() => {
       this.step('touch:locked');
       this.requireLane(ref);

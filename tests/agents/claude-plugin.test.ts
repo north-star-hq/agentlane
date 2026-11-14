@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
-import { claudePluginSources } from '../../src/agents/claude-plugin.ts';
+import { claudePluginInstall, claudePluginSources } from '../../src/agents/claude-plugin.ts';
 import { tempDir } from '../support/fakes.ts';
 
 const PLUGIN = path.resolve(import.meta.dirname, '..', '..', 'plugin');
@@ -52,6 +53,36 @@ test('the plugin counts as loaded where Claude Code loads it: local over project
     writeJson(path.join(other, '.claude-plugin', 'plugin.json'), { name: 'dev-loop' });
     fs.mkdirSync(path.join(other, 'bin'));
     assert.deepEqual(claudePluginSources(dir, { ...session, PATH: path.join(other, 'bin') }), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a project-scope install covers the git worktrees of the checkout it was installed for, and no other folder', () => {
+  const root = fs.realpathSync(tempDir('claude-plugin-worktree'));
+  try {
+    const main = path.join(root, 'app');
+    const worktree = path.join(root, 'app-worktrees', 'feature');
+    const other = path.join(root, 'other');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    fs.mkdirSync(main);
+    git(main, 'init', '-q', '-b', 'main');
+    git(main, '-c', 'user.email=t@example.com', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'start');
+    git(main, 'worktree', 'add', '-q', worktree);
+    fs.mkdirSync(other);
+    for (const dir of [main, worktree, other]) {
+      writeJson(path.join(dir, '.claude/settings.json'), { enabledPlugins: { 'agentlane@agentlane': true } });
+    }
+    const config = path.join(root, 'claude-config');
+    const env = { CLAUDE_CONFIG_DIR: config, PATH: process.env.PATH ?? '' };
+    writeJson(path.join(config, 'plugins', 'installed_plugins.json'), {
+      version: 2,
+      plugins: { 'agentlane@agentlane': [{ scope: 'project', projectPath: main, installPath: PLUGIN }] },
+    });
+
+    assert.deepEqual(claudePluginInstall(main, env), { kind: 'loaded', dir: PLUGIN });
+    assert.deepEqual(claudePluginInstall(worktree, env), { kind: 'loaded', dir: PLUGIN });
+    assert.deepEqual(claudePluginInstall(other, env), { kind: 'not-installed', keys: ['agentlane@agentlane'] });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

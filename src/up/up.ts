@@ -303,7 +303,10 @@ async function ensureService(ctx: Ctx, service: ServiceConfig): Promise<string> 
   const recorded = recordedProcess(lane, service.name);
   if (recorded) {
     const seen = await inspectService(deps.system, service, port, recorded);
-    if (seen.healthy) return `already running on ${String(port)} (pid ${String(recorded.pid)}); ${seen.readyDetail}`;
+    if (seen.healthy) {
+      const unread = seen.listeners === null ? `; the listener on ${String(port)} could not be read` : '';
+      return `already running on ${String(port)} (pid ${String(recorded.pid)}); ${seen.readyDetail}${unread}`;
+    }
     const stopped = await stopClaimedService(ctx, recorded);
     const started = await startClaimedService(ctx, service, port);
     return `${started}, replacing pid ${String(recorded.pid)}, which failed its check (${explainInspection(seen)}): ${stopped}`;
@@ -469,7 +472,7 @@ async function deviceSteps(
       report.changed
         ? `applied ${report.steps
             .filter(s => s.changed)
-            .map(s => s.step)
+            .map(s => (s.unconfirmed ? `${s.step} (unconfirmed: ${s.unconfirmed})` : s.step))
             .join(', ')}`
         : 'already in place',
   );
