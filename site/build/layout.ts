@@ -153,10 +153,8 @@ ${page.body}
 `;
 }
 
-function headline(landing: Landing): string {
-  const sentence = landing.headline.replace(/\.$/, '');
-  const at = sentence.indexOf(landing.marked);
-  return `${escapeHtml(sentence.slice(0, at))}<mark>${escapeHtml(landing.marked)}</mark>${escapeHtml(sentence.slice(at + landing.marked.length))}`;
+function headline({ marked }: Landing): string {
+  return `${escapeHtml(marked.before)}<mark>${escapeHtml(marked.text)}</mark>${escapeHtml(marked.after)}`;
 }
 
 export function landingBody(root: string, landing: Landing, sections: Section[], releases: Release[]): string {

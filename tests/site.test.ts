@@ -49,8 +49,8 @@ describe('the docs site', () => {
   test('marks one word of the headline and titles the home with the problem it solves', () => {
     const home = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
     const landing = loadLanding();
-    const [before, after] = landing.headline.replace(/\.$/, '').split(landing.marked);
-    assert.ok(home.includes(`<h1 id="headline">${before ?? ''}<mark>${landing.marked}</mark>${after ?? ''}</h1>`));
+    const [before, after] = landing.headline.replace(/\.$/, '').split(landing.marked.text);
+    assert.ok(home.includes(`<h1 id="headline">${before ?? ''}<mark>${landing.marked.text}</mark>${after ?? ''}</h1>`));
     assert.ok(home.includes(`<title>${landing.title}: ${landing.problem}</title>`));
   });
 
@@ -220,7 +220,35 @@ describe('the docs site', () => {
     test('rejects a marked word the headline lacks', () => {
       assert.throws(
         load(t => t.replace('marked: fighting', 'marked: racing')),
-        /the headline doesn't contain "racing"/,
+        /marked is "racing", which the headline before its full stop doesn't contain/,
+      );
+    });
+
+    test("rejects a marked word that takes in the headline's full stop", () => {
+      assert.throws(
+        load(t => t.replace('marked: fighting', 'marked: databases.')),
+        /marked is "databases\.", which the headline before its full stop doesn't contain/,
+      );
+    });
+
+    test('names a list that is missing', () => {
+      assert.throws(
+        load(t => t.replace(/^buttons:\n(?: {2}.*\n)+/m, '')),
+        /index\.md: front matter needs buttons, a list/,
+      );
+    });
+
+    test('names a field that has the wrong shape', () => {
+      assert.throws(
+        load(t => t.replace(/^badge:\n(?: {2}.*\n)+/m, 'badge: Free and open source\n')),
+        /index\.md: front matter needs badge, with fields under it/,
+      );
+    });
+
+    test('names the card that is missing a field', () => {
+      assert.throws(
+        load(t => t.replace('    href: docs/devices.html\n', '')),
+        /index\.md: front matter needs cards\[1\]\.href/,
       );
     });
 
