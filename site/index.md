@@ -1,11 +1,24 @@
 ---
 title: agentlane
-description: agentlane gives each AI coding agent its own lane, a running copy of your app with its own ports, dev servers, database, and browser, iOS simulator or Android emulator.
-headline: Every coding agent gets its own running copy of your app
-pitch: >-
-  agentlane gives each agent session a lane: its own ports, dev servers and database, and its own iOS simulator,
-  Android emulator or browser, with fast tools to see the app and drive it. Agents use it through the `agentlane`
-  CLI, an MCP server (`look`, `run`, `screenshot`), and skills and hooks that teach them the loop.
+problem: Run several AI coding agents on one machine, each with its own simulator, ports and database
+description: >-
+  Run several AI coding agents on one machine, each with its own ports, dev servers, database and simulator, emulator
+  or browser. Works with Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity, on web, iOS and
+  Android.
+badge:
+  text: Free, open source, runs on your machine
+  href: https://github.com/north-star-hq/agentlane
+headline: Stop your coding agents fighting over ports, simulators and databases.
+marked: fighting
+sentence: The fast, light way to run a copy of your app for every agent, with tools to see it and drive it, all at the same time.
+figure: '**Reads the screen 50x faster** than stock Maestro on two simulators.'
+buttons:
+  - label: Get started
+    href: docs/getting-started.html
+    primary: true
+  - label: Star on GitHub
+    href: https://github.com/north-star-hq/agentlane
+    icon: star
 install:
   - label: Run this in your project
     command: npx agentlane init
@@ -22,23 +35,42 @@ heroAlt: >-
   Claude Code, Codex and Cursor, each shown with its mark, get their own lane from agentlane up: ports, dev server,
   database and a browser, iOS simulator or Android emulator. Each types an item into its own copy of the Basket app,
   ticks items off and takes screenshots, then Codex finishes and its lane is released.
-why:
-  - title: Every agent, one install
-    text: Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity get the same CLI, MCP server, skills and hooks from one [`init`](docs/install.html).
-  - title: Web, iOS and Android in one tool
-    text: '[`look`, `run` and `screenshot`](docs/drive.html) work the same on a simulator, an emulator or a browser.'
-  - title: The whole environment, per agent
-    text: '[Ports, dev servers, a database and sign-in](docs/lanes.html), and a device or browser that no other agent touches.'
-  - title: Skills that teach the loop
-    text: '[Six skills](docs/skills.html) take an agent from setting the project up to proving a change with a committed flow or test.'
-  - title: It checks the app before your agent trusts it
-    text: "[`doctor`](docs/doctor.html) confirms that every server runs this worktree's code, and names the fix when one doesn't."
-  - title: Evidence you can open
-    text: '[Videos, traces, logs and screenshots](docs/evidence.html), plus the Maestro flows and Playwright tests your agent commits.'
-  - title: It cleans up
-    text: 'When a session ends, [its lane is released](docs/guard.html): services stop, databases are torn down, and devices go back to the pool.'
-  - title: Local
-    text: 'No account, no hosted service, and [no telemetry of its own](docs/faq.html#does-agentlane-send-anything-off-my-machine).'
+cards:
+  - icon: plug
+    title: Its own ports
+    text: Ports, dev servers and a database for each agent, so no two start a server on the same port.
+    href: docs/services.html
+  - icon: phone
+    title: Its own device
+    text: An iOS simulator, Android emulator or browser that no other agent can touch.
+    href: docs/devices.html
+  - icon: eye
+    title: See and drive
+    text: '`look`, `run` and `screenshot` work the same way on all three.'
+    href: docs/drive.html
+  - icon: shield
+    title: Checked first
+    text: "`doctor` confirms every server runs this worktree's code before the agent trusts it."
+    href: docs/doctor.html
+  - icon: play
+    title: Proof you can open
+    text: Videos, traces, logs and screenshots, kept after the agent is done.
+    href: docs/evidence.html
+  - icon: cycle
+    title: Cleans up
+    text: When the agent is done, its servers stop, its database goes and its device returns to the pool.
+    href: docs/guard.html
+about:
+  title: What is agentlane?
+  paragraphs:
+    - >-
+      agentlane is a free, open-source toolkit that gives each AI coding agent its own **lane**: a running copy of
+      your project with its own ports, dev servers and database, and its own iOS simulator, Android emulator or
+      browser. Agents use it through the `agentlane` CLI, an MCP server, and skills that teach them the loop, on web
+      apps, iOS and Android.
+    - >-
+      New here? [What a lane holds](docs/lanes.html) explains the idea, and [Getting started](docs/getting-started.html)
+      takes you from one command to a ready lane.
 speed:
   - value: 0.15 s
     label: to read an iOS screen on a warm lane
@@ -46,5 +78,4 @@ speed:
     label: to read a page in the lane's browser
   - value: 6.5 s
     label: to get an iOS build from the shared cache, against 91.5 s to build it
-speedNote: 'The reads are medians of 16 calls and the build is a single run, all on an Apple M4 Max. [How these were measured](docs/speed.html#how-these-were-measured).'
 ---
