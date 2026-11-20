@@ -129,6 +129,7 @@ function project(t: TestContext) {
     timeoutMs: 8000,
     dial: null,
     platforms: null,
+    needs: [],
     ...over,
   });
   const start = (config: ServiceConfig, port: number): ServiceProcess => {
@@ -1014,6 +1015,7 @@ for (const c of leaderReads) {
       timeoutMs: 1000,
       dial: null,
       platforms: null,
+      needs: [],
     };
     assert.ok(explainInspection(await inspectService(f.system, config, 1, c.proc)).startsWith(`${reason}; `));
   });

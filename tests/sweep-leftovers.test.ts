@@ -469,6 +469,7 @@ test('a stop proves ours, through the moment the sweep saw its leader running, a
       timeoutMs: 8000,
       dial: null,
       platforms: null,
+      needs: [],
     },
     { PATH: process.env.PATH },
     path.join(project, 'api.log'),

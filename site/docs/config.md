@@ -60,6 +60,10 @@ Data each lane gets its own copy of, such as a database, by name. `up` runs each
 
 <!-- generated: config resource -->
 
+## shared
+
+<!-- generated: config shared -->
+
 ## hooks
 
 Shell commands the project owns. Each one reads the lane from the environment, runs without asking anything, and exits non-zero when it didn't do its job. `up` writes each hook's output to `hooks/<name>.log` in the lane's folder.
