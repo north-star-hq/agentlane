@@ -67,7 +67,7 @@ An agent reads its screen in **0.12 s**, where stock Maestro takes 6.5 s with tw
 
 ## The skills
 
-[The skills](https://north-star-hq.github.io/agentlane/docs/skills.html) teach an agent the whole loop in your project, from setup to proof. Each stub `init` writes prints its skill from the installed version, so the skills update with the package.
+[The skills](https://north-star-hq.github.io/agentlane/docs/skills.html) teach an agent the whole loop in your project, from setup to proof.
 
 - **setup** finds how your project runs its apps, servers, data and sign-in, wires your agents, writes `agentlane.json`, and brings each app up until `doctor` reports ready. It asks you only what it can't find out.
 - **dev-loop** is what an agent follows whenever it runs the app: one lane per session, `up`, `doctor` before trusting an instance, `release` when done, and what counts as proof.
@@ -84,39 +84,39 @@ agentlane is the same idea as a git worktree, for the running app. A worktree gi
 
 ### agentlane and Simlock
 
-[Simlock](https://github.com/callstackincubator/simlock), from Callstack, leases iOS simulators, Android emulators and enrolled phones to coding agents that run in parallel. An agent asks for a device and gets one back, booted and checked, that no other agent touches until it lets go. A lane does the same for simulators, emulators and browsers, and adds the rest of the running app around the device: its ports, dev servers and database.
+[Simlock](https://github.com/callstackincubator/simlock), from Callstack, leases iOS simulators, Android emulators and enrolled phones to coding agents that run in parallel. An agent asks for a device and gets one back, booted and checked, that no other agent touches until it lets go. A lane holds a simulator, emulator or browser for one agent too, and adds the rest of the running app around it: its ports, dev servers and database.
 
 ### agentlane and agent-device
 
-[agent-device](https://github.com/callstack/agent-device), also from Callstack, lets coding agents control mobile, TV, desktop and web apps through a CLI, an MCP server and a Node.js API, on more platforms than agentlane covers. A lane gives the agent a simulator, emulator or browser of its own, with the app's servers already up for it, and `look`, `run` and `screenshot` to drive it.
+[agent-device](https://github.com/callstack/agent-device), also from Callstack, lets coding agents control mobile, TV, desktop and web apps through a CLI, an MCP server and a Node.js API, on more platforms than agentlane covers. It also coordinates device access between agents in parallel worktrees. A lane starts the app's servers and database first, so what the agent drives already runs that worktree's code.
 
 ### agentlane and portless
 
-[portless](https://github.com/vercel-labs/portless), from Vercel Labs, replaces port numbers with stable, named `.localhost` URLs, for people and agents alike, and gives each linked worktree a subdomain of its own. A lane hands out the ports themselves, starts your dev servers on them and waits until they answer, then adds the database and the device the app needs.
+[portless](https://github.com/vercel-labs/portless), from Vercel Labs, gives each dev server a free port and a stable, named `.localhost` URL, and gives each linked worktree a subdomain of its own. A lane adds the database and the simulator, emulator or browser that go with those servers.
 
 ### agentlane and worktrunk
 
-[worktrunk](https://github.com/max-sixty/worktrunk) is a CLI for git worktrees, designed for running AI agents in parallel: you switch, list and remove worktrees by branch name, with hooks and shared build caches. It gives each agent its own copy of the code. A lane runs the app from that copy, and the same session in a second worktree gets a second lane.
+[worktrunk](https://github.com/max-sixty/worktrunk) is a CLI for git worktrees, designed for running AI agents in parallel. You switch, list and remove worktrees by branch name, with hooks and shared build caches. A lane runs the app from each worktree, and the same session in a second worktree gets a second lane.
 
 ### agentlane and Playwright
 
-[Playwright](https://github.com/microsoft/playwright) drives Chromium, Firefox and WebKit with one API, in tests, in scripts and as a tool for AI agents, and its `playwright-cli` is built for coding agents. agentlane drives the browser with it by default. A lane gives each agent its own Chrome for Testing, with a profile no other lane can read, and its hook stops one agent's commands from reaching another lane's browser.
+[Playwright](https://github.com/microsoft/playwright) drives Chromium, Firefox and WebKit with one API, and its `playwright-cli` is built for coding agents. agentlane drives the browser with it by default. A lane gives each agent its own Chrome for Testing, with a profile no other lane can read, and agentlane's hook stops one agent's commands from reaching another lane's browser.
 
 ### agentlane and Maestro
 
-[Maestro](https://github.com/mobile-dev-inc/Maestro) tests Android, iOS and web apps through flows written in YAML, and its MCP server lets coding agents drive a live device. agentlane drives every simulator and emulator with it. Its patches give each iOS simulator's runner a port of its own, so a second simulator doesn't start cold on every call, and keep a Maestro session warm between calls.
+[Maestro](https://github.com/mobile-dev-inc/Maestro) tests Android, iOS and web apps through YAML flows, and its MCP server lets coding agents drive a live device. agentlane drives every simulator and emulator with it. agentlane's patches give each iOS simulator's runner a port of its own, so a second simulator doesn't start cold on every call, and agentlane keeps a Maestro session warm between calls.
 
 ### agentlane and Conductor
 
-[Conductor](https://www.conductor.build/) runs Claude Code, Codex and Cursor agents in parallel, each in an isolated workspace, on your Mac. A lane gives each of those agents a running copy of the app as well: ports, dev servers, a database, and a simulator, emulator or browser.
+[Conductor](https://www.conductor.build/) runs Claude Code, Codex, Cursor and OpenCode in parallel, each task in its own workspace and branch, on your Mac or in Conductor Cloud's sandboxes. Each workspace gets its own range of ports for the app's servers. On your Mac, a lane adds a database and a simulator, emulator or browser to each workspace.
 
 ### agentlane and Paradev
 
-[Paradev](https://github.com/superset-sh/superset), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. A lane claims its ports before the servers start, and adds a database and an iOS simulator or Android emulator for each agent.
+[Paradev](https://github.com/ParadevAI/Paradev), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. A lane gives each agent an iOS simulator or Android emulator of its own as well.
 
 ### agentlane and your agent's own worktrees
 
-Claude Code's `--worktree`, the Codex app's worktrees and Cursor's worktrees each give an agent its own checkout, so parallel edits don't collide, and Cursor can run setup commands in every new one. A lane starts where the checkout ends: the app running from that worktree's code, on ports, a database and a device of its own, with `doctor` to confirm every server runs that code.
+Claude Code's `--worktree`, the Codex app's worktrees and Cursor's worktrees each give an agent its own checkout, so parallel edits don't collide. Codex and Cursor can also run setup scripts in every new one. A lane runs the app from that checkout, and `doctor` confirms that every server is running that worktree's code.
 
 ## Where it runs
 
