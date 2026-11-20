@@ -19,6 +19,7 @@ export const DEFAULT_VARIANT = 'Debug';
 export const DEFAULT_READY_HOST = '127.0.0.1';
 export const DEFAULT_READY_SECONDS = 60;
 export const DEFAULT_DIAL_VALUE = 'http://localhost:{port}';
+export const DEFAULT_SHARED_SECONDS = 180;
 
 const port = { type: 'integer', minimum: 1024, maximum: 65535 } as const;
 const bundleId = {
@@ -69,6 +70,12 @@ const host = {
   default: DEFAULT_READY_HOST,
   description: 'The host the readiness check connects to.',
 } as const;
+const needs = {
+  type: 'array',
+  items: { type: 'string', pattern: SERVICE_NAME_PATTERN },
+  uniqueItems: true,
+  description: 'The shared services this uses, by their names under `shared`.',
+} as const;
 const hook = (when: string) =>
   ({ type: 'string', minLength: 1, description: `A shell command run with \`sh -c\` ${when}.` }) as const;
 
@@ -93,6 +100,12 @@ export const projectSchema = {
       description: `What each lane gets of its own besides ports, such as a database, by name. \`up\` runs each create once per lane, in this order, after the setup hook and the build preconditions (also under --no-setup). The values a create exports then reach the lane's services, the hooks after setup, and \`${TOOL} exec\`, as ${ENV_PREFIX}_<NAME>_PORT does; a command never takes an exported variable from the caller's environment. When the lane ends (release, the session-end release, or a reap of a lane whose owner died or was taken over), each teardown runs, last created first.`,
       propertyNames: { pattern: SERVICE_NAME_PATTERN },
       additionalProperties: { $ref: '#/$defs/resource' },
+    },
+    shared: {
+      type: 'object',
+      description: `The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in \`needs\`. ${TOOL} starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one.`,
+      propertyNames: { pattern: SERVICE_NAME_PATTERN },
+      additionalProperties: { $ref: '#/$defs/shared' },
     },
     hooks: { $ref: '#/$defs/hooks' },
     preconditions: {
@@ -210,6 +223,38 @@ export const projectSchema = {
           default: DEFAULT_TEARDOWN_SECONDS,
           description: 'How long teardown may run before it is stopped and counted as failed.',
         },
+        needs,
+      },
+    },
+    shared: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['start', 'stop', 'ready'],
+      properties: {
+        start: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'A shell command that starts the server and exits, leaving it running. It must cope with running twice and with finding the server already running.',
+        },
+        stop: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped.',
+        },
+        ready: {
+          type: 'string',
+          minLength: 1,
+          description: `A shell command that exits 0 when the server answers. ${TOOL} also runs it to tell whether the shared service is running.`,
+        },
+        cwd: { type: 'string', minLength: 1, description: 'The directory start, stop and ready run in, relative to this file.' },
+        timeoutSeconds: {
+          type: 'number',
+          exclusiveMinimum: 0,
+          default: DEFAULT_SHARED_SECONDS,
+          description: 'How long start may run, and then how long ready may take to pass, before the start counts as failed.',
+        },
       },
     },
     service: {
@@ -266,6 +311,7 @@ export const projectSchema = {
             },
           },
         },
+        needs,
       },
     },
     httpReady: {

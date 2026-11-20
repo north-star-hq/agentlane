@@ -7,6 +7,7 @@ import {
   declaredPlatforms,
   findProjectConfig,
   forPlatform,
+  loadLaneConfig,
   loadProjectConfig,
   parseProjectConfig,
   ProjectConfigError,
@@ -26,6 +27,7 @@ interface Service {
   dial?: Record<string, unknown>;
   ports?: number[];
   timeoutSeconds?: number;
+  needs?: string[];
 }
 
 const APP = { platform: 'ios', bundleId: 'com.example.app', launch: 'dev-client' };
@@ -494,7 +496,15 @@ test('resources normalize in the order declared, with their folder, exports and 
     '/project/agentlane.json',
   );
   assert.deepEqual(parsed.resources, [
-    { name: 'pg', create: 'start-pg', exports: ['PGPORT'], teardown: 'stop-pg', cwd: '/project', teardownTimeoutMs: 30_000 },
+    {
+      name: 'pg',
+      create: 'start-pg',
+      exports: ['PGPORT'],
+      teardown: 'stop-pg',
+      cwd: '/project',
+      teardownTimeoutMs: 30_000,
+      needs: [],
+    },
     {
       name: 'db',
       create: 'make-db',
@@ -502,7 +512,118 @@ test('resources normalize in the order declared, with their folder, exports and 
       teardown: 'drop-db',
       cwd: '/project/apps/api',
       teardownTimeoutMs: 120_000,
+      needs: [],
     },
-    { name: 'cache', create: 'mkdir cache', exports: [], teardown: 'rm -rf cache', cwd: '/project', teardownTimeoutMs: 120_000 },
+    {
+      name: 'cache',
+      create: 'mkdir cache',
+      exports: [],
+      teardown: 'rm -rf cache',
+      cwd: '/project',
+      teardownTimeoutMs: 120_000,
+      needs: [],
+    },
   ]);
+  assert.deepEqual(parsed.shared, []);
+  assert.deepEqual(
+    parsed.allServices.map(s => s.needs),
+    [[], []],
+  );
+});
+
+const PG = { start: 'docker start pg', stop: 'docker stop pg', ready: 'pg_isready -h 127.0.0.1' };
+
+test('shared services normalize with their folder and timeout, and resources and services name the ones they need', t => {
+  const dir = fs.realpathSync(tempDir('config-shared'));
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const file = path.join(dir, 'agentlane.json');
+  const raw = {
+    app: APP,
+    web: {},
+    services: { metro: { ...METRO, platforms: ['ios', 'android'] }, web: { ...WEB, needs: ['pg', 'redis'] } },
+    resources: { db: { ...DB, needs: ['pg'] }, cache: { create: 'mkdir cache', teardown: 'rm -rf cache' } },
+    shared: {
+      pg: PG,
+      redis: { start: 'redis-up', stop: 'redis-down', ready: 'redis-cli ping', cwd: 'infra', timeoutSeconds: 30 },
+    },
+  };
+  fs.writeFileSync(file, JSON.stringify(raw));
+  const loaded = loadProjectConfig(file);
+  assert.deepEqual(loaded.shared, [
+    { name: 'pg', ...PG, cwd: dir, timeoutMs: 180_000 },
+    {
+      name: 'redis',
+      start: 'redis-up',
+      stop: 'redis-down',
+      ready: 'redis-cli ping',
+      cwd: path.join(dir, 'infra'),
+      timeoutMs: 30_000,
+    },
+  ]);
+  assert.deepEqual(
+    loaded.resources.map(r => [r.name, r.needs]),
+    [
+      ['db', ['pg']],
+      ['cache', []],
+    ],
+  );
+  assert.deepEqual(
+    loaded.allServices.map(s => [s.name, s.needs]),
+    [
+      ['metro', []],
+      ['web', ['pg', 'redis']],
+    ],
+  );
+  for (const view of [forPlatform(loaded, 'web'), forPlatform(loaded, 'android'), loadLaneConfig(file, 'web')]) {
+    assert.deepEqual(view.shared, loaded.shared);
+    assert.deepEqual(view.resources, loaded.resources);
+  }
+  assert.deepEqual(
+    loadLaneConfig(file, 'web').services.map(s => [s.name, s.needs]),
+    [['web', ['pg', 'redis']]],
+  );
+});
+
+test('a needs naming no shared service is refused with the name and where it is', () => {
+  const problems = problemsOf(
+    config({
+      services: { metro: METRO, api: { ...API, needs: ['pg', 'cache'] } },
+      extra: { resources: { db: { ...DB, needs: ['postgres'] } }, shared: { pg: PG } },
+    }),
+  );
+  assert.deepEqual(
+    problems.map(p => [p.path, p.schemaPath]),
+    [
+      ['/resources/db/needs/0', '(cross-field rule)'],
+      ['/services/api/needs/1', '(cross-field rule)'],
+    ],
+  );
+  assert.match(problems[0]?.message ?? '', /^postgres is not a shared service; .*: pg$/);
+  assert.match(problems[1]?.message ?? '', /^cache is not a shared service/);
+  assert.deepEqual(
+    problemsOf(config({ extra: { resources: { db: { ...DB, needs: ['pg'] } } } })).map(p => [p.path, p.message]),
+    [['/resources/db/needs/0', 'pg is not a shared service; declare it under shared, or name one of: none']],
+  );
+  assert.throws(
+    () => parseProjectConfig(config({ extra: { resources: { db: { ...DB, needs: ['pg'] } } } }), '/project/agentlane.json'),
+    (error: unknown) =>
+      error instanceof ProjectConfigError && error.message.includes('/resources/db/needs/0 pg is not a shared service'),
+  );
+});
+
+test('a shared service without start, stop or ready is refused naming the field', () => {
+  for (const field of ['start', 'stop', 'ready'] as const) {
+    const entry = Object.fromEntries(Object.entries(PG).filter(([key]) => key !== field));
+    assert.deepEqual(
+      problemsOf(config({ extra: { shared: { pg: entry } } })).map(p => [p.path, p.schemaPath, p.message]),
+      [[`/shared/pg/${field}`, '#/$defs/shared/required', 'is required']],
+      field,
+    );
+  }
+  assert.deepEqual(
+    problemsOf(config({ extra: { shared: { pg: { ...PG, timeoutSeconds: 0 }, Bad: PG } } })).map(p => p.path),
+    ['/shared/pg/timeoutSeconds', '/shared/Bad'],
+  );
 });
