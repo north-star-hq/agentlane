@@ -13,6 +13,8 @@ import type { Owner } from '../src/registry/owner.ts';
 import type { Step } from '../src/registry/registry.ts';
 import { Registry, STEPS } from '../src/registry/registry.ts';
 import { OWNER_CHECK_MS, RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
+import { SHARED_IDLE_MS } from '../src/registry/shared.ts';
+import { Store } from '../src/registry/store.ts';
 import { realServiceSystem } from '../src/services/system.ts';
 import { runSweep } from '../src/up/sweep.ts';
 import { FakeDevices, tempDir } from './support/fakes.ts';
@@ -20,6 +22,7 @@ import { parkNow } from './support/world.ts';
 import type { ClaimerPlan, SlowDevices, StressOp } from './support/stress-plan.ts';
 import { EXIT_REFUSED, runClaimer } from './support/stress-plan.ts';
 import { openRegistryReadOnly } from './support/registry-read.ts';
+import type { SharedClaimerPlan } from './support/shared-claimer.ts';
 
 const CLAIMERS = 16;
 const SEEDS = Number(process.env.STRESS_SEEDS ?? 10);
@@ -563,4 +566,132 @@ test(`stress with a slow device backend (create ${String(SLOW_MS.create)} ms, sh
     [],
     'every lease step had an injected crash with the slow backend',
   );
+});
+
+const SHARED_CLAIMERS = 4;
+const SHARED_ROUNDS = 6;
+const SHARED_CLAIMER = path.join(import.meta.dirname, 'support', 'shared-claimer.ts');
+
+function runSharedClaimer(plan: SharedClaimerPlan): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [SHARED_CLAIMER, JSON.stringify(plan)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+  child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+  return new Promise(resolve => {
+    child.on('close', code => {
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+async function runSharedSeed(seed: number): Promise<void> {
+  const started = Date.now();
+  const random = rng(seed);
+  const root = tempDir(`stress-shared-${String(seed)}`);
+  const stateDir = path.join(root, 'state');
+  const repository = path.join(root, 'repo');
+  const lock = path.join(root, 'lock');
+  const overlaps = path.join(root, 'overlaps');
+  const log = path.join(root, 'log');
+  const up = path.join(root, 'up');
+  fs.mkdirSync(repository, { recursive: true });
+  const guarded = (what: string, body: string) =>
+    `mkdir '${lock}' 2>/dev/null || { echo '${what}' >> '${overlaps}'; exit 1; }; echo ${what} >> '${log}'; sleep 0.03; ${body}; rmdir '${lock}'`;
+  const spec = {
+    name: 'db',
+    start: guarded('start', `touch '${up}'`),
+    stop: guarded('stop', `rm -f '${up}'`),
+    ready: `test -f '${up}'`,
+    cwd: repository,
+    timeoutMs: 10_000,
+  };
+  const config: RegistryConfig = {
+    poolSize: 0,
+    emulatorPoolSize: 0,
+    memoryBudgetMb: 0,
+    parkMs: 30 * 60_000,
+    blocks: { metro: { first: 48200, last: 48208 } },
+  };
+  const ahead = {
+    now: () => Date.now() + SHARED_IDLE_MS + 60_000,
+    sleep: (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)),
+  };
+  const sweep = () =>
+    runSweep({
+      dir: stateDir,
+      env: process.env,
+      processes: systemProcesses,
+      system: realServiceSystem,
+      clock: ahead,
+      devices: {},
+      ports: { listening: () => Promise.resolve(new Set<number>()) },
+      config,
+      log: () => undefined,
+    });
+  const events = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []);
+  try {
+    Store.open(stateDir, 5000).close();
+    const plans: SharedClaimerPlan[] = Array.from({ length: SHARED_CLAIMERS }, (_, i) => {
+      const worktree = path.join(root, 'worktrees', String(i));
+      fs.mkdirSync(worktree, { recursive: true });
+      return {
+        stateDir,
+        repository,
+        worktree,
+        config,
+        spec,
+        up,
+        startMs: Math.floor(random() * 200),
+        rounds: Array.from({ length: SHARED_ROUNDS }, () => ({
+          upMs: Math.floor(random() * 60),
+          parkedMs: 150 + Math.floor(random() * 300),
+        })),
+      };
+    });
+    const state = { running: true, sweeps: 0, problems: [] as string[] };
+    const sweeper = (async () => {
+      while (state.running) {
+        const report = await sweep();
+        state.sweeps++;
+        state.problems.push(...report.problems);
+        await new Promise(resolve => setTimeout(resolve, Math.floor(random() * 20)));
+      }
+    })();
+    const exits = await Promise.all(plans.map(runSharedClaimer));
+    state.running = false;
+    await sweeper;
+    const where = `seed ${String(seed)}`;
+    for (const [i, exit] of exits.entries()) {
+      assert.equal(exit.code, 0, `${where} claimer ${String(i)}: code ${String(exit.code)}\n${exit.stdout}${exit.stderr}`);
+    }
+    assert.deepEqual(state.problems, [], `${where}: no sweep met a problem`);
+    await sweep();
+    const all = events();
+    assert.equal(all.at(-1), 'stop', `${where}: once the last lane has parked and gone, a sweep stops it`);
+
+    assert.equal(fs.existsSync(overlaps) ? fs.readFileSync(overlaps, 'utf8') : '', '', `${where}: a start and a stop overlapped`);
+    all.forEach((event, i) => {
+      assert.equal(event, i % 2 === 0 ? 'start' : 'stop', `${where}: event ${String(i)} of ${all.join(' ')}`);
+    });
+    const starts = exits.reduce((n, exit) => n + Number(/^starts (\d+)$/m.exec(exit.stdout)?.[1] ?? 0), 0);
+    const waits = exits.map(exit => /^waited (\d+) (\d+)$/m.exec(exit.stdout));
+    const onStops = waits.reduce((n, m) => n + Number(m?.[1] ?? 0), 0);
+    const onStarts = waits.reduce((n, m) => n + Number(m?.[2] ?? 0), 0);
+    assert.equal(starts, all.filter(e => e === 'start').length, `${where}: every start in the log is one a lane ran`);
+    const stopsDuring = all.filter(e => e === 'stop').length - 1;
+    assert.ok(stopsDuring > 0, `${where}: the sweep stopped the service while lanes still woke and parked`);
+    assert.equal(fs.existsSync(up), false);
+    console.log(
+      `shared stress seed ${String(seed)}: ${String(SHARED_CLAIMERS)} claimers x ${String(SHARED_ROUNDS)} rounds; ${String(state.sweeps)} sweeps; ${String(starts)} starts and ${String(stopsDuring)} stops while lanes woke and parked; starts that waited on a stop: ${String(onStops)}, on another lane's start: ${String(onStarts)}; ${String(Date.now() - started)} ms`,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const SHARED_SEEDS = [7, 8, 9];
+
+test(`stress: ${String(SHARED_CLAIMERS)} lanes in separate processes wake and park around one shared service while the sweep stops it: its start and stop never overlap, and every start returns with it running`, async () => {
+  for (const seed of SHARED_SEEDS) await runSharedSeed(seed);
 });

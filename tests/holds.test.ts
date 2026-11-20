@@ -133,6 +133,7 @@ test('a held lane is not parked at the park cutoff nor while the hold lasts, and
       reaps: [],
       alive: [],
       recorders: [],
+      shared: [],
       pruned: [],
       problems: [],
     });

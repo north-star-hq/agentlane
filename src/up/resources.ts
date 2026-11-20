@@ -141,6 +141,7 @@ export async function createResources(r: ResourceRun, lane: Lane): Promise<Creat
       timeoutMs: resource.teardownTimeoutMs,
       env: recorded(laneVariables(result.lane, r.config, r.dir)),
       cleared: resourceVariables(r.config),
+      needs: resource.needs,
     });
     if (start.kind === 'kept') {
       result.kept.push(resource.name);

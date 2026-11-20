@@ -99,8 +99,48 @@ CREATE TABLE IF NOT EXISTS owner_checks (
     AND (reaper_pid IS NULL) = (attempt IS NULL)),
   CHECK (reaper_pid IS NULL OR gone IS NOT NULL)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS shared_services (
+  repository TEXT NOT NULL,
+  name TEXT NOT NULL,
+  state TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  start TEXT NOT NULL,
+  stop TEXT NOT NULL,
+  ready TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  timeout_ms INTEGER NOT NULL,
+  env TEXT NOT NULL,
+  unneeded_since INTEGER,
+  holder_pid INTEGER,
+  holder_start TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER,
+  problem TEXT,
+  PRIMARY KEY (repository, name),
+  CHECK (state IN ('stopped', 'starting', 'running', 'stopping')),
+  CHECK ((holder_pid IS NULL) = (state IN ('stopped', 'running')) AND (holder_pid IS NULL) = (holder_start IS NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS shared_needs (
+  claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  PRIMARY KEY (claim_id, name)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds', 'owner_checks'];
+const ADDED_TABLES = [
+  'resources',
+  'browsers',
+  'process_alive',
+  'device_leases',
+  'parks',
+  'holds',
+  'owner_checks',
+  'shared_services',
+  'shared_needs',
+];
+const ADDED_COLUMNS: readonly { table: string; column: string; sql: string }[] = [
+  { table: 'resources', column: 'repository', sql: 'ALTER TABLE resources ADD COLUMN repository TEXT' },
+  { table: 'resources', column: 'needs', sql: "ALTER TABLE resources ADD COLUMN needs TEXT NOT NULL DEFAULT '[]'" },
+];
 
 const SCHEMA = `
 CREATE TABLE claims (
@@ -279,7 +319,7 @@ export class Store {
     );
     if (!added) {
       store.write(() => {
-        store.db.exec(FORMAT_1_ADDITIONS);
+        store.addToFormat1();
       });
     }
     return store;
@@ -300,7 +340,17 @@ export class Store {
         `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN (${ADDED_TABLES.map(() => '?').join(', ')})`,
       )
       .get(...ADDED_TABLES);
-    return found !== undefined && int(found, 'n') === ADDED_TABLES.length;
+    if (found === undefined || int(found, 'n') !== ADDED_TABLES.length) return false;
+    return ADDED_COLUMNS.every(c => this.hasColumn(c.table, c.column));
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    return this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column) !== undefined;
+  }
+
+  private addToFormat1(): void {
+    this.db.exec(FORMAT_1_ADDITIONS);
+    for (const c of ADDED_COLUMNS) if (!this.hasColumn(c.table, c.column)) this.db.exec(c.sql);
   }
 
   private version(): number {
@@ -319,7 +369,7 @@ export class Store {
         );
       }
       this.db.exec(SCHEMA);
-      this.db.exec(FORMAT_1_ADDITIONS);
+      this.addToFormat1();
       this.db.exec(`PRAGMA user_version = ${String(SCHEMA_VERSION)}`);
     });
   }

@@ -57,6 +57,24 @@ import {
   takeTeardowns,
 } from './resources.ts';
 import { loadLane, ownerFromRow, processesOf } from './rows.ts';
+import type { SharedCommands, SharedKey, SharedNeed, SharedServiceStatus, SharedStartClaim, SharedStopClaim } from './shared.ts';
+import {
+  beginStart,
+  beginStop,
+  failStart,
+  failStop,
+  finishStart,
+  finishStop,
+  laneActive,
+  laneNeeds,
+  markNeedsUnneeded,
+  readShared,
+  recordLaneNeeds,
+  SHARED_IDLE_MS,
+  SHARED_STOP_RETRY_MS,
+  sharedHoldersBeforeLock,
+  stopCandidates,
+} from './shared.ts';
 import { readStatus } from './status.ts';
 import type { Row } from './store.ts';
 import { int, optInt, optText, Store, text, UNIDENTIFIED } from './store.ts';
@@ -1611,6 +1629,7 @@ export class Registry {
     const id = text(row, 'id');
     const device = db.prepare('SELECT name FROM devices WHERE claim_id = ?').get(id);
     const processes = processesOf(db, id);
+    const needed = laneActive(readPark(db, id)) ? laneNeeds(db, id) : [];
     const ended: EndedLane = {
       id,
       owner: describeOwner(ownerFromRow(row)),
@@ -1644,7 +1663,16 @@ export class Registry {
       now,
     );
     db.prepare('DELETE FROM claims WHERE id = ?').run(id);
+    markNeedsUnneeded(db, needed, now);
     return ended;
+  }
+
+  /** Writes a change to a lane's park, marking the shared services it needed as unneeded when it stops being active. */
+  private changePark(laneId: string, change: () => void): void {
+    const db = this.store.db;
+    const needed = laneActive(readPark(db, laneId)) ? laneNeeds(db, laneId) : [];
+    change();
+    if (needed.length > 0 && !laneActive(readPark(db, laneId))) markNeedsUnneeded(db, needed, this.clock.now());
   }
 
   private endAndLease(
@@ -2247,14 +2275,16 @@ export class Registry {
       }
       const park = readPark(db, ref.id);
       if (park && park.state !== 'parked' && !this.heldByDead(park, dead)) return null;
-      writePark(db, ref.id, {
-        state: 'parking',
-        since: this.clock.now(),
-        parkedAt: park?.parkedAt ?? null,
-        holder: me,
-        attempt,
-        restarts: park?.restarts ?? NOTHING_TO_RESTART,
-        problems: park?.problems ?? [],
+      this.changePark(ref.id, () => {
+        writePark(db, ref.id, {
+          state: 'parking',
+          since: this.clock.now(),
+          parkedAt: park?.parkedAt ?? null,
+          holder: me,
+          attempt,
+          restarts: park?.restarts ?? NOTHING_TO_RESTART,
+          problems: park?.problems ?? [],
+        });
       });
       return loadLane(db, ref.id);
     });
@@ -2266,8 +2296,10 @@ export class Registry {
       const db = this.store.db;
       const park = readPark(db, ref.id);
       if (park?.state !== 'parking' || park.attempt !== attempt) return;
-      if (park.parkedAt === null) dropPark(db, ref.id);
-      else writePark(db, ref.id, { ...park, state: 'parked', since: this.clock.now(), holder: null, attempt: null });
+      this.changePark(ref.id, () => {
+        if (park.parkedAt === null) dropPark(db, ref.id);
+        else writePark(db, ref.id, { ...park, state: 'parked', since: this.clock.now(), holder: null, attempt: null });
+      });
     });
   }
 
@@ -2314,14 +2346,16 @@ export class Registry {
             kept.push(`kept ${NOUN[platform]} ${name}: this process has no ${NOUN[platform]} tool to shut it down`);
           }
         }
-        writePark(db, ref.id, {
-          state: 'parked',
-          since: now,
-          parkedAt: now,
-          holder: null,
-          attempt: null,
-          restarts,
-          problems: kept,
+        this.changePark(ref.id, () => {
+          writePark(db, ref.id, {
+            state: 'parked',
+            since: now,
+            parkedAt: now,
+            holder: null,
+            attempt: null,
+            restarts,
+            problems: kept,
+          });
         });
         return { parked: true, work: this.inWrite({ own, others }, me, keeper, notes, 'park:stopped-device') };
       });
@@ -2382,14 +2416,16 @@ export class Registry {
       const park = readPark(db, ref.id);
       if (park?.attempt !== attempt) return;
       const now = this.clock.now();
-      writePark(db, ref.id, {
-        ...park,
-        state: 'parked',
-        since: now,
-        parkedAt: park.parkedAt ?? now,
-        holder: null,
-        attempt: null,
-        problems,
+      this.changePark(ref.id, () => {
+        writePark(db, ref.id, {
+          ...park,
+          state: 'parked',
+          since: now,
+          parkedAt: park.parkedAt ?? now,
+          holder: null,
+          attempt: null,
+          problems,
+        });
       });
     });
   }
@@ -2471,21 +2507,28 @@ export class Registry {
     const holders = holdersBeforeLock(this.store.db, this.processes);
     return this.store.write(() => {
       const row = this.requireLane(ref);
-      return startResource(this.store.db, { id: ref.id, worktree: text(row, 'worktree') }, spec, me, holders, this.clock.now());
+      return startResource(
+        this.store.db,
+        { id: ref.id, worktree: text(row, 'worktree'), repository: text(row, 'project_root') },
+        spec,
+        me,
+        holders,
+        this.clock.now(),
+      );
     });
   }
 
   finishResource(lane: string, name: string, exports: ResourceValues): void {
     const me = this.self();
     this.store.write(() => {
-      finishResource(this.store.db, lane, name, exports, me);
+      finishResource(this.store.db, lane, name, exports, me, this.clock.now());
     });
   }
 
   failResource(lane: string, name: string, problem: string): void {
     const me = this.self();
     this.store.write(() => {
-      failResource(this.store.db, lane, name, problem, me);
+      failResource(this.store.db, lane, name, problem, me, this.clock.now());
     });
   }
 
@@ -2499,7 +2542,7 @@ export class Registry {
   finishTeardown(lane: string, name: string): void {
     const me = this.self();
     this.store.write(() => {
-      endTeardown(this.store.db, lane, name, me);
+      endTeardown(this.store.db, lane, name, me, this.clock.now());
     });
   }
 
@@ -2508,6 +2551,96 @@ export class Registry {
     this.store.write(() => {
       failTeardown(this.store.db, lane, name, problem, me, this.clock.now());
     });
+  }
+
+  /**
+   * Records the shared services the lane needs, by name: exactly `names`, from its resources' and services' `needs`.
+   * While the lane is active, one it no longer needs counts as unneeded from now if no other active lane needs it.
+   */
+  recordNeeds(ref: LaneRef, names: readonly string[]): void {
+    this.store.write(() => {
+      const row = this.requireLane(ref);
+      recordLaneNeeds(this.store.db, ref.id, text(row, 'project_root'), names, this.clock.now());
+    });
+  }
+
+  /** The shared services the lane's record says it needs, by name. */
+  needsOf(laneId: string): string[] {
+    return laneNeeds(this.store.db, laneId).map(n => n.name);
+  }
+
+  /**
+   * Takes the start of shared service `name` for a lane, or for a teardown this process holds in `repository`, or says
+   * who has it; see `beginStart`. A lane's start also records that the lane needs it.
+   */
+  beginSharedStart(
+    need: { lane: LaneRef } | { repository: string },
+    name: string,
+    spec: SharedCommands | null,
+    foundDown: boolean,
+  ): SharedStartClaim {
+    const me = this.self();
+    const holders = sharedHoldersBeforeLock(this.store.db, this.processes);
+    return this.store.write(() => {
+      let whom: SharedNeed;
+      if ('lane' in need) {
+        const row = this.requireLane(need.lane);
+        whom = { kind: 'lane', repository: text(row, 'project_root'), lane: need.lane.id };
+      } else whom = { kind: 'teardown', repository: need.repository };
+      return beginStart(this.store.db, whom, name, spec, foundDown, me, holders, this.clock.now());
+    });
+  }
+
+  /** Records the start this process holds as done; false when it no longer holds it. */
+  finishSharedStart(key: SharedKey): boolean {
+    const me = this.self();
+    return this.store.write(() => finishStart(this.store.db, key, me, this.clock.now()));
+  }
+
+  failSharedStart(key: SharedKey, problem: string): void {
+    const me = this.self();
+    this.store.write(() => {
+      failStart(this.store.db, key, problem, me, this.clock.now());
+    });
+  }
+
+  /** The shared services a sweep may have to stop or mark, by one read of the registry; no process starts. */
+  sharedStopCandidates(): SharedKey[] {
+    const now = this.clock.now();
+    return stopCandidates(this.store.db, now, { idleSince: now - SHARED_IDLE_MS, retrySince: now - SHARED_STOP_RETRY_MS });
+  }
+
+  /** Takes the stop of a shared service nothing has needed for SHARED_IDLE_MS, or says why it is left; see `beginStop`. */
+  beginSharedStop(key: SharedKey): SharedStopClaim {
+    const me = this.self();
+    const holders = sharedHoldersBeforeLock(this.store.db, this.processes);
+    return this.store.write(() => {
+      this.store.actor = { who: `${TOOL} stopping shared service ${key.name}`, folder: key.repository };
+      const now = this.clock.now();
+      return beginStop(this.store.db, key, me, holders, now, {
+        idleSince: now - SHARED_IDLE_MS,
+        retrySince: now - SHARED_STOP_RETRY_MS,
+      });
+    });
+  }
+
+  finishSharedStop(key: SharedKey): void {
+    const me = this.self();
+    this.store.write(() => {
+      finishStop(this.store.db, key, me, this.clock.now());
+    });
+  }
+
+  failSharedStop(key: SharedKey, problem: string): void {
+    const me = this.self();
+    this.store.write(() => {
+      failStop(this.store.db, key, problem, me, this.clock.now());
+    });
+  }
+
+  /** Every shared service, with the lanes that need it, when it stops if none does, and its last problem. */
+  sharedServices(): SharedServiceStatus[] {
+    return readShared(this.store.db);
   }
 
   /** The browsers of lanes that have ended, however they ended: their processes may still run. */
