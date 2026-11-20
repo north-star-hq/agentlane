@@ -316,20 +316,24 @@ export async function stopUnneededShared(deps: SharedRunDeps, registry: Registry
     const { commands } = claim;
     const place = placeOf(deps, registry.dir, key, commands);
     const done = { ...key, unneededSince: claim.unneededSince, moved: place.moved, took: claim.took };
+    let how: string | null = null;
     try {
       await runHook(`shared ${key.name} stop`, commands.stop, { ...place, timeoutMs: commands.timeoutMs });
+    } catch (error) {
+      how = error instanceof HookFailed ? `stop ${describeExit(error.run)}` : `stop could not run (${message(error)})`;
+    }
+    if (how === null) {
       registry.finishSharedStop(key);
       stopped.push({ ...done, outcome: 'stopped', problem: null });
-    } catch (error) {
-      const how = error instanceof HookFailed ? `stop ${describeExit(error.run)}` : `stop could not run (${message(error)})`;
-      registry.failSharedStop(key, `${how}: ${commands.stop}`);
-      const where = place.moved ? ` (it ran in ${place.cwd}, since its folder ${commands.cwd} is gone)` : '';
-      stopped.push({
-        ...done,
-        outcome: 'failed',
-        problem: `${how}${where}: ${commands.stop}\n${tail(place.log)}\nfull log: ${place.log}`,
-      });
+      continue;
     }
+    registry.failSharedStop(key, `${how}: ${commands.stop}`);
+    const where = place.moved ? ` (it ran in ${place.cwd}, since its folder ${commands.cwd} is gone)` : '';
+    stopped.push({
+      ...done,
+      outcome: 'failed',
+      problem: `${how}${where}: ${commands.stop}\n${tail(place.log)}\nfull log: ${place.log}`,
+    });
   }
   return stopped;
 }
