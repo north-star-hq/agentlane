@@ -189,6 +189,8 @@ const SPLIT_NAMES = [
   'a{d..d}b shell',
   'xcrun sim{c,}tl boot booted',
   'e{nv,mulator} -avd x',
+  "do''cker run -d postgres",
+  'sh -c \'pod""man-compose up -d\'',
 ];
 
 const PLAIN = [
@@ -202,6 +204,8 @@ const PLAIN = [
   "awk '{print $1, $2}' list.txt",
   'node -e "console.log({a: 1, b: 2})"',
   'echo {1..3}',
+  'ls -la',
+  'nohup pnpm dev > dev.log 2>&1 &',
 ];
 
 test('the guard hooks init writes start no node process for a command with no device or browser tool in it', async () => {
@@ -241,7 +245,7 @@ test('the guard hooks init writes start no node process for a command with no de
           assert.equal(quiet.stdout, agent === 'cursor' ? '{"permission":"allow"}\n' : '', agent);
           assert.deepEqual(calls(log), [], `${agent}, ${format}: started the toolkit or node for ${plain}`);
         }
-        for (const shell of ['xcrun simctl boot booted', ...SPLIT_NAMES]) {
+        for (const shell of ['xcrun simctl boot booted', 'docker run -d postgres', ...SPLIT_NAMES]) {
           const device = sh(command, dir, env, input(shell));
           assert.equal(device.status, 0, `${agent}, ${format}: ${device.stderr}`);
           assert.deepEqual(
@@ -266,6 +270,8 @@ const GUARDED_COMMANDS: Record<(typeof GUARDED_WORDS)[number], (name: string) =>
   'playwright-cli': name => `${name} kill-all`,
   '@playwright/cli': name => `npx ${name} kill-all`,
   'agent-browser': name => `${name} --session x open`,
+  docker: name => `${name} run -d postgres`,
+  podman: name => `${name} compose up -d`,
 };
 
 function splitsOf(word: string): string[] {

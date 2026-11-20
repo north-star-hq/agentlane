@@ -215,6 +215,41 @@ test('a command that aims at no device is allowed without reading the registry, 
   }
 });
 
+test('in every agent the guard blocks a container that outlives its command without reading the registry, and the bypass passes', async () => {
+  const s = setup('agent-guard-container');
+  try {
+    const notADir = path.join(s.root, 'state-is-a-file');
+    fs.writeFileSync(notADir, '');
+    for (const [format, make] of Object.entries(DOCUMENTED_INPUT)) {
+      const agent = (format === 'copilot-claude-format' ? 'claude' : format) as Agent;
+      const blocked: string[] = [];
+      const stdin = JSON.stringify(make('docker compose up -d', s.root));
+      const env = { AGENTLANE_STATE_DIR: notADir };
+      const code = await runHookCommand(['pre-tool-use', '--agent', agent], deps(s, env, blocked, { stdin }));
+      const reason = blockReason(agent, code, blocked);
+      assert.match(reason, /^agentlane: blocked: `docker compose up -d` starts a container that keeps running/, format);
+      assert.ok(reason.includes('AGENTLANE_ALLOW_CONTAINER=1 docker compose up -d'), `${format}: ${reason}`);
+
+      for (const [command, extra] of [
+        ['AGENTLANE_ALLOW_CONTAINER=1 docker compose up -d', {}],
+        ['docker compose up -d', { AGENTLANE_ALLOW_CONTAINER: '1' }],
+      ] as const) {
+        const allowed: string[] = [];
+        const input = JSON.stringify(make(command, s.root));
+        const allowCode = await runHookCommand(
+          ['pre-tool-use', '--agent', agent],
+          deps(s, { ...env, ...extra }, allowed, { stdin: input }),
+        );
+        assert.equal(allowCode, 0, `${format}: ${command}`);
+        assert.equal(stdoutOf(allowed), ALLOW[agent], `${format}: ${command}`);
+        assert.equal(stderrOf(allowed), '', `${format}: ${command}`);
+      }
+    }
+  } finally {
+    fs.rmSync(s.root, { recursive: true, force: true });
+  }
+});
+
 const SESSION_END_INPUT: Partial<Record<Agent, (reason: string) => object>> = {
   gemini: reason => ({ session_id: 'g-1', cwd: '/w', hook_event_name: 'SessionEnd', timestamp: 't', reason }),
   copilot: reason => ({ sessionId: 'cp-1', timestamp: 1_791_795_600_000, cwd: '/w', reason }),
