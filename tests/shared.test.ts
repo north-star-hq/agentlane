@@ -1,14 +1,20 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
+import { systemClock } from '../src/clock.ts';
+import { groupAlive, identityOf, killGroup, systemProcesses } from '../src/processes.ts';
 import type { SharedServiceConfig } from '../src/project/config.ts';
+import type { RegistryConfig } from '../src/registry/config.ts';
 import { MINUTE_MS } from '../src/registry/config.ts';
+import type { Owner } from '../src/registry/owner.ts';
 import { RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
 import { NOTHING_TO_RESTART } from '../src/registry/parks.ts';
 import { databasePath } from '../src/registry/paths.ts';
-import { SHARED_IDLE_MS, SHARED_STOP_RETRY_MS } from '../src/registry/shared.ts';
+import { Registry } from '../src/registry/registry.ts';
+import { SHARED_IDLE_MS, SHARED_READY_RUN_MAX_MS, SHARED_STOP_RETRY_MS, sharedHoldMs } from '../src/registry/shared.ts';
 import { Store } from '../src/registry/store.ts';
 import type { Lane } from '../src/registry/types.ts';
 import { realServiceSystem } from '../src/services/system.ts';
@@ -19,9 +25,11 @@ import {
   sharedDir,
   startSharedForLane,
   startSharedForTeardown,
+  stopUnneededShared,
 } from '../src/up/shared.ts';
-import { runSweep, sweepDue, type SweepDeps } from '../src/up/sweep.ts';
+import { runSweep, SWEEP_INTERVAL_MS, sweepDue, type SweepDeps } from '../src/up/sweep.ts';
 import { tempDir } from './support/fakes.ts';
+import type { SharedHolderPlan } from './support/shared-holder.ts';
 import type { World } from './support/world.ts';
 import { parkNow, sawOwners, world } from './support/world.ts';
 
@@ -59,10 +67,10 @@ function deps(w: World): SharedRunDeps {
   return { env: { PATH: process.env.PATH }, clock: w.clock };
 }
 
-function sweepDeps(w: World): SweepDeps {
+function sweepDeps(w: World, env: NodeJS.ProcessEnv = {}): SweepDeps {
   return {
     dir: w.dir,
-    env: { PATH: process.env.PATH, HOME: tempDir('shared-home') },
+    env: { PATH: process.env.PATH, HOME: tempDir('shared-home'), ...env },
     processes: w.procs,
     system: realServiceSystem,
     clock: w.clock,
@@ -342,7 +350,7 @@ test("a lane whose resources and services don't need it doesn't keep it up, nor 
   }
 });
 
-test('a failed stop keeps it running with the problem, readable in the shared read, and the next sweep after the retry time stops it', async () => {
+test('a failed stop keeps it running with the problem, readable in the shared read, and the next sweep a sweep interval later stops it', async () => {
   const w = world();
   const f = fixture();
   const log = path.join(f.dir, 'log');
@@ -373,10 +381,14 @@ test('a failed stop keeps it running with the problem, readable in the shared re
     assert.match(status.problem ?? '', /^stop exited 3: /);
     assert.equal(status.attempts, 1);
     assert.equal(status.unneededSince, parkedAt);
-    assert.equal(status.stopsAt, w.clock.now() + SHARED_STOP_RETRY_MS);
-    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false, 'not due again before the retry time');
+    assert.equal(SHARED_STOP_RETRY_MS, SWEEP_INTERVAL_MS, "a failed stop is due again at the MCP servers' next sweep");
+    assert.equal(status.stopsAt, w.clock.now() + SWEEP_INTERVAL_MS);
 
-    await w.clock.advance(SHARED_STOP_RETRY_MS);
+    await w.clock.advance(SWEEP_INTERVAL_MS - 1);
+    sawOwners(w.registry());
+    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false, 'passing commands start no sweeper for it');
+    assert.deepEqual(await sweepStops(w), []);
+    await w.clock.advance(1);
     sawOwners(w.registry());
     assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), true);
     assert.deepEqual(await sweepStops(w), ['db stopped']);
@@ -604,7 +616,10 @@ test('a sweep takes over a stop whose holder died once nothing needs the service
     const dead = w.procs.spawn();
     assert.equal(w.registry({ self: dead }).beginSharedStop({ repository: repo, name: 'db' }).kind, 'claimed');
     w.procs.kill(dead.pid);
-    await w.clock.advance(3 * f.spec().timeoutMs);
+    await w.clock.advance(sharedHoldMs(f.spec().timeoutMs) - 1);
+    sawOwners(w.registry());
+    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false, 'its holder may still be stopping it');
+    await w.clock.advance(1);
     sawOwners(w.registry());
     assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), true);
     const report = await runSweep(sweepDeps(w));
@@ -618,7 +633,7 @@ test('a sweep takes over a stop whose holder died once nothing needs the service
   }
 });
 
-test('a failed start leaves it stopped with the problem, undoes what the start began, and throws naming the service and its output', async () => {
+test('a failed start runs no stop: it throws naming the service and its output, leaves the service running with the problem, and the sweep stops it 5 minutes after its lane ends', async () => {
   const w = world();
   const f = fixture();
   const log = path.join(f.dir, 'log');
@@ -630,15 +645,318 @@ test('a failed start leaves it stopped with the problem, undoes what the start b
     assert.equal(error.service, 'db');
     assert.match(error.message, /^shared service db: start exited 4: .*\n(.|\n)*port 5432 is taken(.|\n)*full log: /);
     const status = w.registry().sharedServices()[0];
-    assert.deepEqual([status?.state, status?.problem?.startsWith('start exited 4: ')], ['stopped', true]);
-    assert.deepEqual(f.lines(), ['start', 'stop']);
+    assert.deepEqual([status?.state, status?.by, status?.problem?.startsWith('start exited 4: ')], ['running', null, true]);
+    assert.deepEqual(f.lines(), ['start']);
 
     const never = f.spec({ start: `echo start >> '${log}'`, timeoutMs: 1000 });
     const waiting = startSharedForLane(deps(w), w.registry(), refOf(a), [never]);
     const timedOut = await settle(w, waiting).catch((e: unknown) => e);
     assert.ok(timedOut instanceof SharedServiceFailed);
     assert.match(timedOut.message, /^shared service db: ready did not pass within 1 s of its start: test -f /);
-    assert.equal(stateOf(w), 'stopped');
+    assert.match(w.registry().sharedServices()[0]?.problem ?? '', /^ready did not pass within 1 s/);
+    assert.deepEqual(f.lines(), ['start', 'start']);
+    assert.deepEqual(await sweepStops(w), [], 'its lane is active');
+
+    w.registry().release(refOf(a), a.owner);
+    await w.clock.advance(SHARED_IDLE_MS - 1);
+    assert.deepEqual(await sweepStops(w), []);
+    await w.clock.advance(1);
+    assert.deepEqual(await sweepStops(w), ['db stopped']);
+    assert.deepEqual(f.lines(), ['start', 'start', 'stop']);
+  } finally {
+    w.close();
+  }
+});
+
+test('a failed start by one lane never stops the service another active lane uses', async () => {
+  const w = world();
+  const f = fixture();
+  const flaky = path.join(f.dir, 'flaky');
+  try {
+    const repo = w.folder('repo');
+    const b = await lane(w, 'b', repo);
+    const a = await lane(w, 'a', repo);
+    const spec = f.spec({ ready: `test -f '${f.up}' && test ! -f '${flaky}'`, timeoutMs: 1000 });
+    await startSharedForLane(deps(w), w.registry(), refOf(b), [spec]);
+    fs.writeFileSync(flaky, '');
+    const error = await settle(w, startSharedForLane(deps(w), w.registry(), refOf(a), [spec])).catch((e: unknown) => e);
+    assert.ok(error instanceof SharedServiceFailed);
+    assert.match(error.message, /ready did not pass within 1 s/);
+    assert.deepEqual(f.lines(), ['start', 'start'], 'no stop ran');
+    assert.ok(fs.existsSync(f.up), "lane b's server still runs");
+    const status = w.registry().sharedServices()[0];
+    assert.deepEqual([status?.state, status?.lanes], ['running', [a.id, b.id].sort()]);
+    await w.clock.advance(SHARED_IDLE_MS);
+    assert.deepEqual(await sweepStops(w), []);
+    assert.ok(fs.existsSync(f.up));
+  } finally {
+    w.close();
+  }
+});
+
+test('a registry write that fails after a successful start leaves the service running and runs no stop', async () => {
+  const w = world();
+  const f = fixture();
+  try {
+    const repo = w.folder('repo');
+    const a = await lane(w, 'a', repo);
+    const failing = w.registry();
+    failing.finishSharedStart = () => {
+      throw new Error('the registry stayed busy');
+    };
+    const error = await startSharedForLane(deps(w), failing, refOf(a), [f.spec()]).catch((e: unknown) => e);
+    assert.ok(error instanceof SharedServiceFailed);
+    assert.match(error.message, /^shared service db: its start stopped partway: the registry stayed busy$/);
+    assert.deepEqual(f.lines(), ['start']);
+    assert.ok(fs.existsSync(f.up));
+    const status = w.registry().sharedServices()[0];
+    assert.deepEqual([status?.state, status?.by], ['running', null]);
+
+    const b = await lane(w, 'b', repo);
+    assert.deepEqual(
+      (await startSharedForLane(deps(w), w.registry(), refOf(b), [f.spec()])).map(s => s.outcome),
+      ['found-running'],
+    );
+    assert.deepEqual(f.lines(), ['start']);
+    assert.equal(w.registry().sharedServices()[0]?.problem, null);
+  } finally {
+    w.close();
+  }
+});
+
+test('a resource row held by a process that died does not keep it up: up killed mid-create, then the lane parks, and it stops 5 minutes after the park', async () => {
+  const w = world();
+  const f = fixture();
+  try {
+    const repo = w.folder('repo');
+    const a = await lane(w, 'a', repo);
+    await startSharedForLane(deps(w), w.registry(), refOf(a), [f.spec({ timeoutMs: 1000 })]);
+    const dying = w.procs.spawn();
+    w.registry({ self: dying }).startResource(refOf(a), {
+      name: 'appdb',
+      cwd: a.worktree,
+      teardown: 'true',
+      timeoutMs: 1000,
+      env: {},
+      cleared: [],
+      needs: ['db'],
+    });
+    w.procs.kill(dying.pid);
+    await w.clock.advance(MINUTE_MS);
+    assert.ok(parkNow(w.registry(), refOf(a)));
+    const parkedAt = w.clock.now();
+    const status = w.registry().sharedServices()[0];
+    assert.deepEqual([status?.holding, status?.unneededSince], [[{ lane: a.id, resource: 'appdb' }], parkedAt]);
+
+    await w.clock.advance(SHARED_IDLE_MS - 1000);
+    sawOwners(w.registry());
+    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), false);
+    assert.deepEqual(await sweepStops(w), []);
+    await w.clock.advance(1000);
+    sawOwners(w.registry());
+    assert.equal(sweepDue({ dir: w.dir, clock: w.clock, processes: w.procs }), true);
+    assert.deepEqual(await sweepStops(w), ['db stopped']);
+    assert.deepEqual(f.lines(), ['start', 'stop']);
+  } finally {
+    w.close();
+  }
+});
+
+test('a lane waits on a live start for as long as a start may take: its first ready run, its start and the ready window, plus margin', async () => {
+  const w = world();
+  const f = fixture();
+  try {
+    const repo = w.folder('repo');
+    const a = await lane(w, 'a', repo);
+    const b = await lane(w, 'b', repo);
+    const timeoutMs = 1000;
+    const holder = w.procs.spawn();
+    const claimedAt = w.clock.now();
+    const claim = w
+      .registry({ self: holder })
+      .beginSharedStart({ lane: refOf(a) }, 'db', { ...f.spec({ timeoutMs }), env: {} }, false);
+    assert.equal(claim.kind, 'claimed');
+    const state = { settled: false };
+    const waiting = startSharedForLane(deps(w), w.registry(), refOf(b), [f.spec({ timeoutMs })]).finally(() => {
+      state.settled = true;
+    });
+    waiting.catch(() => undefined);
+    const firstReady = Math.min(timeoutMs, SHARED_READY_RUN_MAX_MS);
+    const worstCase = claimedAt + firstReady + timeoutMs + timeoutMs + 1000;
+    const limit = claimedAt + sharedHoldMs(timeoutMs);
+    const end = Math.max(limit, worstCase);
+    while (w.clock.now() < end) {
+      await until(() => w.clock.sleeping > 0 || state.settled);
+      assert.equal(state.settled, false, `still waiting at ${String(w.clock.now() - claimedAt)} ms`);
+      await w.clock.advance(Math.min(SHARED_WAIT_POLL_MS, end - w.clock.now()));
+    }
+    await until(() => w.clock.sleeping > 0 || state.settled);
+    assert.equal(state.settled, false, 'still waiting at the limit');
+    await w.clock.advance(SHARED_WAIT_POLL_MS);
+    const hung = await waiting.catch((e: unknown) => e);
+    assert.ok(hung instanceof SharedServiceFailed);
+    assert.match(
+      hung.message,
+      /^shared service db: pid \d+ has been starting it since .*, longer than its commands may take; kill \d+/,
+    );
+  } finally {
+    w.close();
+  }
+});
+
+test('a ready that passes only after the ready window has closed does not count', async () => {
+  const w = world();
+  const f = fixture();
+  const log = path.join(f.dir, 'log');
+  try {
+    const a = await lane(w, 'a', w.folder('repo'));
+    const starting = startSharedForLane(deps(w), w.registry(), refOf(a), [
+      f.spec({ start: `echo start >> '${log}'`, timeoutMs: 100 }),
+    ]);
+    starting.catch(() => undefined);
+    await until(() => w.clock.sleeping > 0);
+    fs.writeFileSync(f.up, '');
+    await w.clock.advance(500);
+    const late = await starting.catch((e: unknown) => e);
+    assert.ok(late instanceof SharedServiceFailed, 'no ready run is started once the window has closed');
+    assert.match(late.message, /^shared service db: ready did not pass within 0\.1 s/);
+  } finally {
+    w.close();
+  }
+});
+
+test('a ready run that answers after the ready window has closed does not count', async () => {
+  const w = world();
+  const f = fixture();
+  const probes = path.join(f.dir, 'probes');
+  try {
+    const a = await lane(w, 'a', w.folder('repo'));
+    const starting = startSharedForLane(deps(w), w.registry(), refOf(a), [
+      f.spec({ ready: `echo probe >> '${probes}'; sleep 0.3; test -f '${f.up}'`, timeoutMs: 1000 }),
+    ]);
+    starting.catch(() => undefined);
+    await until(() => fs.existsSync(probes) && fs.readFileSync(probes, 'utf8').split('\n').length > 2);
+    await w.clock.advance(1001);
+    const late = await starting.catch((e: unknown) => e);
+    assert.ok(late instanceof SharedServiceFailed);
+    assert.match(late.message, /^shared service db: ready did not pass within 1 s/);
+  } finally {
+    w.close();
+  }
+});
+
+test('each ready run gets what is left of the ready window, not a full run of its own', async () => {
+  const w = world();
+  const f = fixture();
+  const slow = path.join(f.dir, 'slow');
+  try {
+    const a = await lane(w, 'a', w.folder('repo'));
+    const timeoutMs = 30_000;
+    const starting = startSharedForLane(deps(w), w.registry(), refOf(a), [
+      f.spec({ start: 'true', ready: `if [ -f '${slow}' ]; then sleep 10; echo slow; fi; exit 1`, timeoutMs }),
+    ]);
+    starting.catch(() => undefined);
+    await until(() => w.clock.sleeping > 0);
+    fs.writeFileSync(slow, '');
+    const began = Date.now();
+    await w.clock.advance(timeoutMs - 1000);
+    const late = await settle(w, starting).catch((e: unknown) => e);
+    assert.ok(late instanceof SharedServiceFailed);
+    assert.ok(Date.now() - began < 5000, `its last ready run was cut at the window's end (${String(Date.now() - began)} ms)`);
+  } finally {
+    w.close();
+  }
+});
+
+test('a start or stop whose log folder cannot be made lets go of the shared service', async () => {
+  const w = world();
+  const f = fixture();
+  const blocker = path.join(w.dir, 'shared');
+  try {
+    const repo = w.folder('repo');
+    const a = await lane(w, 'a', repo);
+    fs.mkdirSync(w.dir, { recursive: true });
+    fs.writeFileSync(blocker, '');
+    const error = await startSharedForLane(deps(w), w.registry(), refOf(a), [f.spec()]).catch((e: unknown) => e);
+    const failed = w.registry().sharedServices()[0];
+    assert.deepEqual([failed?.state, failed?.by], ['running', null]);
+    assert.ok(error instanceof SharedServiceFailed);
+    assert.match(error.message, /^shared service db: its start stopped partway: .*(ENOTDIR|EEXIST)/);
+    assert.deepEqual(f.lines(), []);
+
+    fs.rmSync(blocker);
+    assert.deepEqual(
+      (await startSharedForLane(deps(w), w.registry(), refOf(a), [f.spec()])).map(s => s.outcome),
+      ['started'],
+      'the next start does not wait on the one that failed',
+    );
+    w.registry().release(refOf(a), a.owner);
+    await w.clock.advance(SHARED_IDLE_MS);
+    fs.rmSync(path.join(w.dir, 'shared'), { recursive: true });
+    fs.writeFileSync(blocker, '');
+    sawOwners(w.registry());
+    const report = await runSweep(sweepDeps(w));
+    assert.deepEqual(
+      report.shared.map(s => s.outcome),
+      ['failed'],
+    );
+    assert.match(report.shared[0]?.problem ?? '', /^stop could not run \(.*(ENOTDIR|EEXIST)/);
+    const after = w.registry().sharedServices()[0];
+    assert.deepEqual([after?.state, after?.by, after?.attempts], ['running', null, 1]);
+    fs.rmSync(blocker);
+    await w.clock.advance(SWEEP_INTERVAL_MS);
+    assert.deepEqual(await sweepStops(w), ['db stopped']);
+  } finally {
+    w.close();
+  }
+});
+
+test('a stop and ready run with the PATH and container variables the start had, over those of the process running them, and the rest of its environment is not recorded', async () => {
+  const w = world();
+  const f = fixture();
+  const log = path.join(f.dir, 'log');
+  try {
+    const repo = w.folder('repo');
+    const a = await lane(w, 'a', repo);
+    const b = await lane(w, 'b', repo);
+    const spec = f.spec({
+      start: `echo "start $DOCKER_HOST $COMPOSE_PROJECT_NAME" >> '${log}'; touch '${f.up}'`,
+      stop: `echo "stop \${DOCKER_HOST:-none} \${COMPOSE_PROJECT_NAME:-none} \${DOCKER_CONTEXT:-none}" >> '${log}'; rm -f '${f.up}'`,
+      ready: `test "$DOCKER_HOST" = tcp://start-host && test -f '${f.up}'`,
+    });
+    const startEnv = {
+      PATH: process.env.PATH,
+      DOCKER_HOST: 'tcp://start-host',
+      COMPOSE_PROJECT_NAME: 'lanes',
+      API_TOKEN: 's3cret',
+    };
+    await startSharedForLane({ ...deps(w), env: startEnv }, w.registry(), refOf(a), [spec]);
+    assert.deepEqual(w.registry().sharedServices()[0]?.commands.env, {
+      PATH: process.env.PATH,
+      DOCKER_HOST: 'tcp://start-host',
+      COMPOSE_PROJECT_NAME: 'lanes',
+    });
+    assert.deepEqual(
+      (
+        await startSharedForLane(
+          { ...deps(w), env: { PATH: process.env.PATH, DOCKER_HOST: 'tcp://other' } },
+          w.registry(),
+          refOf(b),
+          [spec],
+        )
+      ).map(s => s.outcome),
+      ['kept'],
+      "lane b's ready asks the start's daemon",
+    );
+    for (const l of [a, b]) w.registry().release(refOf(l), l.owner);
+    await w.clock.advance(SHARED_IDLE_MS);
+    sawOwners(w.registry());
+    const report = await runSweep(sweepDeps(w, { DOCKER_HOST: 'tcp://sweep-host', DOCKER_CONTEXT: 'elsewhere' }));
+    assert.deepEqual(
+      report.shared.map(s => s.outcome),
+      ['stopped'],
+    );
+    assert.deepEqual(f.lines(), ['start tcp://start-host lanes', 'stop tcp://start-host lanes none']);
   } finally {
     w.close();
   }
@@ -771,5 +1089,231 @@ test('a lane parked mid-start leaves the service marked once the start finishes'
     assert.deepEqual([status?.state, status?.unneededSince], ['running', parkedAt]);
   } finally {
     w.close();
+  }
+});
+
+const HOLDER = path.join(import.meta.dirname, 'support', 'shared-holder.ts');
+const HOLDER_CONFIG: RegistryConfig = {
+  poolSize: 0,
+  emulatorPoolSize: 0,
+  memoryBudgetMb: 0,
+  parkMs: 30 * MINUTE_MS,
+  blocks: { metro: { first: 48320, last: 48328 } },
+};
+
+interface RealWorld {
+  root: string;
+  stateDir: string;
+  repo: string;
+  log: string;
+  up: string;
+  gate: string;
+  registry(clock?: typeof systemClock): Registry;
+  lane(name: string): Promise<Lane>;
+  lines(): string[];
+  /** Runs a holder in a process of its own and kills it once `log` shows `marker` and its command is recorded; resolves to its pid. */
+  killMidway(plan: SharedHolderPlan['action'], aheadMs: number, marker: string): Promise<number>;
+  /** Lets any command still waiting on the gate finish, ends a recorded command's group, and removes the folder. */
+  close(): void;
+}
+
+function recordedCommand(stateDir: string): number | null {
+  const db = new DatabaseSync(databasePath(stateDir));
+  try {
+    const pid = db.prepare('SELECT command_pid FROM shared_services').get()?.command_pid;
+    return typeof pid === 'number' ? pid : null;
+  } finally {
+    db.close();
+  }
+}
+
+/** A registry on the real process table and clock, for holders that are real processes killed mid-command. */
+function realWorld(): RealWorld {
+  const root = tempDir('shared-real');
+  const stateDir = path.join(root, 'state');
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  Store.open(stateDir, 5000).close();
+  const self = identityOf(systemProcesses, process.pid);
+  assert.ok(self);
+  const owner: Owner = { kind: 'process', process: self, sessionId: null, threadId: null };
+  const log = path.join(root, 'log');
+  const open = (clock = systemClock) =>
+    Registry.open({
+      dir: stateDir,
+      processes: systemProcesses,
+      ports: { listening: () => Promise.resolve(new Set<number>()) },
+      devices: {},
+      config: HOLDER_CONFIG,
+      pollMs: 20,
+      lockWaitMs: 30_000,
+      self,
+      clock,
+    });
+  const lines = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []);
+  return {
+    root,
+    stateDir,
+    repo,
+    log,
+    up: path.join(root, 'up'),
+    gate: path.join(root, 'gate'),
+    registry: open,
+    lane: async name => {
+      const worktree = path.join(root, name);
+      fs.mkdirSync(worktree, { recursive: true });
+      const registry = open();
+      try {
+        return (await registry.claim({ owner, worktree, projectRoot: repo, services: [], device: null, waitMs: 0 })).lane;
+      } finally {
+        registry.close();
+      }
+    },
+    lines,
+    killMidway: async (action, aheadMs, marker) => {
+      const plan: SharedHolderPlan = { stateDir, config: HOLDER_CONFIG, aheadMs, action };
+      const child = spawn(process.execPath, [HOLDER, JSON.stringify(plan)], { stdio: ['ignore', 'ignore', 'inherit'] });
+      const exited = new Promise(resolve => child.once('exit', resolve));
+      try {
+        await until(() => lines().includes(marker) && recordedCommand(stateDir) !== null);
+      } finally {
+        child.kill('SIGKILL');
+        await exited;
+      }
+      return child.pid ?? 0;
+    },
+    close: () => {
+      fs.writeFileSync(path.join(root, 'gate'), '');
+      const command = recordedCommand(stateDir);
+      if (command !== null) killGroup(command);
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function realDeps(said: string[]): SharedRunDeps {
+  return { env: process.env, clock: systemClock, log: line => said.push(line) };
+}
+
+test("a sweeper killed mid-stop leaves its stop running: a lane's start waits for that stop to end, then starts the service", async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `echo start >> '${r.log}'; touch '${r.up}'`,
+      stop: `echo stop-begin >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done; rm -f '${r.up}'; echo stop-end >> '${r.log}'`,
+      ready: `test -f '${r.up}'`,
+      cwd: r.repo,
+      timeoutMs: 20_000,
+    };
+    const a = await r.lane('a');
+    const said: string[] = [];
+    await startSharedForLane(realDeps(said), registry, refOf(a), [spec]);
+    assert.ok(parkNow(registry, refOf(a)));
+    const sweeper = await r.killMidway({ kind: 'stop' }, SHARED_IDLE_MS + MINUTE_MS, 'stop-begin');
+    assert.deepEqual([registry.sharedServices()[0]?.state, registry.sharedServices()[0]?.by], ['stopping', sweeper]);
+
+    const b = await r.lane('b');
+    const state = { settled: false };
+    const starting = startSharedForLane(realDeps(said), registry, refOf(b), [spec]).finally(() => {
+      state.settled = true;
+    });
+    await until(() => said.some(line => line.startsWith('waiting for the stop of shared service db that pid')));
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(state.settled, false, 'the start waits while the stop runs on');
+    assert.deepEqual(r.lines(), ['start', 'stop-begin']);
+    fs.writeFileSync(r.gate, '');
+    const started = await starting;
+    assert.deepEqual(
+      started.map(s => [s.outcome, s.took]),
+      [['started', { state: 'stopping', pid: sweeper }]],
+    );
+    assert.deepEqual(r.lines(), ['start', 'stop-begin', 'stop-end', 'start']);
+    assert.ok(fs.existsSync(r.up));
+    assert.equal(registry.sharedServices()[0]?.state, 'running');
+  } finally {
+    registry.close();
+    r.close();
+  }
+});
+
+test('the command of a holder that died is ended once it runs past its timeout, and the start is taken over', async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `echo start >> '${r.log}'; touch '${r.up}'`,
+      stop: `echo stop-begin >> '${r.log}'; sleep 30; rm -f '${r.up}'; echo stop-end >> '${r.log}'`,
+      ready: `test -f '${r.up}'`,
+      cwd: r.repo,
+      timeoutMs: 1000,
+    };
+    const a = await r.lane('a');
+    const said: string[] = [];
+    await startSharedForLane(realDeps(said), registry, refOf(a), [spec]);
+    assert.ok(parkNow(registry, refOf(a)));
+    const sweeper = await r.killMidway({ kind: 'stop' }, SHARED_IDLE_MS + MINUTE_MS, 'stop-begin');
+    const command = recordedCommand(r.stateDir);
+    assert.ok(command !== null && groupAlive(command), 'the stop recorded its shell, which runs on');
+
+    const b = await r.lane('b');
+    const began = Date.now();
+    const started = await startSharedForLane(realDeps(said), registry, refOf(b), [spec]);
+    assert.deepEqual(
+      started.map(s => [s.outcome, s.took]),
+      [['found-running', { state: 'stopping', pid: sweeper }]],
+    );
+    assert.ok(Date.now() - began < 10_000, `ended within its timeout plus slack (${String(Date.now() - began)} ms)`);
+    assert.ok(
+      said.some(line => line.startsWith(`ending the stop of shared service db that pid ${String(sweeper)} left running`)),
+    );
+    assert.equal(groupAlive(command), false, 'its whole process group was ended');
+    assert.deepEqual(r.lines(), ['start', 'stop-begin']);
+  } finally {
+    registry.close();
+    r.close();
+  }
+});
+
+test('a lane start killed mid-start leaves its start running: the sweep stops the service only once that start has ended', async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  const ahead = { now: () => Date.now() + SHARED_IDLE_MS + MINUTE_MS, sleep: (ms: number) => systemClock.sleep(ms) };
+  const sweeping = r.registry(ahead);
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `echo start-begin >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done; touch '${r.up}'; echo start-end >> '${r.log}'`,
+      stop: `echo stop >> '${r.log}'; rm -f '${r.up}'`,
+      ready: `test -f '${r.up}'`,
+      cwd: r.repo,
+      timeoutMs: 20_000,
+    };
+    const a = await r.lane('a');
+    const starter = await r.killMidway({ kind: 'start', lane: refOf(a), spec }, 0, 'start-begin');
+    assert.ok(parkNow(registry, refOf(a)));
+    const sweep = () => stopUnneededShared({ env: process.env, clock: ahead }, sweeping);
+    assert.deepEqual(await sweep(), [], 'the start that pid left running still runs');
+    const left = sweeping.beginSharedStop({ repository: r.repo, name: 'db' });
+    assert.match(
+      left.kind === 'left' ? left.reason : left.kind,
+      new RegExp(`^the start that pid ${String(starter)} left running`),
+    );
+
+    const command = recordedCommand(r.stateDir);
+    assert.ok(command !== null);
+    fs.writeFileSync(r.gate, '');
+    await until(() => r.lines().includes('start-end') && !groupAlive(command));
+    assert.deepEqual(
+      (await sweep()).map(s => [s.outcome, s.took?.state]),
+      [['stopped', 'starting']],
+    );
+    assert.deepEqual(r.lines(), ['start-begin', 'start-end', 'stop']);
+  } finally {
+    registry.close();
+    sweeping.close();
+    r.close();
   }
 });

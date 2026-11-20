@@ -37,7 +37,7 @@
     },
     "shared": {
       "type": "object",
-      "description": "The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in `needs`. agentlane starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one. A stop runs the commands as they were at the shared service's last start, so a change to them counts from its next start.",
+      "description": "The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in `needs`. agentlane starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one. A shared service whose start failed may be partly up, so it counts as running and stops under the same rule. A stop runs the commands, with the PATH and the variables that choose a container tool's daemon and project, as they were at the shared service's last start, so a change to them counts from its next start.",
       "propertyNames": {
         "pattern": "^[a-z][a-z0-9-]*$"
       },
@@ -437,7 +437,7 @@
         "stop": {
           "type": "string",
           "minLength": 1,
-          "description": "A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped. agentlane also runs it to undo a start that failed."
+          "description": "A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped, or only partly started."
         },
         "ready": {
           "type": "string",

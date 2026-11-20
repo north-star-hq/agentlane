@@ -51,6 +51,7 @@ function runShell(
   env: NodeJS.ProcessEnv,
   out: number,
   timeoutMs: number | undefined,
+  onSpawn: ((pid: number) => void) | undefined,
 ): Promise<CommandResult> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
@@ -80,20 +81,28 @@ function runShell(
       clearTimeout(timer);
       resolve({ code, signal, ms: Date.now() - started, ...(timedOut ? { timedOut } : {}) });
     });
+    if (child.pid !== undefined) onSpawn?.(child.pid);
   });
 }
 
 export async function runHook(
   hook: string,
   command: string,
-  options: { cwd: string; env: NodeJS.ProcessEnv; log: string; timeoutMs?: number },
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    log: string;
+    timeoutMs?: number;
+    /** Called with the shell's pid once it runs; with a timeout, the shell leads a process group of its own. */
+    onSpawn?: (pid: number) => void;
+  },
 ): Promise<HookRun> {
   fs.mkdirSync(path.dirname(options.log), { recursive: true });
   fs.appendFileSync(options.log, `--- ${new Date().toISOString()} ${hook}: ${command}\n`);
   const fd = fs.openSync(options.log, 'a');
   let result: CommandResult;
   try {
-    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs);
+    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs, options.onSpawn);
   } finally {
     fs.closeSync(fd);
   }
@@ -118,11 +127,22 @@ export function runCheck(
 ): Promise<CheckOutcome> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawn('/bin/sh', ['-c', command], { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('/bin/sh', ['-c', command], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
     const chunks: Buffer[] = [];
     child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on('data', (chunk: Buffer) => chunks.push(chunk));
-    const timer = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs ?? 30_000);
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-(child.pid ?? 0), 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    }, options.timeoutMs ?? 30_000);
     child.once('error', error => {
       clearTimeout(timer);
       reject(error);

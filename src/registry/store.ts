@@ -113,12 +113,15 @@ CREATE TABLE IF NOT EXISTS shared_services (
   unneeded_since INTEGER,
   holder_pid INTEGER,
   holder_start TEXT,
+  command_pid INTEGER,
+  command_start TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   last_attempt_at INTEGER,
   problem TEXT,
   PRIMARY KEY (repository, name),
   CHECK (state IN ('stopped', 'starting', 'running', 'stopping')),
-  CHECK ((holder_pid IS NULL) = (state IN ('stopped', 'running')) AND (holder_pid IS NULL) = (holder_start IS NULL))
+  CHECK ((holder_pid IS NULL) = (state IN ('stopped', 'running')) AND (holder_pid IS NULL) = (holder_start IS NULL)),
+  CHECK ((command_pid IS NULL) = (command_start IS NULL) AND (command_pid IS NULL OR holder_pid IS NOT NULL))
 ) STRICT;
 CREATE TABLE IF NOT EXISTS shared_needs (
   claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,

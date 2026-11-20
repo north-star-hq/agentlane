@@ -61,6 +61,7 @@ import type { SharedCommands, SharedKey, SharedNeed, SharedServiceStatus, Shared
 import {
   beginStart,
   beginStop,
+  endCommand,
   failStart,
   failStop,
   finishStart,
@@ -68,6 +69,7 @@ import {
   laneActive,
   laneNeeds,
   markNeedsUnneeded,
+  noteCommand,
   readShared,
   recordLaneNeeds,
   SHARED_IDLE_MS,
@@ -2597,10 +2599,32 @@ export class Registry {
     return this.store.write(() => finishStart(this.store.db, key, me, this.clock.now()));
   }
 
+  /** Records the start this process holds as failed; it stays recorded as running, with `problem`, for the sweep to stop. */
   failSharedStart(key: SharedKey, problem: string): void {
     const me = this.self();
     this.store.write(() => {
       failStart(this.store.db, key, problem, me, this.clock.now());
+    });
+  }
+
+  /**
+   * Records the shell of the start or stop command this process runs for a shared service it holds, so a process taking
+   * over once this one has died waits for that command. Nothing is recorded when the shell has already exited.
+   */
+  noteSharedCommand(key: SharedKey, pid: number): void {
+    const me = this.self();
+    const group = identityOf(this.processes, pid);
+    if (!group) return;
+    this.store.write(() => {
+      noteCommand(this.store.db, key, group, me);
+    });
+  }
+
+  /** Forgets the command this process recorded for a shared service, once it has ended. */
+  endSharedCommand(key: SharedKey): void {
+    const me = this.self();
+    this.store.write(() => {
+      endCommand(this.store.db, key, me);
     });
   }
 
@@ -2640,7 +2664,7 @@ export class Registry {
 
   /** Every shared service, with the lanes that need it, when it stops if none does, and its last problem. */
   sharedServices(): SharedServiceStatus[] {
-    return readShared(this.store.db);
+    return readShared(this.store.db, this.clock.now());
   }
 
   /** The browsers of lanes that have ended, however they ended: their processes may still run. */
