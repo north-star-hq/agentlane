@@ -158,7 +158,7 @@ export function buildSite(out: string = DEFAULT_OUT): string[] {
       `docs/${page.slug}.html`,
       shell({
         root: '../',
-        title: `${page.title} | agentlane`,
+        title: `${page.title} | ${landing.title}: ${landing.problem}`,
         description: plainText(page.summary),
         current: { kind: 'doc', slug: page.slug },
         sections,
