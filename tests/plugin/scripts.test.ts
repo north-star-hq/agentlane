@@ -114,11 +114,15 @@ test('the hook script skips commands that name no device or browser driver witho
   const dir = project(`touch "${marker}/ran"; exit 0`);
   const ran = path.join(marker, 'ran');
   try {
-    const result = hook(dir, 'pre-tool-use', { tool_name: 'Bash', tool_input: { command: 'git status && pnpm test' } });
-    assert.equal(result.status, 0);
-    assert.equal(result.stdout, '');
-    assert.equal(fs.existsSync(ran), false);
+    for (const command of ['git status && pnpm test', 'ls -la', 'nohup some-server &']) {
+      const result = hook(dir, 'pre-tool-use', { tool_name: 'Bash', tool_input: { command } });
+      assert.equal(result.status, 0);
+      assert.equal(result.stdout, '');
+      assert.equal(fs.existsSync(ran), false, `${command} started the toolkit`);
+    }
     for (const command of [
+      'docker run -d postgres:16',
+      'podman-compose up -d',
       'xcrun simctl list',
       'playwright-cli -s=agentlane-1a2b3c4d snapshot',
       'npx @playwright/cli@latest kill-all',
@@ -170,6 +174,34 @@ test('the hook script passes the hook input to the toolkit and its decision back
       { AGENTLANE_OWNER_PID: String(process.pid) },
     );
     assert.equal(end.status, 0, end.stderr);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the hook script denies a container that outlives its command, and lets it through with the bypass the user asked for', () => {
+  const dir = project(realToolkit);
+  try {
+    const input = (command: string) => ({ tool_name: 'Bash', tool_input: { command }, cwd: dir });
+    const denied = hook(dir, 'pre-tool-use', input('docker run -d postgres:16'));
+    assert.equal(denied.status, 0, denied.stderr);
+    const reply = JSON.parse(denied.stdout) as {
+      hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string };
+    };
+    assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny');
+    assert.match(
+      reply.hookSpecificOutput.permissionDecisionReason,
+      /^agentlane: blocked: `docker run -d postgres:16` starts a container/,
+    );
+    for (const [command, env] of [
+      ['AGENTLANE_ALLOW_CONTAINER=1 docker run -d postgres:16', {}],
+      ['docker run -d postgres:16', { AGENTLANE_ALLOW_CONTAINER: '1' }],
+      ['docker run --rm alpine true', {}],
+    ] as const) {
+      const allowed = hook(dir, 'pre-tool-use', input(command), env);
+      assert.equal(allowed.status, 0, allowed.stderr);
+      assert.equal(allowed.stdout, '', command);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

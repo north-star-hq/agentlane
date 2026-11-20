@@ -20,7 +20,7 @@ import { toolVersion } from '../agents/package.ts';
 import { aimsOf } from './aims.ts';
 import type { HookInput, HookReply } from './conventions.ts';
 import { CONVENTIONS, readHookInput } from './conventions.ts';
-import { aimedOwnLanes, guard, type GuardContext } from './guard.ts';
+import { aimedOwnLanes, containerBlock, guard, type GuardContext } from './guard.ts';
 import { HOOK_PROBE_ENV, writeHookMark } from './hook-mark.ts';
 import { claimOnce } from './hook-once.ts';
 import { claudeSessionName } from './session-name.ts';
@@ -32,7 +32,9 @@ export const HOOK_HELP: UsageGroup<(typeof HOOK_COMMANDS)[number]> = {
   entries: {
     hook: `  hook pre-tool-use    Deny a simctl, adb, emulator or avdmanager command aimed at a device
                        another session holds, and a playwright-cli or agent-browser command
-                       aimed at another session's browser, the way the agent's hooks block.
+                       aimed at another session's browser, and a docker or podman command that
+                       starts a container which outlives it (run -d, start, compose up -d),
+                       the way the agent's hooks block.
   hook session-end     Release every lane this session holds and stop their services, in a
                        detached process (the session-end budget is short).
                        Both take --agent ${AGENTS.join('|')} (default claude).
@@ -78,7 +80,11 @@ function guardReply(raw: string, agent: Agent, deps: HookDeps): HookReply {
   const input = readHookInput(raw);
   const { command } = input;
   const cwd = input.cwd ?? deps.cwd;
-  if (command === null || aimsOf(command, deps.env, cwd).length === 0) return convention.allow;
+  if (command === null) return convention.allow;
+  const aims = aimsOf(command, deps.env, cwd);
+  if (aims.length === 0) return convention.allow;
+  const container = containerBlock(aims);
+  if (!container.allow) return convention.deny(container.reason);
   const owner = selfOwner(deps);
   const report = readRegistryStatus({
     dir: stateDir(deps.env),
