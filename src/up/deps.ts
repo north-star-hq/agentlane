@@ -36,6 +36,12 @@ export interface EnvDeps {
   pollMs?: number;
   /** How often a long `exec` command or `up` hook counts as a call on the lane while it runs; HEARTBEAT_MS when absent. */
   heartbeatMs?: number;
+  /** This process's parent pid, read anew on each call; `process.ppid` when absent. `exec` takes a change as its caller being gone. */
+  parentPid?: () => number;
+  /** How often `exec` checks that its caller is still there while its command runs; CALLER_POLL_MS when absent. */
+  callerPollMs?: number;
+  /** How long `exec` gives the processes of a command whose caller is gone to end after SIGTERM before SIGKILL; STOP_GRACE_MS when absent. */
+  stopGraceMs?: number;
   selfPid?: number;
   onCancel?: (cancel: () => void) => () => void;
   /** Starts the sweep when it has work, as every command does at its start; a claim calls it when it finds work for it. */
