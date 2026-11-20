@@ -3,11 +3,13 @@ import type { ChildProcess } from 'node:child_process';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { AGENT_COMMANDS } from '../src/agents/cli.ts';
 import { BENCH_COMMANDS } from '../src/bench-cli.ts';
 import { DRIVER_COMMANDS } from '../src/driver-cli.ts';
 import { HOOK_COMMANDS } from '../src/plugin/hook-cli.ts';
+import { databasePath } from '../src/registry/paths.ts';
 import { REGISTRY_COMMANDS } from '../src/registry-cli.ts';
 import { UP_COMMANDS } from '../src/up-cli.ts';
 import { tempDir } from './support/fakes.ts';
@@ -143,6 +145,24 @@ test('schema prints the JSON Schema the package ships', () => {
   const result = cli(['schema']);
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.stdout, fs.readFileSync(path.join(ROOT, 'schema', 'agentlane.schema.json'), 'utf8'));
+});
+
+test('schema leaves the state folder alone: a 0.5.1 registry there is neither opened nor upgraded', () => {
+  const stateDir = path.join(tempDir('cli-schema'), 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const old = new DatabaseSync(databasePath(stateDir));
+  old.exec(fs.readFileSync(path.join(import.meta.dirname, 'fixtures', 'registry-0.5.1.sql'), 'utf8'));
+  old.exec('PRAGMA user_version = 1');
+  old.close();
+  const snapshot = () =>
+    fs
+      .readdirSync(stateDir)
+      .sort()
+      .map(name => `${name} ${fs.readFileSync(path.join(stateDir, name)).toString('base64')}`);
+  const before = snapshot();
+  const result = cli(['schema'], { AGENTLANE_STATE_DIR: stateDir });
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(snapshot(), before);
 });
 
 test('up with an invalid config exits 2 naming the field and the schema rule, before claiming anything', () => {
