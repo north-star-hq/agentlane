@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { laneBrowser, hasBrowser } from '../browser/lane-browser.ts';
 import { keepFailureEvidence } from '../browser/evidence.ts';
 import { realBrowserTools } from '../browser/tools.ts';
@@ -18,6 +19,7 @@ import { keepTouching, recordCall, touchLane } from '../registry/touch.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import type { LanePark } from '../registry/parks.ts';
 import type { Lane } from '../registry/types.ts';
+import type { ServiceSystem } from '../services/system.ts';
 import { laneDir, readUpRecord } from './lane-files.ts';
 import type { EnvDeps } from './deps.ts';
 import { reversePorts } from './doctor.ts';
@@ -59,9 +61,31 @@ async function restoreDeviceNetwork(deps: EnvDeps, config: MobileConfig | null, 
   }
 }
 
+export const CALLER_POLL_MS = 1000;
+export const STOP_GRACE_MS = 5000;
+const STOP_CHECK_MS = 100;
+const CALLER_GONE_EXIT = 128 + os.constants.signals.SIGHUP;
+
+interface Caller {
+  gone(): boolean;
+}
+
+function callerOf(deps: EnvDeps): Caller {
+  const parentPid = deps.parentPid ?? (() => process.ppid);
+  const pid = parentPid();
+  return { gone: () => parentPid() !== pid };
+}
+
+type Ending = { kind: 'exited'; code: number } | { kind: 'caller-gone' };
+
+/**
+ * Runs a command with the lane's environment and returns its exit code. When the process that started exec goes away
+ * while the command runs, exec ends the command and every process below it, and returns 129 as a hung-up command would.
+ */
 export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv;
   if (command === undefined) throw new UsageError('exec needs a command', `${CLI} exec -- <command> [args...]`);
+  const caller = callerOf(deps);
   const folder = resolveFolder(deps.cwd);
   const owner = resolveOwner(deps.env, deps.processes, deps.selfPid);
   const state = stateDir(deps.env);
@@ -117,12 +141,14 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
   if (browser) env = { ...env, ...browser.vars };
 
   const stopTouching = keepTouching(site, ref, `exec: ${command}`, deps.heartbeatMs);
-  let code: number;
+  let ending: Ending;
   try {
-    code = await run(deps, command, args, env);
+    ending = await run(deps, caller, command, args, env);
   } finally {
     stopTouching();
   }
+  if (ending.kind === 'caller-gone') return CALLER_GONE_EXIT;
+  const { code } = ending;
   try {
     touchLane(site, ref, `exec: ${command}`);
   } catch (error) {
@@ -137,7 +163,8 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
   return code;
 }
 
-function run(deps: EnvDeps, command: string, args: readonly string[], env: NodeJS.ProcessEnv): Promise<number> {
+function run(deps: EnvDeps, caller: Caller, command: string, args: readonly string[], env: NodeJS.ProcessEnv): Promise<Ending> {
+  if (caller.gone()) return Promise.resolve({ kind: 'caller-gone' });
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: deps.cwd, env, stdio: 'inherit' });
     const forward = (signal: NodeJS.Signals) => {
@@ -146,7 +173,14 @@ function run(deps: EnvDeps, command: string, args: readonly string[], env: NodeJ
     const ignore = () => undefined;
     process.on('SIGINT', ignore);
     process.on('SIGTERM', forward);
+    let stopping: Promise<void> | null = null;
+    const watch = setInterval(() => {
+      if (!caller.gone()) return;
+      clearInterval(watch);
+      stopping = stopTree(deps.system, child, deps.stopGraceMs ?? STOP_GRACE_MS);
+    }, deps.callerPollMs ?? CALLER_POLL_MS);
     const done = () => {
+      clearInterval(watch);
       process.off('SIGINT', ignore);
       process.off('SIGTERM', forward);
     };
@@ -154,12 +188,67 @@ function run(deps: EnvDeps, command: string, args: readonly string[], env: NodeJ
       done();
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         deps.log(`${TOOL} exec: ${command}: command not found`);
-        resolve(127);
+        resolve({ kind: 'exited', code: 127 });
       } else reject(error);
     });
     child.once('close', (code, signal) => {
       done();
-      resolve(code ?? 128 + (signal ? os.constants.signals[signal] : 0));
+      if (stopping) {
+        stopping.then(() => {
+          resolve({ kind: 'caller-gone' });
+        }, reject);
+        return;
+      }
+      resolve({ kind: 'exited', code: code ?? 128 + (signal ? os.constants.signals[signal] : 0) });
     });
   });
+}
+
+interface Tracked {
+  pid: number;
+  start: string | null;
+}
+
+function track(system: ServiceSystem, pids: readonly number[]): Tracked[] {
+  const starts = system.running(pids);
+  if (!starts) return pids.map(pid => ({ pid, start: null }));
+  return pids.flatMap(pid => {
+    const start = starts.get(pid);
+    return start === undefined ? [] : [{ pid, start }];
+  });
+}
+
+function stillRunning(system: ServiceSystem, tracked: readonly Tracked[]): Tracked[] {
+  if (tracked.length === 0) return [];
+  const starts = system.running(tracked.map(p => p.pid));
+  if (!starts) return [...tracked];
+  return tracked.filter(p => {
+    const start = starts.get(p.pid);
+    return start !== undefined && (p.start === null || start === p.start);
+  });
+}
+
+async function stopTree(system: ServiceSystem, child: ChildProcess, graceMs: number): Promise<void> {
+  const root = child.pid;
+  if (root === undefined) return;
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  const below = track(
+    system,
+    (system.descendants(root) ?? []).map(d => d.pid),
+  );
+  child.kill('SIGTERM');
+  for (const p of below) system.signal(p.pid, 'SIGTERM');
+  const deadline = Date.now() + graceMs;
+  let left = stillRunning(system, below);
+  while ((left.length > 0 || !exited()) && Date.now() < deadline) {
+    await sleep(Math.min(STOP_CHECK_MS, Math.max(0, deadline - Date.now())));
+    left = stillRunning(system, left);
+  }
+  if (left.length === 0 && exited()) return;
+  const doomed = new Set(left.map(p => p.pid));
+  for (const pid of exited() ? [...doomed] : [root, ...doomed]) {
+    for (const d of system.descendants(pid) ?? []) doomed.add(d.pid);
+  }
+  child.kill('SIGKILL');
+  for (const pid of doomed) system.signal(pid, 'SIGKILL');
 }
