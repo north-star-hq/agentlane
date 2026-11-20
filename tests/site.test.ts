@@ -54,6 +54,14 @@ describe('the docs site', () => {
     assert.ok(home.includes(`<title>${landing.title}: ${landing.problem}</title>`));
   });
 
+  test("titles each docs page with its own name first, then the problem the home's title names", () => {
+    const landing = loadLanding();
+    for (const page of loadSections().flatMap(s => s.pages)) {
+      const html = fs.readFileSync(path.join(out, 'docs', `${page.slug}.html`), 'utf8');
+      assert.ok(html.includes(`<title>${page.title} | ${landing.title}: ${landing.problem}</title>`), page.slug);
+    }
+  });
+
   test("carries the home's headline, sentence and cards into its Markdown copy and llms.txt", () => {
     const landing = loadLanding();
     for (const file of ['index.md', 'llms.txt']) {
