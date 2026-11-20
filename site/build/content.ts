@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from 'yaml';
 import { plainText, renderMarkdown, slug, type Heading } from './markdown.ts';
+import { ICONS } from './icons.ts';
 import { REPO, SITE } from './paths.ts';
 import { expandGenerated } from './reference.ts';
 
@@ -39,17 +40,36 @@ export interface InstallStep {
   prompt?: string;
 }
 
+export interface Link {
+  label: string;
+  href: string;
+  icon?: string;
+  primary?: boolean;
+}
+
+export interface Card {
+  icon: string;
+  title: string;
+  text: string;
+  href: string;
+}
+
 export interface Landing {
   title: string;
+  problem: string;
   description: string;
+  badge: { text: string; href: string };
   headline: string;
-  pitch: string;
+  marked: string;
+  sentence: string;
+  figure: string;
+  buttons: Link[];
   install: InstallStep[];
   agents: string[];
   heroAlt: string;
-  why: { title: string; text: string }[];
+  cards: Card[];
+  about: { title: string; paragraphs: string[] };
   speed: { value: string; label: string }[];
-  speedNote: string;
 }
 
 function frontMatter(file: string): { data: Record<string, unknown>; body: string } {
@@ -98,22 +118,35 @@ export function loadSections(): Section[] {
   return sections;
 }
 
-export function loadLanding(): Landing {
-  const file = path.join(SITE, 'index.md');
+export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
   const { data } = frontMatter(file);
-  const install = data.install as InstallStep[];
-  const agents = data.agents as string[];
+  const where = path.relative(REPO, file);
+  const headline = text(data, 'headline', file);
+  const marked = text(data, 'marked', file);
+  if (!headline.includes(marked)) throw new Error(`${where}: the headline doesn't contain "${marked}"`);
+  const buttons = data.buttons as Link[];
+  const cards = data.cards as Card[];
+  for (const icon of [...buttons, ...cards].flatMap(b => b.icon ?? []))
+    if (!(icon in ICONS)) throw new Error(`${where}: no icon called ${icon} in site/build/icons.ts`);
+  for (const card of cards)
+    if (/\[[^\]]*\]\(/.test(card.text))
+      throw new Error(`${where}: the card "${card.title}" is a link already, so its text can't hold one`);
   return {
     title: text(data, 'title', file),
+    problem: text(data, 'problem', file),
     description: text(data, 'description', file),
-    headline: text(data, 'headline', file),
-    pitch: text(data, 'pitch', file),
-    install,
-    agents,
+    badge: data.badge as Landing['badge'],
+    headline,
+    marked,
+    sentence: text(data, 'sentence', file),
+    figure: text(data, 'figure', file),
+    buttons,
+    install: data.install as InstallStep[],
+    agents: data.agents as string[],
     heroAlt: text(data, 'heroAlt', file),
-    why: data.why as Landing['why'],
+    cards,
+    about: data.about as Landing['about'],
     speed: data.speed as Landing['speed'],
-    speedNote: text(data, 'speedNote', file),
   };
 }
 

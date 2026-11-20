@@ -5,7 +5,7 @@ import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { buildSite, pageMarkdown } from '../site/build/build.ts';
 import { checkSite } from '../site/build/check.ts';
-import { loadSections, SITE } from '../site/build/content.ts';
+import { loadLanding, loadSections, SITE } from '../site/build/content.ts';
 import { checkFacts, undocumentedVariables } from '../site/build/facts.ts';
 import { expandGenerated, referenceGaps } from '../site/build/reference.ts';
 import { MAESTRO_RELEASE } from '../src/driver/release.ts';
@@ -43,6 +43,27 @@ describe('the docs site', () => {
       const still = fs.readFileSync(path.join(out, `assets/hero-${theme}-still.svg`), 'utf8');
       assert.ok(!still.includes('prefers-reduced-motion'));
       assert.ok(still.includes('<style>') && still.includes('*{animation:none!important}'));
+    }
+  });
+
+  test('marks one word of the headline and titles the home with the problem it solves', () => {
+    const home = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    const landing = loadLanding();
+    const [before, after] = landing.headline.replace(/\.$/, '').split(landing.marked);
+    assert.ok(home.includes(`<h1 id="headline">${before ?? ''}<mark>${landing.marked}</mark>${after ?? ''}</h1>`));
+    assert.ok(home.includes(`<title>${landing.title}: ${landing.problem}</title>`));
+  });
+
+  test("carries the home's headline, sentence and cards into its Markdown copy and llms.txt", () => {
+    const landing = loadLanding();
+    for (const file of ['index.md', 'llms.txt']) {
+      const text = fs.readFileSync(path.join(out, file), 'utf8');
+      for (const line of [
+        landing.headline,
+        landing.sentence,
+        ...landing.cards.map(c => `${c.title}](${c.href.replace(/\.html$/, '.md')}).** ${c.text}`),
+      ])
+        assert.ok(text.includes(line), `${file} lacks ${line}`);
     }
   });
 
@@ -176,6 +197,45 @@ describe('the docs site', () => {
         'index.html: loads https://cdn.example.com/site.css from another origin',
         'index.html: /changelog.html is not relative',
       ]);
+    });
+  });
+
+  describe("the home's front matter", () => {
+    let dir: string;
+
+    before(() => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-home-'));
+    });
+
+    after(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    function load(edit: (text: string) => string): () => unknown {
+      const file = path.join(dir, 'index.md');
+      fs.writeFileSync(file, edit(fs.readFileSync(path.join(SITE, 'index.md'), 'utf8')));
+      return () => loadLanding(file);
+    }
+
+    test('rejects a marked word the headline lacks', () => {
+      assert.throws(
+        load(t => t.replace('marked: fighting', 'marked: racing')),
+        /the headline doesn't contain "racing"/,
+      );
+    });
+
+    test('rejects an icon icons.ts has no drawing for', () => {
+      assert.throws(
+        load(t => t.replace('icon: plug', 'icon: plugs')),
+        /no icon called plugs/,
+      );
+    });
+
+    test('rejects a link inside a card, which is a link already', () => {
+      assert.throws(
+        load(t => t.replace('kept after the agent is done.', 'kept in [the evidence folder](docs/evidence.html).')),
+        /the card "Proof you can open" is a link already/,
+      );
     });
   });
 
