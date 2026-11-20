@@ -319,6 +319,10 @@ test("a lane whose resources and services don't need it doesn't keep it up, nor 
     await startSharedForLane(deps(w), w.registry(), refOf(d), [f.spec()]);
     w.registry().recordNeeds(refOf(other), ['db']);
     assert.deepEqual(w.registry().sharedServices()[0]?.lanes, [a.id, d.id].sort());
+    assert.deepEqual(
+      [a, c, other].map(l => w.registry().needsOf(l.id)),
+      [['db'], [], ['db']],
+    );
 
     assert.ok(parkNow(w.registry(), refOf(a)));
     await w.clock.advance(MINUTE_MS);
