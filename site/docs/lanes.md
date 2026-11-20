@@ -1,8 +1,18 @@
 ---
 title: "What a lane holds"
 short: "Ports, a device or browser, data and processes, claimed per session and folder."
-summary: "A lane is one agent session's running copy of the project: its own ports, its own simulator, emulator or browser, its own resources such as a database, and the processes started on them. A lane belongs to the session that made it and the folder it was made in. One registry per machine keeps every lane apart, across projects and agents. A lane nobody calls on is parked after 30 minutes, and a lane whose owner is gone ends 30 minutes after it was found gone."
+summary: "Lanes let you run several AI coding agents on one machine, each with its own simulator, ports and database. A lane is one agent session's running copy of the project: its ports, its simulator, emulator or browser, its resources such as the database, and the processes started on them. A lane belongs to the session that made it and the folder it was made in. One registry per machine keeps every lane apart, across projects and agents. A lane nobody calls on is parked after 30 minutes, and a lane whose owner is gone ends 30 minutes after it was found gone."
 ---
+
+## Two agents on one machine, with and without lanes
+
+Run two coding agents on one machine and they meet at port 8081, the booted simulator and the dev database. Worktrees separate their files. Lanes separate everything that runs:
+
+| Two agents, no lanes                                         | Two agents, each in a lane                                |
+| ------------------------------------------------------------ | --------------------------------------------------------- |
+| The second `expo start` fails: port 8081 is in use           | Metro on 41100 and 41101                                  |
+| `simctl install booted` lands on the other agent's simulator | Each has its own simulator, and the guard blocks `booted` |
+| Both run migrations on one database                          | A `DATABASE_URL` per lane                                 |
 
 ## What's in a lane
 
