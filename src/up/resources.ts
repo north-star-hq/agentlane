@@ -237,8 +237,11 @@ function movedNote(t: ResourceTeardown): string {
   return `${t.cwd} is gone, so it ran in the lane's log folder`;
 }
 
-/** The shared services whose start failed in this pass, by repository and name, so no later teardown of it tries again. */
-class FailedStarts {
+/**
+ * The shared services whose start failed in one pass of teardowns, by repository and name, so no later teardown of
+ * that pass tries again. A pass is one `tearDownEndedResources` call, or every call one sweep makes for its reaps.
+ */
+export class FailedStarts {
   private readonly failed = new Map<string, SharedServiceFailed>();
 
   private static key(repository: string, name: string): string {
@@ -297,15 +300,16 @@ async function tearDownOne(
  * once the shared services it needs run. A failed teardown keeps its record, so a later pass tries again; a pass skips
  * one that failed in the last few minutes, unless it names that lane. A shared service that does not start fails the
  * teardown that needs it, which does not run, and every later teardown of the pass that needs it, without another start.
+ * The pass is this call unless the caller passes the `failedStarts` of a pass it spreads over several calls.
  */
 export async function tearDownEndedResources(
   deps: Pick<EnvDeps, 'env' | 'clock'>,
   registry: Registry,
   stateDir: string,
   choice: EndedResourceChoice = {},
+  failedStarts: FailedStarts = new FailedStarts(),
 ): Promise<Teardown[]> {
   const byLane = new Map<string, Teardown>();
-  const failedStarts = new FailedStarts();
   for (const t of registry.takeTeardowns(choice.lane === undefined ? {} : { lane: choice.lane })) {
     const into = byLane.get(t.lane) ?? { lane: t.lane, notes: [], problems: [] };
     byLane.set(t.lane, into);
