@@ -74,6 +74,21 @@ Both connect to `127.0.0.1` unless `host` says otherwise. A service that exits o
 
 `platforms` limits a service to the apps that need it. In the example above, Metro serves only the mobile app, so `up --platform web` doesn't start it, and `doctor` and `restart` for the web leave it out. Leave `platforms` out to run a service for every platform.
 
+## Servers the lanes share
+
+A service is the lane's own, on its own port. A server every lane of the repository uses, such as the database server, is a [shared service](shared.md) instead. A service that talks to one names it in `needs`, and `up` starts it before the service:
+
+```json
+"api": {
+  "type": "api",
+  "start": "PORT=\"$AGENTLANE_API_PORT\" exec node api/server.mjs",
+  "ready": { "kind": "http", "path": "/health" },
+  "needs": ["postgres"]
+}
+```
+
+The lane needs the shared services of every platform it was brought up for, so a web `up` after an iOS `up` keeps what the iOS services need.
+
 ## Dialing a service from the app
 
 A mobile app needs this lane's API address, not one baked into the build. `dial` passes it as a launch argument:

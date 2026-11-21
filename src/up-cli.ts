@@ -36,9 +36,10 @@ export const UP_HELP: UsageGroup<(typeof UP_COMMANDS)[number]> = {
   title: `Environment (reads ${CONFIG_FILE} from this folder or the ones above it):`,
   entries: {
     up: `  up         Take this worktree from bare to the running app on its own simulator or emulator,
-             or to its web app's services: preflight, claim, setup, resources, build (through the
-             build cache), services, hygiene, launch, signin, doctor; a web app skips the device
-             steps. Prints shell exports on stdout: eval "$(${TOOL} up)".
+             or to its web app's services: preflight, claim, setup, build preconditions, shared
+             services, resources, build (through the build cache), services, hygiene, launch,
+             signin, doctor; a web app skips the device steps. Prints shell exports on stdout:
+             eval "$(${TOOL} up)".
                --platform <name>     ios, android or web (default: the config's app.platform, or
                                      web when it declares only a web app)
                --no-app              bring up the project's data alone, for commands that need
@@ -70,7 +71,8 @@ export const UP_HELP: UsageGroup<(typeof UP_COMMANDS)[number]> = {
              With a driver block, 'maestro' there is the toolkit's build on this lane's device,
              with JDK 17 and the lane's runner token: ${TOOL} exec -- maestro test <flow.yaml>
              Without one, or with an invalid config or no running device, 'maestro' says why and
-             runs nothing.
+             runs nothing. When the process that ran exec exits, exec stops the command and every
+             process under it (SIGTERM, then SIGKILL 5 s later) and exits 129.
 `,
     doctor: `  doctor     Is this worktree's instance worth driving? Checks the lane, toolchain, device,
              app, launch, services and hygiene, read-only; exit 1 names each fix. A lane up --no-app
