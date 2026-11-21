@@ -8,6 +8,7 @@ import { readCheck, RETURN_WINDOW_MS } from './owner-checks.ts';
 import { readPark } from './parks.ts';
 import { pendingTeardowns } from './resources.ts';
 import { endedFromHistory, loadLaneInfo } from './rows.ts';
+import { readShared } from './shared.ts';
 import type { Store } from './store.ts';
 import { int, optText, text } from './store.ts';
 import type {
@@ -32,6 +33,14 @@ export interface StatusSources {
 
 const RECENT_MS = 24 * 3_600_000;
 
+/** What a 0.5.x registry lacks of the shared services' records; status reads such a registry as having none. */
+const SHARED_ADDITIONS = ['shared_services', 'shared_needs', 'resources.repository', 'resources.needs'];
+
+/** Whether status can read a registry that lacks `lacking` without upgrading it first. */
+export function readsAsIs(lacking: readonly string[]): boolean {
+  return lacking.every(a => SHARED_ADDITIONS.includes(a));
+}
+
 function processState(verdict: ProcessVerdict): ProcessState {
   if (verdict === 'alive') return 'running';
   if (verdict === 'cant-tell') return 'unknown';
@@ -49,6 +58,7 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     queue: [],
     recent: [],
     teardowns: [],
+    shared: [],
   };
   if (!store) return report;
   const db = store.db;
@@ -144,5 +154,6 @@ export function readStatus(store: Store | null, sources: StatusSources): StatusR
     .all(now - RECENT_MS)
     .map(endedFromHistory);
   report.teardowns = pendingTeardowns(db);
+  if (!store.lacking().some(a => SHARED_ADDITIONS.includes(a))) report.shared = readShared(db, now);
   return report;
 }

@@ -4,6 +4,7 @@ import type { RegistryConfig } from './config.ts';
 import type { Owner, OwnerState, ProvenState } from './owner.ts';
 import type { LaneHold } from './holds.ts';
 import type { ParkRestarts, ParkState } from './parks.ts';
+import type { SharedServiceStatus } from './shared.ts';
 
 export interface ServiceRequest {
   name: string;
@@ -254,4 +255,6 @@ export interface StatusReport {
   recent: EndedLane[];
   /** Resources of ended lanes whose teardown has not run, or failed and waits for the next try. */
   teardowns: PendingTeardown[];
+  /** The shared services agentlane has started, of every repository, and whether each runs, who needs it and when it stops. */
+  shared: SharedServiceStatus[];
 }

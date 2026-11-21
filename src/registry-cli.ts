@@ -40,6 +40,8 @@ import type { LaneHold } from './registry/holds.ts';
 import { DEFAULT_HOLD_MS, parseHoldTime } from './registry/holds.ts';
 import { recordCall } from './registry/touch.ts';
 import { describeRestarts } from './registry/parks.ts';
+import type { SharedServiceStatus } from './registry/shared.ts';
+import { SHARED_IDLE_MS } from './registry/shared.ts';
 import type {
   Lane,
   LaneGone,
@@ -56,6 +58,7 @@ import type { Teardown } from './up/release.ts';
 import { LANE_FILES_KEEP_MS, pruneEndedLaneFiles } from './up/lane-files.ts';
 import { tearDownLane } from './up/release.ts';
 import { tearDownEndedResources } from './up/resources.ts';
+import { sharedLog } from './up/shared.ts';
 import { runSweep, SWEEP_INTERVAL_MS } from './up/sweep.ts';
 import { systemClock } from './clock.ts';
 import { claudeSessionName } from './plugin/session-name.ts';
@@ -124,7 +127,8 @@ export const REGISTRY_HELP: UsageGroup<(typeof REGISTRY_COMMANDS)[number]> = {
                --worktree <dir>      the folder whose lane to hold (default: this git worktree)
 `,
     status: `  status     Every lane on this Mac: owner, folder, start, idle time, last action, and whether
-             it is held or parked.
+             it is held or parked. Then every shared service ${TOOL} started: whether it runs, the
+             lanes that need it, when it stops once none does, and why its last start or stop failed.
 `,
     lanes: `  lanes      --json: the same as status, as JSON for tools.
 `,
@@ -332,6 +336,47 @@ function laneLines(c: LaneStatus, sessionName: SessionNames, now: number): strin
   return lines;
 }
 
+function laneCount(ids: readonly string[]): string {
+  return `${String(ids.length)} lane${ids.length === 1 ? '' : 's'} (${ids.join(', ')})`;
+}
+
+function idleShared(s: SharedServiceStatus, now: number): string {
+  if (s.holding.length > 0)
+    return `held by ${s.holding.map(h => `resource ${h.resource} of lane ${h.lane}`).join(', ')}; it stops ${formatAge(SHARED_IDLE_MS)} after they let go`;
+  if (s.stopsAt === null) return `it stops ${formatAge(SHARED_IDLE_MS)} after a sweep finds nothing needs it`;
+  if (s.stopsAt <= now) return 'the next sweep stops it';
+  return `stops ${formatTime(s.stopsAt)} (in ${formatAge(s.stopsAt - now)})`;
+}
+
+function sharedHead(s: SharedServiceStatus, now: number): string {
+  const by = s.by === null ? '' : ` by pid ${String(s.by)}`;
+  switch (s.state) {
+    case 'running':
+      return s.lanes.length > 0 ? `running, used by ${laneCount(s.lanes)}` : `running, used by no lane; ${idleShared(s, now)}`;
+    case 'stopped':
+      return s.lanes.length > 0 ? `stopped, needed by ${laneCount(s.lanes)}; ${CLI} up starts it` : 'stopped';
+    default:
+      return `${s.state}${by}${s.lanes.length > 0 ? `, used by ${laneCount(s.lanes)}` : ''}`;
+  }
+}
+
+function sharedProblem(s: SharedServiceStatus): string {
+  if (s.attempts === 0) return `      problem      ${s.problem ?? ''}; the next ${CLI} up that needs it starts it again`;
+  const retry = s.stopsAt === null ? 'the sweep tries it again once nothing needs it' : 'the sweep tries it again then';
+  return `      stop failed  ${String(s.attempts)} time${s.attempts === 1 ? '' : 's'}: ${s.problem ?? ''}; ${retry}`;
+}
+
+function sharedLines(s: SharedServiceStatus, report: StatusReport): string[] {
+  const lines = [
+    `shared service ${s.name}: ${sharedHead(s, report.now)}`,
+    `      repository   ${path.basename(s.repository)}  (${s.repository})   ${s.state} since ${formatTime(s.since)}`,
+  ];
+  if (s.problem !== null) {
+    lines.push(sharedProblem(s), `      log          ${sharedLog(report.stateDir, s)}`);
+  }
+  return lines;
+}
+
 function poolLine(report: StatusReport): string {
   const { config } = report;
   const count = (platform: Platform) => report.pool.filter(d => d.platform === platform).length;
@@ -355,6 +400,7 @@ export function renderStatus(report: StatusReport, sessionName: SessionNames = (
     lines.push(`lanes (${String(report.lanes.length)}):`);
     for (const c of report.lanes) lines.push(...laneLines(c, sessionName, report.now));
   }
+  if (report.shared.length > 0) lines.push('', ...report.shared.flatMap(s => sharedLines(s, report)));
   if (report.queue.length > 0) {
     lines.push('', 'queue:');
     for (const q of report.queue)

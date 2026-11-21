@@ -279,6 +279,13 @@ function untilFree<T>(deadline: number, action: () => T, onTimeout: () => Error)
   }
 }
 
+function newerFormat(dir: string, version: number): UsageError {
+  return new UsageError(
+    `${databasePath(dir)} is registry format ${String(version)}, newer than this ${TOOL} understands (${String(SCHEMA_VERSION)})`,
+    `upgrade ${TOOL} to the version every project on this Mac uses`,
+  );
+}
+
 export const UNIDENTIFIED = 'an unidentified caller';
 
 export class Store {
@@ -333,6 +340,45 @@ export class Store {
     return Store.open(dir, lockWaitMs);
   }
 
+  /**
+   * Opens the registry for reading, without upgrading or writing it, or returns null when there is none yet. A
+   * registry an earlier 0.x wrote is read as it is; `lacking` names what it doesn't have.
+   */
+  static openToRead(dir: string, lockWaitMs: number): Store | null {
+    if (!fs.existsSync(databasePath(dir))) return null;
+    const db = new DatabaseSync(databasePath(dir), { readOnly: true, timeout: Math.min(1000, lockWaitMs) });
+    const store = new Store(dir, db, lockWaitMs);
+    let version: number;
+    try {
+      version = untilFree(
+        Date.now() + lockWaitMs,
+        () => store.version(),
+        () => store.busyRefusal(),
+      );
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+    if (version === SCHEMA_VERSION) return store;
+    store.close();
+    if (version > SCHEMA_VERSION) throw newerFormat(dir, version);
+    return null;
+  }
+
+  /** The tables and columns later versions added to format 1 that this registry lacks, as `table` or `table.column`. */
+  lacking(): string[] {
+    const tables = new Set(
+      this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map(row => text(row, 'name')),
+    );
+    return [
+      ...ADDED_TABLES.filter(t => !tables.has(t)),
+      ...ADDED_COLUMNS.filter(c => tables.has(c.table) && !this.hasColumn(c.table, c.column)).map(c => `${c.table}.${c.column}`),
+    ];
+  }
+
   close(): void {
     this.db.close();
   }
@@ -365,12 +411,7 @@ export class Store {
     this.write(() => {
       const version = this.version();
       if (version === SCHEMA_VERSION) return;
-      if (version > SCHEMA_VERSION) {
-        throw new UsageError(
-          `${databasePath(this.dir)} is registry format ${String(version)}, newer than this ${TOOL} understands (${String(SCHEMA_VERSION)})`,
-          `upgrade ${TOOL} to the version every project on this Mac uses`,
-        );
-      }
+      if (version > SCHEMA_VERSION) throw newerFormat(this.dir, version);
       this.db.exec(SCHEMA);
       this.addToFormat1();
       this.db.exec(`PRAGMA user_version = ${String(SCHEMA_VERSION)}`);

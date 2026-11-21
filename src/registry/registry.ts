@@ -77,7 +77,7 @@ import {
   sharedHoldersBeforeLock,
   stopCandidates,
 } from './shared.ts';
-import { readStatus } from './status.ts';
+import { readsAsIs, readStatus } from './status.ts';
 import type { Row } from './store.ts';
 import { int, optInt, optText, Store, text, UNIDENTIFIED } from './store.ts';
 import type {
@@ -2746,9 +2746,25 @@ function browserServices(request: LaneRequest): ServiceRequest[] {
     : [debug];
 }
 
+/** The shared services lane `laneId` needs, by name, as its record says; read without upgrading the registry. */
+export function readLaneNeeds(dir: string, laneId: string, lockWaitMs = DEFAULT_LOCK_WAIT_MS): string[] {
+  const store = Store.openToRead(dir, lockWaitMs);
+  if (!store) return [];
+  try {
+    return store.lacking().includes('shared_needs') ? [] : laneNeeds(store.db, laneId).map(n => n.name);
+  } finally {
+    store.close();
+  }
+}
+
 export function readRegistryStatus(options: Omit<RegistryOptions, 'ports'>): StatusReport {
   const config = options.config ?? loadConfig(options.dir);
-  const store = Store.openExisting(options.dir, options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS);
+  const lockWaitMs = options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;
+  let store = Store.openToRead(options.dir, lockWaitMs);
+  if (store && !readsAsIs(store.lacking())) {
+    store.close();
+    store = Store.openExisting(options.dir, lockWaitMs);
+  }
   try {
     return readStatus(store, {
       dir: options.dir,
