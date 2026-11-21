@@ -639,3 +639,204 @@ test('a teardown whose process died mid-run is taken over by the next pass, whic
   assert.deepEqual(d.lines(), ['start', `create ${id}`, 'service', 'stop', 'start', `teardown ${id}`]);
   assert.deepEqual(teardowns(w), []);
 });
+
+/** The config with its resource using the shared service without naming it in needs, as before the project declared it shared. */
+function undeclared(config: Record<string, unknown>): Record<string, unknown> {
+  const { appdb } = config.resources as { appdb: Record<string, unknown> };
+  return { ...config, resources: { appdb: { ...appdb, needs: [] } } };
+}
+
+/** Each resource row's name, its needs, and whether its repository is its lane's. */
+function resourceRows(w: World): unknown[][] {
+  const sql = new DatabaseSync(databasePath(w.state), { timeout: 5000 });
+  try {
+    return sql
+      .prepare(
+        'SELECT r.name, r.needs, r.repository = c.project_root AS ours FROM resources r JOIN claims c ON c.id = r.claim_id ORDER BY r.seq',
+      )
+      .all()
+      .map(row => [row.name, row.needs, row.ours]);
+  } finally {
+    sql.close();
+  }
+}
+
+async function releaseTearsDown(w: World, id: string): Promise<void> {
+  const out: string[] = [];
+  assert.equal(await runRegistryCommand('release', ['--worktree', w.project], cli(w, out)), 0, out.join(''));
+  assert.match(out.join(''), new RegExp(`lane ${id}: tore down resource appdb \\(`));
+  assert.deepEqual(teardowns(w), []);
+}
+
+test('a resource kept by a later up records the shared service its config now needs, so its teardown after a park starts it', async t => {
+  const w = world(t);
+  const d = db(w);
+  fs.writeFileSync(d.up, '');
+  setUp(w, undeclared(webConfig(d)));
+  const first = await up(w.deps(), OPTIONS);
+  assert.equal(first.doctor.ok, true, failures(first));
+  const id = first.lane.id;
+  assert.deepEqual(resourceRows(w), [['appdb', '[]', 1]]);
+
+  setUp(w, webConfig(d));
+  w.lines.length = 0;
+  const second = await up(w.deps(), OPTIONS);
+  assert.equal(second.lane.id, id);
+  assert.ok(
+    w.lines.some(l => l.startsWith('agentlane up: resources: kept appdb ')),
+    w.lines.join('\n'),
+  );
+  assert.deepEqual(resourceRows(w), [['appdb', '["db"]', 1]]);
+
+  await parkedAndStopped(w, first.lane);
+  await releaseTearsDown(w, id);
+  assert.deepEqual(d.lines(), [`create ${id}`, 'service', 'stop', 'start', `teardown ${id}`]);
+});
+
+test('a resource row a 0.5.x registry wrote gets its repository and needs at the next up, so its teardown after a park starts the shared service', async t => {
+  const w = world(t);
+  const d = db(w);
+  setUp(w, webConfig(d));
+  const first = await up(w.deps(), OPTIONS);
+  assert.equal(first.doctor.ok, true, failures(first));
+  const id = first.lane.id;
+  const sql = new DatabaseSync(databasePath(w.state), { timeout: 5000 });
+  try {
+    sql.prepare("UPDATE resources SET repository = NULL, needs = '[]'").run();
+  } finally {
+    sql.close();
+  }
+  assert.deepEqual(resourceRows(w), [['appdb', '[]', null]]);
+
+  const second = await up(w.deps(), OPTIONS);
+  assert.equal(second.lane.id, id);
+  assert.deepEqual(resourceRows(w), [['appdb', '["db"]', 1]]);
+
+  await parkedAndStopped(w, first.lane);
+  await releaseTearsDown(w, id);
+  assert.deepEqual(d.lines(), ['start', `create ${id}`, 'service', 'stop', 'start', `teardown ${id}`]);
+});
+
+test("a wake records what the lane's resources need now, so their teardown after a later park starts the shared service", async t => {
+  const w = world(t);
+  const d = db(w);
+  fs.writeFileSync(d.up, '');
+  setUp(w, undeclared(webConfig(d)));
+  const first = await up(w.deps(), OPTIONS);
+  assert.equal(first.doctor.ok, true, failures(first));
+  const id = first.lane.id;
+
+  setUp(w, webConfig(d));
+  age(w, first.lane);
+  assert.deepEqual(
+    (await sweep(w)).outcomes.map(o => [o.kind, o.lane]),
+    [['parked', id]],
+  );
+  assert.equal(await execInLane(w.deps(), ['true']), 0, w.lines.join('\n'));
+  assert.deepEqual(resourceRows(w), [['appdb', '["db"]', 1]]);
+
+  await parkedAndStopped(w, first.lane);
+  await releaseTearsDown(w, id);
+  assert.deepEqual(d.lines(), [`create ${id}`, 'service', 'service', 'stop', 'start', `teardown ${id}`]);
+});
+
+test('one pass starts a shared service that fails once: each later teardown that needs it fails without another start and keeps its record with the same problem', async t => {
+  const w = world(t);
+  const d = db(w);
+  const attempts = path.join(w.root, 'db', 'attempts');
+  const tries = () => (fs.existsSync(attempts) ? fs.readFileSync(attempts, 'utf8').trim().split('\n').length : 0);
+  const config = webConfig(d);
+  const { db: spec } = config.shared as { db: { start: string } };
+  const names = ['one', 'two', 'three'];
+  setUp(w, {
+    ...config,
+    shared: { db: { ...spec, start: `echo attempt >> '${attempts}'; ${spec.start}` } },
+    resources: Object.fromEntries(
+      names.map(name => [
+        name,
+        {
+          create: `test -f '${d.up}' && echo "create ${name}" >> '${d.log}' && echo "${name.toUpperCase()}_URL=x" >> "$AGENTLANE_EXPORTS"`,
+          exports: [`${name.toUpperCase()}_URL`],
+          teardown: `test -f '${d.up}' && echo "teardown ${name}" >> '${d.log}'`,
+          needs: ['db'],
+        },
+      ]),
+    ),
+  });
+  const result = await up(w.deps(), OPTIONS);
+  assert.equal(result.doctor.ok, true, failures(result));
+  const id = result.lane.id;
+  await parkedAndStopped(w, result.lane);
+  fs.writeFileSync(d.broken, '');
+  const before = tries();
+
+  const out: string[] = [];
+  assert.equal(await runRegistryCommand('release', ['--worktree', w.project], cli(w, out)), 1);
+  assert.equal(tries() - before, 1, 'the pass started the failing shared service more than once');
+  const problems = out
+    .join('')
+    .split('\n')
+    .filter(l => l.startsWith(`agentlane: lane ${id}: PROBLEM: resource `));
+  assert.deepEqual(
+    problems.map(l => l.replace(/ \(attempt 1\): start exited 3: .*$/, '')),
+    ['three', 'two', 'one'].map(
+      name => `agentlane: lane ${id}: PROBLEM: resource ${name}: teardown did not run, since shared service db did not start`,
+    ),
+    out.join(''),
+  );
+  const kept = teardowns(w);
+  assert.deepEqual(kept.map(td => [td.name, td.attempts]).sort(), names.map(name => [name, 1]).sort());
+  const [firstProblem] = kept.map(td => td.problem);
+  assert.match(firstProblem ?? '', /^teardown did not run, since shared service db did not start: start exited 3: /);
+  assert.deepEqual(
+    kept.map(td => td.problem),
+    kept.map(() => firstProblem),
+  );
+  assert.equal(
+    d.lines().some(l => l.startsWith('teardown')),
+    false,
+  );
+
+  fs.rmSync(d.broken);
+  out.length = 0;
+  assert.equal(await runRegistryCommand('release', [id], cli(w, out)), 0, out.join(''));
+  assert.equal(tries() - before, 2);
+  assert.deepEqual(d.lines().slice(-4), ['start', 'teardown three', 'teardown two', 'teardown one']);
+  assert.deepEqual(teardowns(w), []);
+});
+
+test('restart starts the shared service the restarted service now needs before starting it, records the need, and changes nothing when that start fails', async t => {
+  const w = world(t);
+  const d = db(w);
+  setUp(w, webConfig(d, {}));
+  const result = await up(w.deps(), OPTIONS);
+  assert.equal(result.doctor.ok, true, failures(result));
+  const id = result.lane.id;
+  const site = () =>
+    readRegistryStatus({ dir: w.state, processes: systemProcesses }).lanes[0]?.processes.find(p => p.service === 'site')?.pid;
+  const running = site();
+  assert.ok(running !== undefined);
+
+  setUp(w, webConfig(d, { site: ['db'] }));
+  fs.writeFileSync(d.broken, '');
+  w.lines.length = 0;
+  assert.equal(await runUpCommand('restart', ['site'], w.deps(), () => undefined), 1);
+  assert.match(w.lines.join('\n'), /shared service db: start exited 3: /);
+  assert.deepEqual(d.lines(), [`create ${id}`, 'service'], 'the restart restarted the site without its shared service');
+  assert.equal(site(), running);
+
+  fs.rmSync(d.broken);
+  w.lines.length = 0;
+  assert.equal(await runUpCommand('restart', ['site'], w.deps(), () => undefined), 0, w.lines.join('\n'));
+  assert.deepEqual(d.lines(), [`create ${id}`, 'service', 'start', 'service']);
+  assert.notEqual(site(), running);
+  assert.ok(
+    w.lines.some(l => l.startsWith('agentlane restart: shared: starting shared service db: ')),
+    w.lines.join('\n'),
+  );
+  assert.deepEqual(
+    look(w, r => r.needsOf(id)),
+    ['db'],
+  );
+  assert.deepEqual([service(w).state, service(w).lanes, service(w).unneededSince], ['running', [id], null]);
+});

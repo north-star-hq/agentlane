@@ -1,5 +1,5 @@
 import { CLI } from '../name.ts';
-import type { ServiceConfig } from '../project/config.ts';
+import type { ProjectConfig, ProjectPlatform, ServiceConfig, SharedServiceConfig } from '../project/config.ts';
 import type { Registry } from '../registry/registry.ts';
 import type { LaneInfo, LaneRef, ServiceProcess } from '../registry/types.ts';
 import {
@@ -21,6 +21,17 @@ export interface LaneServices {
   lane: LaneInfo;
   dir: string;
   env: NodeJS.ProcessEnv;
+}
+
+/** The services a lane brought up for `platforms` runs. */
+export function servicesOfPlatforms(config: ProjectConfig, platforms: readonly ProjectPlatform[]): ServiceConfig[] {
+  return config.allServices.filter(s => s.platforms === null || s.platforms.some(p => platforms.includes(p)));
+}
+
+/** The shared services a lane brought up for `platforms` needs: those its resources and those services name. */
+export function sharedNeedsOfPlatforms(config: ProjectConfig, platforms: readonly ProjectPlatform[]): SharedServiceConfig[] {
+  const named = new Set([...config.resources, ...servicesOfPlatforms(config, platforms)].flatMap(user => user.needs));
+  return config.shared.filter(s => named.has(s.name));
 }
 
 export function claimedPort(lane: LaneInfo, service: string): number | undefined {

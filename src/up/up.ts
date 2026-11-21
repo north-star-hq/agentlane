@@ -42,14 +42,7 @@ import type { HookRun } from '../hooks/run.ts';
 import { runHook } from '../hooks/run.ts';
 import { CLI, CONFIG_FILE, TOOL } from '../name.ts';
 import { identityOf } from '../processes.ts';
-import type {
-  HookName,
-  MobileConfig,
-  ProjectConfig,
-  ProjectPlatform,
-  ServiceConfig,
-  SharedServiceConfig,
-} from '../project/config.ts';
+import type { HookName, MobileConfig, ProjectConfig, ProjectPlatform, ServiceConfig } from '../project/config.ts';
 import { asMobile, findProjectConfig, forPlatform, loadProjectConfig } from '../project/config.ts';
 import { WEB_PLATFORM } from '../project/schema.ts';
 import { loadConfig, withProjectBlocks } from '../registry/config.ts';
@@ -63,7 +56,13 @@ import type { Lane, LaneRef } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
 import { LANE_FILES_KEEP_MS, laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
-import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
+import {
+  claimedPort,
+  recordedProcess,
+  sharedNeedsOfPlatforms,
+  startClaimedService,
+  stopClaimedService,
+} from './lane-services.ts';
 import { rememberAnswers } from './answers.ts';
 import type { EnvDeps } from './deps.ts';
 import type { DoctorReport } from './doctor.ts';
@@ -584,12 +583,6 @@ async function browserSteps(ctx: Ctx, run: Run, tools: BrowserTools, driverChang
   );
 }
 
-function sharedNeedsOfPlatforms(config: ProjectConfig, platforms: readonly ProjectPlatform[]): SharedServiceConfig[] {
-  const services = config.allServices.filter(s => s.platforms === null || s.platforms.some(p => platforms.includes(p)));
-  const named = new Set([...config.resources, ...services].flatMap(user => user.needs));
-  return config.shared.filter(s => named.has(s.name));
-}
-
 const SHARED_OUTCOMES: Record<SharedStarted['outcome'], string> = {
   started: 'started',
   kept: 'running',
@@ -789,6 +782,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     }
     const booting = bootingWithSetup ?? (target ? startBoot(target) : null);
     try {
+      if (options.waking) registry.followResourceNeeds(ctx.ref, config.resources);
       await sharedStep(ctx, run, platforms);
       if (config.resources.length > 0 && !options.waking) {
         const made = await run.step('resources', () => createResources(ctx, ctx.lane), describeResources);
