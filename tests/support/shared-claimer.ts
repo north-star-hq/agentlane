@@ -7,6 +7,7 @@ import type { RegistryConfig } from '../../src/registry/config.ts';
 import type { Owner } from '../../src/registry/owner.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import { startSharedForLane } from '../../src/up/shared.ts';
+import { dieMidCommand } from './die-mid-command.ts';
 import { parkNow } from './world.ts';
 
 export interface SharedClaimerPlan {
@@ -20,6 +21,10 @@ export interface SharedClaimerPlan {
   startMs: number;
   /** For each round: how long the lane stays up after its start returns, then how long it stays parked. */
   rounds: { upMs: number; parkedMs: number }[];
+  /** Die by SIGKILL the moment the registry records a start command this claimer runs, which runs on. */
+  dieMidCommand?: boolean;
+  /** Once parked in round `round`, create `parked` and stay parked until `go` exists. */
+  barrier?: { round: number; parked: string; go: string };
 }
 
 export const EXIT_NOT_RUNNING = 12;
@@ -49,13 +54,15 @@ async function main(): Promise<void> {
     lockWaitMs: 30_000,
     self,
   });
-  const waited = { stopping: 0, starting: 0 };
+  if (plan.dieMidCommand) dieMidCommand(registry);
+  const waited = { stopping: 0, starting: 0, orphaned: 0 };
   const deps = {
     env: process.env,
     clock: systemClock,
     log: (line: string) => {
       if (line.includes('which is stopping')) waited.stopping++;
       if (line.includes('which is starting')) waited.starting++;
+      if (line.includes('left running when it died')) waited.orphaned++;
     },
   };
   const running = (when: string) => {
@@ -85,11 +92,18 @@ async function main(): Promise<void> {
     await delay(round.upMs);
     running('while its lane is up');
     if (!parkNow(registry, ref)) fail(EXIT_NOT_TAKEN, `lane ${lane.id}: no park taken`);
+    if (plan.barrier?.round === i) {
+      fs.writeFileSync(plan.barrier.parked, '');
+      while (!fs.existsSync(plan.barrier.go)) await delay(20);
+    }
     await delay(round.parkedMs);
   }
   registry.release(ref, owner);
   registry.close();
-  fs.writeSync(1, `starts ${String(starts)}\nwaited ${String(waited.stopping)} ${String(waited.starting)}\n`);
+  fs.writeSync(
+    1,
+    `starts ${String(starts)}\nwaited ${String(waited.stopping)} ${String(waited.starting)} ${String(waited.orphaned)}\n`,
+  );
   process.exit(0);
 }
 
