@@ -784,6 +784,24 @@ test("an up whose shared start fails still records what the lane's resources nee
   assert.deepEqual(d.lines(), [`create ${id}`, 'service', 'start', `teardown ${id}`]);
 });
 
+test("a restart records what the lane's resources need now, so their teardown after a later park starts the shared service", async t => {
+  const w = world(t);
+  const d = db(w);
+  fs.writeFileSync(d.up, '');
+  setUp(w, undeclared(webConfig(d)));
+  const first = await up(w.deps(), OPTIONS);
+  assert.equal(first.doctor.ok, true, failures(first));
+  const id = first.lane.id;
+
+  setUp(w, webConfig(d));
+  assert.equal(await runUpCommand('restart', ['site'], w.deps(), () => undefined), 0, w.lines.join('\n'));
+  assert.deepEqual(resourceRows(w), [['appdb', '["db"]', 1]]);
+
+  await parkedAndStopped(w, first.lane);
+  await releaseTearsDown(w, id);
+  assert.deepEqual(d.lines(), [`create ${id}`, 'service', 'service', 'stop', 'start', `teardown ${id}`]);
+});
+
 test('one pass starts a shared service that fails once: each later teardown that needs it fails without another start and keeps its record with the same problem', async t => {
   const w = world(t);
   const d = db(w);
