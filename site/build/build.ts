@@ -47,7 +47,7 @@ export function landingMarkdown(landing: Landing, sections: Section[]): string {
     )
     .join('\n\n');
   const docs = sections
-    .map(s => `## ${s.title}\n\n${s.pages.map(p => `- [${p.title}](docs/${p.slug}.md): ${p.short}`).join('\n')}`)
+    .map(s => `## ${s.title}\n\n${s.pages.map(p => `- [${p.label}](docs/${p.slug}.md): ${p.short}`).join('\n')}`)
     .join('\n\n');
   return (
     [

@@ -13,6 +13,7 @@ export interface DocPage {
   number: string;
   section: string;
   title: string;
+  label: string;
   short: string;
   summary: string;
   outline: boolean;
@@ -112,11 +113,13 @@ export function loadSections(): Section[] {
       const { data, body } = frontMatter(file);
       const markdown = expandGenerated(body).trim() + '\n';
       const { html, headings } = renderMarkdown(markdown);
+      const title = text(data.title, file, 'title');
       return {
         slug: name,
         number: `${number}.${String(p + 1)}`,
         section: entry.title,
-        title: text(data.title, file, 'title'),
+        title,
+        label: data.label === undefined ? title : text(data.label, file, 'label'),
         short: text(data.short, file, 'short'),
         summary: text(data.summary, file, 'summary'),
         outline: data.status === 'outline',

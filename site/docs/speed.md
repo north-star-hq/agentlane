@@ -12,7 +12,7 @@ summary: "An agent reads and acts on the app many times per task, so each call h
 | iOS build in a fresh worktree       | 6.5 s from the shared cache  | 91.5 s                 |
 | Boot an Android emulator            | 1.6 to 1.8 s from Quick Boot | 14.6 s cold            |
 
-Once a lane is up, each of the calls an agent makes most takes under a second:
+Once a lane is up, the calls an agent makes most often each take under a second:
 
 | On a warm lane, median of 16 calls | iOS simulator | Browser |
 | ---------------------------------- | ------------- | ------- |

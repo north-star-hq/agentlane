@@ -62,6 +62,26 @@ describe('the docs site', () => {
     }
   });
 
+  test('names a page by its label in the sidebar, the pager and the docs list, and by its title in its h1 and <title>', () => {
+    const pages = loadSections().flatMap(s => s.pages);
+    const at = pages.findIndex(p => p.slug === 'neighbours');
+    const page = pages[at];
+    const previous = pages[at - 1];
+    assert.ok(page && previous);
+    assert.equal(page.label, 'The tools you already use');
+    const own = fs.readFileSync(path.join(out, 'docs', 'neighbours.html'), 'utf8');
+    assert.ok(own.includes(`aria-current="page"><span class="nav-num">${page.number}</span>${page.label}</a>`));
+    assert.ok(own.includes(`<h1>${page.title}</h1>`));
+    assert.ok(own.includes(`<title>${page.title} | `));
+    const other = fs.readFileSync(path.join(out, 'docs', `${previous.slug}.html`), 'utf8');
+    assert.ok(other.includes(`href="../docs/neighbours.html"><span class="nav-num">${page.number}</span>${page.label}</a>`));
+    assert.ok(other.includes(`<span class="pager-title">${page.number} ${page.label}</span>`));
+    assert.ok(!other.includes(page.title));
+    const home = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    assert.ok(home.includes(`<span class="path-page-title">${page.label}</span>`));
+    assert.ok(!home.includes(page.title));
+  });
+
   test("carries the home's headline, sentence and cards into its Markdown copy and llms.txt", () => {
     const landing = loadLanding();
     for (const file of ['index.md', 'llms.txt']) {
