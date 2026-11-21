@@ -42,7 +42,14 @@ import type { HookRun } from '../hooks/run.ts';
 import { runHook } from '../hooks/run.ts';
 import { CLI, CONFIG_FILE, TOOL } from '../name.ts';
 import { identityOf } from '../processes.ts';
-import type { HookName, MobileConfig, ProjectConfig, ProjectPlatform, ServiceConfig } from '../project/config.ts';
+import type {
+  HookName,
+  MobileConfig,
+  ProjectConfig,
+  ProjectPlatform,
+  ServiceConfig,
+  SharedServiceConfig,
+} from '../project/config.ts';
 import { asMobile, findProjectConfig, forPlatform, loadProjectConfig } from '../project/config.ts';
 import { WEB_PLATFORM } from '../project/schema.ts';
 import { loadConfig, withProjectBlocks } from '../registry/config.ts';
@@ -64,6 +71,7 @@ import { bundlerPort, diagnose, dialArguments, reversePorts } from './doctor.ts'
 import { driverVariables } from './maestro-env.ts';
 import { androidBuildEnvironment, projectFindings, toolchainFindings, Unmet } from './preflight.ts';
 import { createResources, tearDownEndedResources } from './resources.ts';
+import { startSharedForLane, type SharedStarted } from './shared.ts';
 import { settleWake, takeLane, type LaneEntry, type WakeHandle } from './wake.ts';
 
 export interface UpOptions {
@@ -576,6 +584,38 @@ async function browserSteps(ctx: Ctx, run: Run, tools: BrowserTools, driverChang
   );
 }
 
+function sharedNeedsOfPlatforms(config: ProjectConfig, platforms: readonly ProjectPlatform[]): SharedServiceConfig[] {
+  const services = config.allServices.filter(s => s.platforms === null || s.platforms.some(p => platforms.includes(p)));
+  const named = new Set([...config.resources, ...services].flatMap(user => user.needs));
+  return config.shared.filter(s => named.has(s.name));
+}
+
+const SHARED_OUTCOMES: Record<SharedStarted['outcome'], string> = {
+  started: 'started',
+  kept: 'running',
+  'found-running': 'already up, so its start did not run',
+};
+
+function describeShared(started: readonly SharedStarted[]): string {
+  if (started.length === 0) return 'none needed';
+  return started.map(s => `${s.name} ${SHARED_OUTCOMES[s.outcome]}`).join(', ');
+}
+
+async function sharedStep(ctx: Ctx, run: Run, platforms: readonly ProjectPlatform[]): Promise<void> {
+  const { deps, registry, config } = ctx;
+  const needed = sharedNeedsOfPlatforms(config, platforms);
+  const bringUp = () => {
+    if (needed.length > 0) registry.touch(ctx.ref, 'up: shared');
+    const log = (line: string) => {
+      deps.log(`${TOOL} up: shared: ${line}`);
+    };
+    const env = hookEnvironment(deps.env, {}, resourceVariables(config));
+    return startSharedForLane({ env, clock: deps.clock, log }, registry, ctx.ref, needed);
+  };
+  if (config.shared.length > 0) await run.step('shared', bringUp, describeShared);
+  else await bringUp();
+}
+
 function describeResources(made: { created: string[]; kept: string[] }): string {
   const parts = [
     made.created.length > 0 ? `created ${made.created.join(', ')}` : '',
@@ -679,12 +719,13 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     const target = mobile ? deviceTarget(deps, mobile, lane, options) : null;
     const dir = laneDir(state, lane.id);
     const previous = readUpRecord(dir);
+    const platforms = [...new Set([...(previous?.platforms ?? (previous ? [previous.platform] : [])), config.platform])];
     writeUpRecord(dir, {
       version: 1,
       lane: lane.id,
       config: config.file,
       platform: config.platform,
-      platforms: [...new Set([...(previous?.platforms ?? (previous ? [previous.platform] : [])), config.platform])],
+      platforms,
       bundleId: mobile?.app.bundleId ?? previous?.bundleId ?? null,
       launch: mobile?.app.launch ?? previous?.launch ?? null,
       pinned: previous?.pinned ?? false,
@@ -747,8 +788,9 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
       throw error;
     }
     const booting = bootingWithSetup ?? (target ? startBoot(target) : null);
-    if (config.resources.length > 0 && !options.waking) {
-      try {
+    try {
+      await sharedStep(ctx, run, platforms);
+      if (config.resources.length > 0 && !options.waking) {
         const made = await run.step('resources', () => createResources(ctx, ctx.lane), describeResources);
         ctx.lane = made.lane;
         ctx.env = laneEnvironment(deps.env, made.lane, config, dir);
@@ -756,10 +798,10 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
           device.lane = made.lane;
           device.env = ctx.env;
         }
-      } catch (error) {
-        if (booting) await booting;
-        throw error;
       }
+    } catch (error) {
+      if (booting) await booting;
+      throw error;
     }
 
     let build: BuildSummary | null = null;
