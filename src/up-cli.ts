@@ -25,6 +25,7 @@ import { execInLane } from './up/exec.ts';
 import { Unmet } from './up/preflight.ts';
 import { ResourceFailed } from './up/resources.ts';
 import { restart } from './up/restart.ts';
+import { SharedServiceFailed } from './up/shared.ts';
 import { runSetup } from './up/setup.ts';
 import { up } from './up/up.ts';
 import { groupUsage, helpOf, type UsageGroup } from './usage.ts';
@@ -126,6 +127,7 @@ function report(error: unknown, command: string, deps: EnvDeps): number {
   if (
     error instanceof HookFailed ||
     error instanceof ResourceFailed ||
+    error instanceof SharedServiceFailed ||
     error instanceof ServiceFailed ||
     error instanceof DeviceStateError ||
     error instanceof DeviceBackendError ||

@@ -11,6 +11,7 @@ import type { Lane, LaneRef, ResourceTeardown, ResourceValues } from '../registr
 import { laneDir } from './lane-files.ts';
 import type { EnvDeps } from './deps.ts';
 import type { Teardown } from './release.ts';
+import { SharedServiceFailed, startSharedForTeardown } from './shared.ts';
 
 export class ResourceFailed extends Error {
   readonly resource: string;
@@ -186,13 +187,94 @@ async function tearDown(
   return { ms: run.ms, moved };
 }
 
+interface TeardownFailure {
+  headline: string;
+  movedNote: string;
+  recordedAfterHeadline: string;
+  detailAfterHeadline: string;
+}
+
+function sharedFailure(error: unknown): TeardownFailure {
+  const didNotRun = 'teardown did not run, since';
+  if (!(error instanceof SharedServiceFailed)) {
+    const problem = message(error);
+    return {
+      headline: `${didNotRun} the shared services it needs could not be started`,
+      movedNote: '',
+      recordedAfterHeadline: problem,
+      detailAfterHeadline: problem,
+    };
+  }
+  const prefix = `shared service ${error.service}: `;
+  const problem = error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message;
+  return {
+    headline: `${didNotRun} shared service ${error.service} did not start`,
+    movedNote: '',
+    recordedAfterHeadline: problem.split('\n')[0] ?? problem,
+    detailAfterHeadline: problem,
+  };
+}
+
+function commandFailure(error: unknown, t: ResourceTeardown, log: string): TeardownFailure {
+  const moved = isDirectory(t.cwd) ? '' : ` (${movedNote(t)})`;
+  if (error instanceof HookFailed) {
+    return {
+      headline: `teardown ${describeExit(error.run)}`,
+      movedNote: moved,
+      recordedAfterHeadline: t.teardown,
+      detailAfterHeadline: `${t.teardown}\n${tail(log)}\nfull log: ${log}`,
+    };
+  }
+  return {
+    headline: `teardown could not run (${message(error)})`,
+    movedNote: moved,
+    recordedAfterHeadline: t.teardown,
+    detailAfterHeadline: `full log: ${log}`,
+  };
+}
+
+function movedNote(t: ResourceTeardown): string {
+  return `${t.cwd} is gone, so it ran in the lane's log folder`;
+}
+
+async function tearDownOne(
+  deps: Pick<EnvDeps, 'env' | 'clock'>,
+  registry: Registry,
+  stateDir: string,
+  t: ResourceTeardown,
+  notes: string[],
+): Promise<TeardownFailure | null> {
+  try {
+    await startSharedForTeardown(
+      {
+        env: hookEnvironment(deps.env, {}, t.cleared),
+        clock: deps.clock,
+        log: line => notes.push(`resource ${t.name}: ${line}`),
+      },
+      registry,
+      t,
+    );
+  } catch (error) {
+    return sharedFailure(error);
+  }
+  try {
+    const done = await tearDown(deps, stateDir, t);
+    registry.finishTeardown(t.lane, t.name);
+    notes.push(`tore down resource ${t.name} (${seconds(done.ms)}${done.moved ? `; ${movedNote(t)}` : ''})`);
+    return null;
+  } catch (error) {
+    return commandFailure(error, t, resourceLog(laneDir(stateDir, t.lane), t.name));
+  }
+}
+
 /**
- * Tears down the resources of lanes that have ended, by release or by a reap, with what their create recorded. A failed
- * teardown keeps its record, so a later pass tries again; a pass skips one that failed in the last few minutes, unless
- * it names that lane.
+ * Tears down the resources of lanes that have ended, by release or by a reap, with what their create recorded, each
+ * once the shared services it needs run. A failed teardown keeps its record, so a later pass tries again; a pass skips
+ * one that failed in the last few minutes, unless it names that lane. A shared service that does not start fails the
+ * teardown that needs it, which does not run.
  */
 export async function tearDownEndedResources(
-  deps: Pick<EnvDeps, 'env'>,
+  deps: Pick<EnvDeps, 'env' | 'clock'>,
   registry: Registry,
   stateDir: string,
   choice: EndedResourceChoice = {},
@@ -201,28 +283,18 @@ export async function tearDownEndedResources(
   for (const t of registry.takeTeardowns(choice.lane === undefined ? {} : { lane: choice.lane })) {
     const into = byLane.get(t.lane) ?? { lane: t.lane, notes: [], problems: [] };
     byLane.set(t.lane, into);
-    const away = `${t.cwd} is gone, so it ran in the lane's log folder`;
-    try {
-      const done = await tearDown(deps, stateDir, t);
+    const failure = await tearDownOne(deps, registry, stateDir, t, into.notes);
+    if (failure === null) continue;
+    const how = `${failure.headline}${failure.movedNote}`;
+    const detail = failure.detailAfterHeadline;
+    if (choice.force) {
       registry.finishTeardown(t.lane, t.name);
-      into.notes.push(`tore down resource ${t.name} (${seconds(done.ms)}${done.moved ? `; ${away}` : ''})`);
-    } catch (error) {
-      const log = resourceLog(laneDir(stateDir, t.lane), t.name);
-      const how =
-        error instanceof HookFailed ? `teardown ${describeExit(error.run)}` : `teardown could not run (${message(error)})`;
-      const where = isDirectory(t.cwd) ? '' : ` (${away})`;
-      const detail = error instanceof HookFailed ? `${t.teardown}\n${tail(log)}\nfull log: ${log}` : `full log: ${log}`;
-      if (choice.force) {
-        registry.finishTeardown(t.lane, t.name);
-        into.problems.push(
-          `forgot resource ${t.name}: ${how}${where}, and --force drops its record, leaving what it made: ${detail}`,
-        );
-      } else {
-        registry.failTeardown(t.lane, t.name, `${how}: ${t.teardown}`);
-        into.problems.push(
-          `resource ${t.name}: ${how}${where} (attempt ${String(t.attempts + 1)}): ${detail}\nits record is kept: the next release or reap tries again, and ${CLI} release ${t.lane} runs it now`,
-        );
-      }
+      into.problems.push(`forgot resource ${t.name}: ${how}, and --force drops its record, leaving what it made: ${detail}`);
+    } else {
+      registry.failTeardown(t.lane, t.name, `${failure.headline}: ${failure.recordedAfterHeadline}`);
+      into.problems.push(
+        `resource ${t.name}: ${how} (attempt ${String(t.attempts + 1)}): ${detail}\nits record is kept: the next release or reap tries again, and ${CLI} release ${t.lane} runs it now`,
+      );
     }
   }
   return [...byLane.values()];
