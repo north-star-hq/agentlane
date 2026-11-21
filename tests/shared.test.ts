@@ -1420,3 +1420,58 @@ test('a start whose holder died and whose shell then exited has done its job: th
     r.close();
   }
 });
+
+test("a dead holder's command whose shell runs past its timeout and can't be ended is tried until the hold limit, then the start fails naming that shell", async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `echo start-begin >> '${r.log}'; sleep 30`,
+      stop: `echo stop >> '${r.log}'; rm -f '${r.up}'`,
+      ready: `test -f '${r.up}'`,
+      cwd: r.repo,
+      timeoutMs: 1000,
+    };
+    const a = await r.lane('a');
+    const starter = await r.killMidway({ kind: 'start', lane: refOf(a), spec }, 0, 'start-begin');
+    const shell = recordedCommand(r.stateDir);
+    assert.ok(shell !== null);
+    await new Promise(resolve => setTimeout(resolve, spec.timeoutMs + 2200));
+
+    const b = await r.lane('b');
+    const signalled: number[] = [];
+    const said: string[] = [];
+    const triesBeforeTheLimit = 3;
+    const pastHold = sharedHoldMs(spec.timeoutMs) + MINUTE_MS;
+    const eperm: SharedRunDeps = {
+      env: process.env,
+      clock: {
+        now: () => Date.now() + (signalled.length >= triesBeforeTheLimit ? pastHold : 0),
+        sleep: ms => systemClock.sleep(ms),
+      },
+      log: line => said.push(line),
+      signal: pid => {
+        signalled.push(pid);
+        throw Object.assign(new Error(`kill ${String(pid)}: operation not permitted`), { code: 'EPERM' });
+      },
+    };
+    const failed = await startSharedForLane(eperm, registry, refOf(b), [spec]).catch((e: unknown) => e);
+    assert.ok(failed instanceof SharedServiceFailed, String(failed));
+    assert.equal(
+      failed.message,
+      `shared service db: the start that pid ${String(starter)} left running when it died still runs as pid ${String(shell)}, past its 1 s timeout, and could not be ended; kill ${String(shell)} as the user that owns that process, then try again`,
+    );
+    assert.deepEqual(
+      signalled,
+      Array.from({ length: triesBeforeTheLimit }, () => -shell),
+    );
+    assert.equal(said.filter(line => line.startsWith('ending ')).length, 1, 'it says once that it ends the command');
+    assert.ok(alive(shell));
+    assert.deepEqual(r.lines(), ['start-begin']);
+    assert.equal(registry.sharedServices()[0]?.state, 'starting');
+  } finally {
+    registry.close();
+    r.close();
+  }
+});

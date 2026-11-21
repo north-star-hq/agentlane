@@ -6,6 +6,7 @@ import { rotateLog } from '../disk-limits.ts';
 import { hookEnvironment } from '../hooks/env.ts';
 import { describeExit, HookFailed, runCheck, runHook, tail } from '../hooks/run.ts';
 import { CLI } from '../name.ts';
+import type { Signaller } from '../processes.ts';
 import { killGroup } from '../processes.ts';
 import type { SharedServiceConfig } from '../project/config.ts';
 import { formatTime } from '../registry/format.ts';
@@ -54,6 +55,8 @@ export interface SharedRunDeps {
   env: NodeJS.ProcessEnv;
   clock: Clock;
   log?: (line: string) => void;
+  /** How the process group of a dead holder's command is ended; `process.kill` when absent. */
+  signal?: Signaller;
 }
 
 /** `kept`: it was running and answers; `found-running`: its ready passed before any start ran; `started`: its start ran. */
@@ -274,6 +277,7 @@ async function bringUp(
   const say = deps.log ?? (() => undefined);
   let foundDown = false;
   let waitingOn: number | null = null;
+  let ending: number | null = null;
   for (;;) {
     const claim = registry.beginSharedStart(need, name, spec, foundDown);
     if (claim.kind === 'unknown') {
@@ -292,13 +296,24 @@ async function bringUp(
     if (claim.kind === 'busy') {
       const { holder, orphan } = claim;
       const doing = claim.state === 'starting' ? 'starting' : 'stopping';
-      const left = `the ${claim.state === 'starting' ? 'start' : 'stop'} of shared service ${name} that pid ${String(holder.pid)} left running when it died`;
+      const what = claim.state === 'starting' ? 'start' : 'stop';
+      const left = `the ${what} of shared service ${name} that pid ${String(holder.pid)} left running when it died`;
+      const pid = orphan ? orphan.shell.pid : holder.pid;
+      const pastHold = deps.clock.now() > claim.since + sharedHoldMs(claim.timeoutMs);
       if (orphan?.overdue) {
-        say(`ending ${left}, pid ${String(orphan.shell.pid)}: it ran past its ${seconds(claim.timeoutMs)}`);
-        killGroup(orphan.shell.pid);
+        if (ending === pid && pastHold) {
+          throw new SharedServiceFailed(
+            name,
+            `the ${what} that pid ${String(holder.pid)} left running when it died still runs as pid ${String(pid)}, past its ${seconds(claim.timeoutMs)} timeout, and could not be ended; kill ${String(pid)} as the user that owns that process, then try again`,
+          );
+        }
+        if (ending !== pid) {
+          ending = pid;
+          say(`ending ${left}, pid ${String(pid)}: it ran past its ${seconds(claim.timeoutMs)}`);
+        }
+        killGroup(pid, deps.signal);
       } else {
-        const pid = orphan ? orphan.shell.pid : holder.pid;
-        if (deps.clock.now() > claim.since + sharedHoldMs(claim.timeoutMs)) {
+        if (pastHold) {
           throw new SharedServiceFailed(
             name,
             `pid ${String(pid)} has been ${doing} it since ${formatTime(claim.since)}, longer than its commands may take; kill ${String(pid)} if that process is hung, then try again`,
@@ -376,7 +391,7 @@ export async function stopUnneededShared(deps: SharedRunDeps, registry: Registry
     let claim = registry.beginSharedStop(key);
     if (claim.kind === 'left' && claim.orphan?.overdue) {
       deps.log?.(`shared service ${key.name}: ending pid ${String(claim.orphan.shell.pid)}: ${claim.reason}, past its timeout`);
-      killGroup(claim.orphan.shell.pid);
+      killGroup(claim.orphan.shell.pid, deps.signal);
       claim = registry.beginSharedStop(key);
     }
     if (claim.kind === 'left') continue;
