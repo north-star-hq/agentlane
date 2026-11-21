@@ -1,5 +1,6 @@
 ---
 title: "agentlane and Simlock, agent-device, portless, worktrunk, Playwright, Maestro, Conductor and Paradev"
+label: "The tools you already use"
 short: "The tools agentlane works beside, what each does well and what a lane adds."
 summary: "agentlane is the same idea as a git worktree, for the running app. A worktree gives each agent its own copy of the code, and a lane gives it its own copy of the app, up and running. Each entry below says what another tool does and what a lane adds to it."
 ---

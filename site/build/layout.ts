@@ -92,7 +92,7 @@ function navList(root: string, current: Current, sections: Section[]): string {
       const items = section.pages
         .map(
           page =>
-            `<li><a href="${docHref(root, page.slug)}"${here(current.kind === 'doc' && current.slug === page.slug)}><span class="nav-num">${page.number}</span>${escapeHtml(page.title)}</a></li>`,
+            `<li><a href="${docHref(root, page.slug)}"${here(current.kind === 'doc' && current.slug === page.slug)}><span class="nav-num">${page.number}</span>${escapeHtml(page.label)}</a></li>`,
         )
         .join('');
       return `<li class="nav-section"><p class="nav-title"><span class="nav-num">${section.number}</span>${escapeHtml(section.title)}</p><ol>${items}</ol></li>`;
@@ -186,7 +186,7 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
       const pages = section.pages
         .map(
           page =>
-            `<li><a href="${docHref(root, page.slug)}"><span class="path-page-num">${page.number}</span><span class="path-page-title">${escapeHtml(page.title)}</span><span class="path-page-short">${renderInline(page.short)}</span></a></li>`,
+            `<li><a href="${docHref(root, page.slug)}"><span class="path-page-num">${page.number}</span><span class="path-page-title">${escapeHtml(page.label)}</span><span class="path-page-short">${renderInline(page.short)}</span></a></li>`,
         )
         .join('');
       return `<li class="path-section"><h3><span class="path-num">${section.number}</span>${escapeHtml(section.title)}</h3><ol>${pages}</ol></li>`;
@@ -231,7 +231,7 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
 function pager(root: string, previous: DocPage | undefined, next: DocPage | undefined): string {
   const card = (page: DocPage | undefined, label: string, cls: string) =>
     page
-      ? `<a class="pager-${cls}" href="${docHref(root, page.slug)}"><span class="pager-label">${label}</span><span class="pager-title">${page.number} ${escapeHtml(page.title)}</span></a>`
+      ? `<a class="pager-${cls}" href="${docHref(root, page.slug)}"><span class="pager-label">${label}</span><span class="pager-title">${page.number} ${escapeHtml(page.label)}</span></a>`
       : '<span></span>';
   return `<nav class="pager" aria-label="Previous and next page">${card(previous, 'Previous', 'prev')}${card(next, 'Next', 'next')}</nav>`;
 }
