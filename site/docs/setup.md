@@ -30,7 +30,7 @@ Each of these gets an answer and a one-line reason:
 | Decision                | How setup decides                                                                                                                        |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | Platforms               | Each app the project ships: `app` for the mobile app, `web` for the web app, or both.                                                   |
-| Data per lane or shared | Per lane, as a [resource](resources.md), when the tests already create a local database. Shared, with cleanup named, when only a hosted one exists. |
+| Data per lane or shared | Per lane, as a [resource](resources.md), when the tests already create a local database, test-only databases included. The server they live in as a [shared service](shared.md). A hosted database, with cleanup named, when only a hosted one exists. |
 | Sign-in                 | The app's own sign-in endpoint with a test account, called from the `signin` hook.                                                       |
 | Browser driver          | Playwright, unless the project already drives browsers with agent-browser.                                                               |
 | Agents to wire          | The agent running setup, and every agent whose folder the repository commits.                                                            |
