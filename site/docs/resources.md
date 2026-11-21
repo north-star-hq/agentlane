@@ -95,7 +95,7 @@ The example app in the agentlane repository carries this recipe as `examples/exp
 }
 ```
 
-It needs `psql` on the `PATH` and Postgres 13 or later, on your Mac or in a container whose port `psql` can reach. These variables change what it does. Set them in front of both commands, as in `"LANE_PG_SERVER=postgres://me@localhost:5433 scripts/lane-pg.sh drop"`, rather than in your shell, so a teardown run by another session's reap uses the same server:
+It needs `psql` on the `PATH` and Postgres 13 or later, on your Mac or in a container whose port `psql` can reach, such as a [shared service](shared.md). These variables change what it does. Set them in front of both commands, as in `"LANE_PG_SERVER=postgres://me@localhost:5433 scripts/lane-pg.sh drop"`, rather than in your shell, so a teardown run by another session's reap uses the same server:
 
 | Variable             | Default                     | What it is                                                                 |
 | -------------------- | --------------------------- | -------------------------------------------------------------------------- |
