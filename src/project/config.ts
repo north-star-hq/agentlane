@@ -117,8 +117,11 @@ export interface SharedServiceConfig {
 export interface ProjectConfig {
   file: string;
   dir: string;
-  /** The platform this view of the config is for: `up --platform`, else the app's platform, else web. */
-  platform: ProjectPlatform;
+  /**
+   * The platform this view of the config is for: `up --platform`, else the app's platform, else web. Null for the view
+   * of the project's data alone, which `up --no-app` brings up.
+   */
+  platform: ProjectPlatform | null;
   /** The mobile app, as `up` sees it on `platform` when that is a mobile platform. */
   app: AppConfig | null;
   platformApps: Partial<Record<Platform, PlatformAppConfig>>;
@@ -137,12 +140,15 @@ export interface ProjectConfig {
   driver: { flows: string | null } | null;
 }
 
+/** The config as `up` sees it for a platform: the one it was loaded with, or the one `forPlatform` chose. */
+export type PlatformConfig = ProjectConfig & { platform: ProjectPlatform };
+
 /** The config as `up` sees it for a mobile platform. */
 export type MobileConfig = ProjectConfig & { platform: Platform; app: AppConfig };
 
 export function asMobile(config: ProjectConfig): MobileConfig | null {
   const { app, platform } = config;
-  return app !== null && platform !== WEB_PLATFORM ? { ...config, app, platform } : null;
+  return app !== null && platform !== null && platform !== WEB_PLATFORM ? { ...config, app, platform } : null;
 }
 
 export class ProjectConfigError extends Error {
@@ -368,7 +374,7 @@ function crossFieldProblems(raw: RawConfig): SchemaProblem[] {
   return problems;
 }
 
-function normalize(raw: RawConfig, file: string): ProjectConfig {
+function normalize(raw: RawConfig, file: string): PlatformConfig {
   const dir = path.dirname(file);
   const services = Object.entries(raw.services ?? {}).map(([name, s]): ServiceConfig => {
     const host = s.ready.host ?? DEFAULT_READY_HOST;
@@ -488,7 +494,7 @@ export function declaredPlatforms(config: ProjectConfig): ProjectPlatform[] {
  * The config as `up` sees it for one platform: app.ios or app.android replace the app's fields they name. A platform
  * the config declares no app for is refused.
  */
-export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): ProjectConfig {
+export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): PlatformConfig {
   if (platform === WEB_PLATFORM) {
     if (!config.web) {
       throw new UsageError(
@@ -515,13 +521,25 @@ export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): P
   return { ...config, platform, app: resolveApp(config.baseApp, config.platformApps, platform), services };
 }
 
-/** The config a lane was brought up with: for its platform, while the config still declares that platform. */
-export function loadLaneConfig(file: string, platform: ProjectPlatform | undefined): ProjectConfig {
+/**
+ * The config as `up --no-app` sees it: the project's data alone, for no platform, with no app, web app or service to
+ * run. Its resources, shared services, hooks and preconditions stay.
+ */
+export function withoutApp(config: ProjectConfig): ProjectConfig {
+  return { ...config, platform: null, app: null, web: null, services: [] };
+}
+
+/**
+ * The config a lane was brought up with: for its platform, while the config still declares that platform, and the
+ * project's data alone for a lane `up --no-app` made (`platform` null).
+ */
+export function loadLaneConfig(file: string, platform: ProjectPlatform | null | undefined): ProjectConfig {
   const loaded = loadProjectConfig(file);
+  if (platform === null) return withoutApp(loaded);
   return platform !== undefined && declaredPlatforms(loaded).includes(platform) ? forPlatform(loaded, platform) : loaded;
 }
 
-export function parseProjectConfig(raw: unknown, file: string): ProjectConfig {
+export function parseProjectConfig(raw: unknown, file: string): PlatformConfig {
   const problems = validator.validate(raw);
   if (problems.length > 0) throw new ProjectConfigError(file, problems);
   const typed = raw as RawConfig;
@@ -530,7 +548,7 @@ export function parseProjectConfig(raw: unknown, file: string): ProjectConfig {
   return normalize(typed, file);
 }
 
-export function loadProjectConfig(file: string): ProjectConfig {
+export function loadProjectConfig(file: string): PlatformConfig {
   if (path.basename(file) === FORMER.configFile) throw formerConfigError(file);
   const text = fs.readFileSync(file, 'utf8');
   let raw: unknown;

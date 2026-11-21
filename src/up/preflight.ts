@@ -263,7 +263,9 @@ export async function projectFindings(
   stopAtFirst: boolean,
 ): Promise<Finding[]> {
   const findings: Finding[] = [];
-  const applies = (p: Precondition) => p.before === stage && (p.platforms === null || p.platforms.includes(config.platform));
+  const { platform } = config;
+  const applies = (p: Precondition) =>
+    p.before === stage && (p.platforms === null || (platform !== null && p.platforms.includes(platform)));
   for (const p of config.preconditions.filter(applies)) {
     const finding = await preconditionFinding(p, config.dir, env);
     findings.push(finding);

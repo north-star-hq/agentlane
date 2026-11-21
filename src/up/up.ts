@@ -45,12 +45,13 @@ import { identityOf } from '../processes.ts';
 import type {
   HookName,
   MobileConfig,
+  PlatformConfig,
   ProjectConfig,
   ProjectPlatform,
   ServiceConfig,
   SharedServiceConfig,
 } from '../project/config.ts';
-import { asMobile, findProjectConfig, forPlatform, loadProjectConfig } from '../project/config.ts';
+import { asMobile, findProjectConfig, forPlatform, loadProjectConfig, servicesFor, withoutApp } from '../project/config.ts';
 import { WEB_PLATFORM } from '../project/schema.ts';
 import { loadConfig, withProjectBlocks } from '../registry/config.ts';
 import { formatAge, shellQuote } from '../registry/format.ts';
@@ -59,10 +60,19 @@ import { stateDir } from '../registry/paths.ts';
 import { UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
 import { keepTouching, recordCall } from '../registry/touch.ts';
-import type { Lane, LaneRef } from '../registry/types.ts';
+import type { Lane, LaneRef, LaneOutcome } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { explainInspection, inspectService } from '../services/services.ts';
-import { LANE_FILES_KEEP_MS, laneDir, hookLog, pruneEndedLaneFiles, readUpRecord, writeUpRecord } from './lane-files.ts';
+import {
+  LANE_FILES_KEEP_MS,
+  laneDir,
+  hookLog,
+  pruneEndedLaneFiles,
+  readUpRecord,
+  upPlatforms,
+  writeUpRecord,
+  type UpRecord,
+} from './lane-files.ts';
 import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
 import { rememberAnswers } from './answers.ts';
 import type { EnvDeps } from './deps.ts';
@@ -80,6 +90,11 @@ export interface UpOptions {
   waitMs: number;
   worktree?: string | undefined;
   platform?: ProjectPlatform | undefined;
+  /**
+   * False to bring up the project's data alone (`--no-app`): preflight, setup, the shared services the resources need,
+   * and the resources. It claims no device, browser or port, and builds, starts and launches nothing.
+   */
+  app?: boolean | undefined;
   /** The caller is waking a parked lane, and holds it for that: the resources it made stay as they are. */
   waking?: boolean | undefined;
 }
@@ -96,7 +111,8 @@ export type BuildSummary =
 export interface UpResult {
   lane: Lane;
   created: boolean;
-  platform: ProjectPlatform;
+  /** Null for a lane with the project's data only. */
+  platform: ProjectPlatform | null;
   /** The web app's URL on this lane, when the config has a web app. */
   url: string | null;
   config: string;
@@ -113,7 +129,7 @@ function seconds(ms: number): string {
   return `${(ms / 1000).toFixed(1)} s`;
 }
 
-export function locateConfig(start: string): ProjectConfig {
+export function locateConfig(start: string): PlatformConfig {
   const file = findProjectConfig(start);
   if (!file) {
     throw new UsageError(
@@ -585,7 +601,7 @@ async function browserSteps(ctx: Ctx, run: Run, tools: BrowserTools, driverChang
 }
 
 function sharedNeedsOfPlatforms(config: ProjectConfig, platforms: readonly ProjectPlatform[]): SharedServiceConfig[] {
-  const services = config.allServices.filter(s => s.platforms === null || s.platforms.some(p => platforms.includes(p)));
+  const services = platforms.flatMap(p => servicesFor(config.allServices, p));
   const named = new Set([...config.resources, ...services].flatMap(user => user.needs));
   return config.shared.filter(s => named.has(s.name));
 }
@@ -624,13 +640,49 @@ function describeResources(made: { created: string[]; kept: string[] }): string 
   return parts.filter(p => p !== '').join('; ');
 }
 
+function describeClaim(o: LaneOutcome): string {
+  const { lane } = o;
+  const held = [
+    ...(lane.device ? [`${lane.device.name} (${lane.device.id})`] : []),
+    ...(lane.browser ? [`a ${lane.browser.driver} browser`] : []),
+    ...lane.ports.map(p => `${p.service} ${String(p.port)}`),
+  ];
+  const what = held.length === 0 ? 'no device, browser or port' : [...(lane.device ? [] : ['no device']), ...held].join(', ');
+  return `${o.created ? 'claimed lane' : 'reusing lane'} ${lane.id}: ${what}`;
+}
+
+function refuseAppLane(lane: Lane, record: UpRecord | null): void {
+  const platforms = upPlatforms(record);
+  const held = [
+    ...(lane.device ? [lane.device.name] : []),
+    ...(lane.browser ? [`a ${lane.browser.driver} browser`] : []),
+    ...(lane.ports.length > 0 ? [`ports for ${lane.ports.map(p => p.service).join(', ')}`] : []),
+  ];
+  if (platforms.length === 0 && held.length === 0) return;
+  const what = [
+    ...(platforms.length > 0 ? [`was brought up for ${platforms.join(', ')}`] : []),
+    ...(held.length > 0 ? [`holds ${held.join(', ')}`] : []),
+  ];
+  throw new UsageError(
+    `this folder's lane ${lane.id} ${what.join(' and ')}, and up --no-app brings up a lane with the project's data alone`,
+    `run the command under ${CLI} exec in this lane, which gives it the resources' values (${CLI} up creates any it lacks); or ${CLI} release, then ${CLI} up --no-app`,
+  );
+}
+
 export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> {
   const { deps, forgetDeviceStates } = rememberAnswers(given);
   const started = deps.clock.now();
   const run = new Run(deps);
   const start = options.worktree ?? deps.cwd;
   const located = locateConfig(start);
-  const config = forPlatform(located, options.platform ?? located.platform);
+  const withApp = options.app !== false;
+  if (!withApp && !options.waking && located.resources.length === 0) {
+    throw new UsageError(
+      `${located.file} declares no resources, so up --no-app has no data to bring up`,
+      `declare the data under resources in ${CONFIG_FILE}, and the server it lives on under shared; or run ${CLI} up for the app`,
+    );
+  }
+  const config = withApp ? forPlatform(located, options.platform ?? located.platform) : withoutApp(located);
   const mobile = asMobile(config);
   const folder = resolveFolder(start);
   const backend = mobile ? deps.devices[mobile.platform] : undefined;
@@ -672,6 +724,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     const owner = resolveOwner(deps.env, deps.processes, deps.selfPid);
     const before = options.waking ? null : registry.takeBack(owner, folder.worktree);
     if (before) {
+      if (!withApp) refuseAppLane(before, readUpRecord(laneDir(state, before.id)));
       const ref = { id: before.id, token: before.token };
       recordCall(state, ref, deps.clock.now());
       if (registry.parkOf(before.id)) woken = await takeLane(entry, ref);
@@ -702,8 +755,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
           stop?.();
         }
       },
-      o =>
-        `${o.created ? 'claimed lane' : 'reusing lane'} ${o.lane.id}: ${o.lane.device?.name ?? 'no device'}${o.lane.device ? ` (${o.lane.device.id})` : ''}${o.lane.browser ? `, a ${o.lane.browser.driver} browser` : ''}, ${o.lane.ports.map(p => `${p.service} ${String(p.port)}`).join(', ')}`,
+      describeClaim,
     );
     for (const note of outcome.notes) deps.log(`${TOOL} up: ${note}`);
     const browsers = deps.browser ?? realBrowserTools;
@@ -719,12 +771,12 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     const target = mobile ? deviceTarget(deps, mobile, lane, options) : null;
     const dir = laneDir(state, lane.id);
     const previous = readUpRecord(dir);
-    const platforms = [...new Set([...(previous?.platforms ?? (previous ? [previous.platform] : [])), config.platform])];
+    const platforms = [...new Set([...upPlatforms(previous), ...(config.platform === null ? [] : [config.platform])])];
     writeUpRecord(dir, {
       version: 1,
       lane: lane.id,
       config: config.file,
-      platform: config.platform,
+      platform: config.platform ?? previous?.platform ?? null,
       platforms,
       bundleId: mobile?.app.bundleId ?? previous?.bundleId ?? null,
       launch: mobile?.app.launch ?? previous?.launch ?? null,

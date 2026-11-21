@@ -8,7 +8,7 @@ import { DriverError } from './driver/errors.ts';
 import { HookFailed } from './hooks/run.ts';
 import { CLI, CONFIG_FILE, envName, TOOL } from './name.ts';
 import type { ProjectConfig, ProjectPlatform } from './project/config.ts';
-import { findProjectConfig, forPlatform, loadProjectConfig, ProjectConfigError } from './project/config.ts';
+import { findProjectConfig, forPlatform, loadProjectConfig, ProjectConfigError, withoutApp } from './project/config.ts';
 import { PROJECT_PLATFORMS, schemaText } from './project/schema.ts';
 import { shellQuote } from './registry/format.ts';
 import { ownerKey, resolveOwner } from './registry/owner.ts';
@@ -18,7 +18,7 @@ import { readRegistryStatus } from './registry/registry.ts';
 import { touchOwnLane } from './registry/touch.ts';
 import { resolveFolder } from './registry-cli.ts';
 import { ServiceFailed } from './services/services.ts';
-import { laneDir, readUpRecord } from './up/lane-files.ts';
+import { configPlatform, laneDir, readUpRecord } from './up/lane-files.ts';
 import type { EnvDeps } from './up/deps.ts';
 import { diagnose, renderDoctor } from './up/doctor.ts';
 import { execInLane } from './up/exec.ts';
@@ -41,6 +41,11 @@ export const UP_HELP: UsageGroup<(typeof UP_COMMANDS)[number]> = {
              steps. Prints shell exports on stdout: eval "$(${TOOL} up)".
                --platform <name>     ios, android or web (default: the config's app.platform, or
                                      web when it declares only a web app)
+               --no-app              bring up the project's data alone, for commands that need
+                                     only its resources (tests, say): preflight, setup, the shared
+                                     services the resources need, and the resources. No device,
+                                     browser or port, and nothing built or started; run the
+                                     commands under exec. A later up here adds the app
                --no-setup            skip the setup hook (it already ran in this worktree)
                --no-cache            build without the build cache
                --refresh-cache       build, and replace the cached build
@@ -68,7 +73,8 @@ export const UP_HELP: UsageGroup<(typeof UP_COMMANDS)[number]> = {
              runs nothing.
 `,
     doctor: `  doctor     Is this worktree's instance worth driving? Checks the lane, toolchain, device,
-             app, launch, services and hygiene, read-only; exit 1 names each fix.
+             app, launch, services and hygiene, read-only; exit 1 names each fix. A lane up --no-app
+             made gets the lane, its resources and its shared services checked.
                --platform <name>     check the config for ios, android or web, as up --platform builds it;
                                      a lane holding the other platform's device fails the lane check
                                      (default: the platform up ran for, else the config's)
@@ -146,6 +152,7 @@ async function runUp(args: string[], deps: EnvDeps, stdout: (text: string) => vo
     args,
     strict: true,
     options: {
+      'no-app': { type: 'boolean', default: false },
       'no-setup': { type: 'boolean', default: false },
       'no-cache': { type: 'boolean', default: false },
       'refresh-cache': { type: 'boolean', default: false },
@@ -156,8 +163,12 @@ async function runUp(args: string[], deps: EnvDeps, stdout: (text: string) => vo
     },
   });
   const platform = parsePlatform(values.platform);
+  if (values['no-app'] && platform !== undefined) {
+    throw new UsageError('--no-app and --platform are exclusive', 'pass one of them');
+  }
   const result = await up(deps, {
     platform,
+    app: !values['no-app'],
     setup: !values['no-setup'],
     cacheMode: cacheMode(values['no-cache'], values['refresh-cache']),
     waitMs: parseSeconds(values.timeout, '--timeout'),
@@ -215,8 +226,8 @@ async function runDoctor(args: string[], deps: EnvDeps, stdout: (text: string) =
   else {
     try {
       const loaded = loadProjectConfig(file);
-      const platform = asked ?? record?.platform ?? lane?.device?.platform;
-      config = platform === undefined ? loaded : forPlatform(loaded, platform);
+      const platform = asked ?? configPlatform(record, lane);
+      config = platform === undefined ? loaded : platform === null ? withoutApp(loaded) : forPlatform(loaded, platform);
     } catch (error) {
       configProblem = (error as Error).message;
     }

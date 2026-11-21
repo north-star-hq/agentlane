@@ -328,6 +328,7 @@ export async function diagnose(deps: EnvDeps, input: DoctorInput): Promise<Docto
   if (!config || !lane || mismatch) return finish(lane, checks);
   checks.push(...resourceChecks(config, lane));
   checks.push(...(await sharedChecks(deps, config, lane)));
+  if (config.platform === null) return finish(lane, checks);
   const tools = deps.browser ?? realBrowserTools;
   if (hasBrowser(lane)) checks.push(...(await browserChecks(tools, stateDir(deps.env), lane, deps.env)));
   else if (!mobile && config.web) {
