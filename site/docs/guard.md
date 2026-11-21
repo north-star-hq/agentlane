@@ -1,10 +1,10 @@
 ---
 title: "The device guard and session hooks"
-short: "Hooks that keep agents off each other's devices and browsers."
-summary: "Before an agent's shell command runs, agentlane's guard hook denies `simctl`, `adb`, `emulator` and `avdmanager` commands aimed at a device another lane holds, and browser driver commands aimed at another lane's browser. When a session ends, the release hook frees every lane the session holds, in each agent that has a session-end event. `init` writes both hooks into every agent's project settings, and `doctor` proves they run."
+short: "Hooks that keep agents off each other's devices and browsers, and stop them leaving containers running."
+summary: "Before an agent's shell command runs, agentlane's guard hook denies `simctl`, `adb`, `emulator` and `avdmanager` commands aimed at a device another lane holds, browser driver commands aimed at another lane's browser, and `docker` or `podman` commands that leave a container running after they end. When a session ends, the release hook frees every lane the session holds, in each agent that has a session-end event. `init` writes both hooks into every agent's project settings, and `doctor` proves they run."
 ---
 
-Lanes keep agents apart only if agents use them. An agent that types `xcrun simctl install booted app.app` reaches whichever simulator is booted, which may be another agent's. The guard hook closes that gap, and the release hook makes sure lanes don't outlive their sessions.
+Lanes keep agents apart only if agents use them. An agent that types `xcrun simctl install booted app.app` reaches whichever simulator is booted, which may be another agent's. The guard hook closes that gap, and denies the containers an agent would leave running when it starts a database by hand. The release hook makes sure lanes don't outlive their sessions.
 
 ## What the guard denies
 
@@ -26,18 +26,46 @@ to recover:
   node_modules/.bin/agentlane status   (every lane with its owner)
 ```
 
+## Containers
+
+The guard also denies a `docker` or `podman` command that starts a container which keeps running after the command ends. No lane records such a container, so nothing stops it, and on a Mac it keeps Docker's VM running too. The server a project's lanes need belongs under [`shared`](shared.md), where agentlane starts it when a lane needs it and stops it when none does, and its data belongs in a [resource](resources.md).
+
+It denies, under `docker`, `podman`, `docker-compose` and `podman-compose`, whatever global flags come first:
+
+- `run` with `-d` or `--detach`, alone or in a cluster such as `-dit`, and `container run -d`;
+- `start` and `restart`, and the same under `container`;
+- `compose up` with `-d`, `--detach` or `--wait`, `compose start`, `compose restart`, and `compose run -d`;
+- `podman pod start` and `restart`, and `podman kube play` without `--down`.
+
+It allows the commands that leave nothing running, such as `run --rm` without `-d`, `compose up` in the foreground, `compose run --rm`, `exec`, `stop`, `rm`, `compose down`, `ps`, `logs`, `build`, `pull` and `create`. It reads the command as it reads a device command: through `sh -c`, `npx`, `env`, `sudo`, `nohup`, `setsid`, a full path, quotes that split the name, and brace expansion. Processes you start on the Mac in the background, with `nohup`, `&`, `setsid` or `disown`, stay allowed.
+
+The denial names the routes through a lane:
+
+```text
+agentlane: blocked: `docker run -d -p 5432:5432 postgres:16` starts a container that keeps running after the command ends, and no lane will stop it.
+to recover:
+  declare the server under "shared" in agentlane.json (or its data as a resource), then node_modules/.bin/agentlane up, or node_modules/.bin/agentlane up --no-app for the data alone
+  node_modules/.bin/agentlane exec -- <command>   (runs the work with that lane's servers and data)
+  AGENTLANE_ALLOW_CONTAINER=1 docker run -d -p 5432:5432 postgres:16   (only if the user has asked, in this conversation, for a container outside lanes; agentlane won't track or stop it)
+```
+
+`AGENTLANE_ALLOW_CONTAINER=1` in front of the command, or exported in the agent's environment, lets it through. It is for when the user has asked, in that conversation, for a container outside lanes. agentlane doesn't track or stop that container: it runs until someone stops it. Any other value, or the variable set in front of an earlier command only, doesn't let it through.
+
+The guard judges only the commands an agent runs in its shell. The commands of a shared service, a resource or a hook run inside agentlane, so a shared service's `start` can run `docker run -d`.
+
 ## What it leaves alone
 
 - Devices no lane holds, and simulators or emulators you made yourself.
 - Commands aimed at the session's own lane: `$AGENTLANE_DEVICE`, and the browser session `exec` sets.
 - Read-only commands that touch no device, such as `simctl list` and `adb devices`.
+- `docker` and `podman` commands that leave no container running.
 - Everything that isn't one of those tools.
 
 The guard is a fence against mistakes, not a sandbox. An agent can still reach a device another way; the [skills](skills.md) tell it to use its own lane, and the guard catches the common slip.
 
 ## Which commands start the guard
 
-Every shell command an agent runs passes through its guard hook, so the hook decides in the shell, before it starts Node, whether the command names `simctl`, `adb`, `emulator`, `avdmanager`, `playwright-cli`, `@playwright/cli` or `agent-browser`. A command that names none of them is allowed at once. The check reads a name however the command spells it: split by quotes (`xcrun 'sim'ctl`, `a''db`, `a$'d'b`, `a$"db"`), by backslashes or a line continuation, or made by brace expansion (`a{d,}b`, `e{nv,mulator}`). A command with braces that names none of the tools, such as `mkdir -p src/{a,b}`, still starts no Node.
+Every shell command an agent runs passes through its guard hook, so the hook decides in the shell, before it starts Node, whether the command names `simctl`, `adb`, `emulator`, `avdmanager`, `playwright-cli`, `@playwright/cli`, `agent-browser`, `docker` or `podman`. A command that names none of them is allowed at once. The check reads a name however the command spells it: split by quotes (`xcrun 'sim'ctl`, `a''db`, `a$'d'b`, `a$"db"`), by backslashes or a line continuation, or made by brace expansion (`a{d,}b`, `e{nv,mulator}`). A command with braces that names none of the tools, such as `mkdir -p src/{a,b}`, still starts no Node.
 
 When the guard lets through a command aimed at the session's own device or browser, that command counts as a call on the lane, so a lane an agent drives by hand isn't [parked](lanes.md#parking) under it.
 

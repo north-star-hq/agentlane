@@ -8,7 +8,7 @@ summary: "`agentlane doctor` answers one question before an agent trusts a runni
 npx agentlane doctor
 ```
 
-`up` ends by running `doctor`, and agents run it again before they trust a running app and whenever something looks off. It changes nothing in the lane: its checks read, and the only command it runs is an agent's guard hook on a harmless command, when that hook has left no recent mark. It counts as a call on the lane, so it puts off parking, but it doesn't bring a parked lane back.
+`up` ends by running `doctor`, and agents run it again before they trust a running app and whenever something looks off. It changes nothing in the lane: its checks read, and the only commands it runs are each needed shared service's `ready`, and an agent's guard hook on a harmless command when that hook has left no recent mark. It counts as a call on the lane, so it puts off parking, but it doesn't bring a parked lane back.
 
 ## What it checks
 
@@ -20,6 +20,7 @@ npx agentlane doctor
 | `lane`                           | This session holds a lane in this folder, with the platform's device or browser.                      |
 | Toolchain                        | Xcode, the simulator runtime, Java 17, the hook locale and the pinned Maestro are there, as the platform needs. |
 | `resource <name>`                | Each resource was created for this lane and exported its values.                                      |
+| `shared <name>`                  | Each [shared service](shared.md) the lane needs answers its `ready`. When it fails, the fix is `up`, which starts it. |
 | `device`                         | The lane's simulator or emulator is booted.                                                           |
 | `device network`                 | On Android, `adb reverse` forwards the ports the app dials.                                           |
 | `app installed`, `app running`   | The app is on the device and running.                                                                 |
@@ -69,6 +70,8 @@ npx agentlane doctor --platform android
 ```
 
 A lane that holds the other platform's device fails the `lane` check, with the fix.
+
+A lane brought up with `up --no-app` gets the `config`, wiring, `lane`, hook locale, `resource` and `shared` lines only, since it has no device, browser, service or app to check.
 
 ## Warnings
 

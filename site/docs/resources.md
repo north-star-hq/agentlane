@@ -22,6 +22,8 @@ Resources live under `resources` in `agentlane.json`, by name. This one gives ea
 
 `create` and `teardown` are shell commands, run from the folder that holds `agentlane.json` unless you set `cwd`. A resource needs both.
 
+The server the databases live in, such as a Postgres container, is a [shared service](shared.md): declare it under `shared` and name it in the resource's `needs`, and `up` starts it before the resource's `create`. Don't start the server in `create`. A server started there keeps running after every lane is gone.
+
 ## Write the create command
 
 `create` makes the resource and hands its values back by writing `NAME=value` lines to the file that `$AGENTLANE_EXPORTS` names. `$AGENTLANE_LANE` holds the lane's id, so a name built from it can't collide with another lane's:
@@ -65,7 +67,7 @@ A command in the lane never takes an exported name from the environment of whoev
 
 ## When teardown runs
 
-Each teardown runs when its lane ends, last created first:
+Each teardown runs when its lane ends, last created first. A teardown whose resource names a shared service in `needs` starts it first when it has stopped:
 
 - at `agentlane release`;
 - when the agent's session ends and its hook releases the lane;
@@ -129,5 +131,6 @@ npx agentlane exec -- printenv DATABASE_URL
 | `exports`                | No       | The variables create writes, such as `DATABASE_URL`.            |
 | `cwd`                    | No       | The folder both commands run in, relative to `agentlane.json`.  |
 | `teardownTimeoutSeconds` | No       | How long teardown may run before it counts as failed. Default 120. |
+| `needs`                  | No       | The [shared services](shared.md) the resource uses, by name.    |
 
 The example app in the agentlane repository gives each lane its own SQLite file this way: see `examples/expo-app/agentlane.json` and `examples/expo-app/api/database.mjs`.

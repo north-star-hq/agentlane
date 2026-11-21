@@ -15,7 +15,9 @@ summary: "A lane is one agent session's running copy of the project: its own por
 | Processes         | The services `up` started, each recorded by pid and start time                       |                                             |
 | Logs and evidence | A folder of logs, and an evidence folder that outlives the lane by seven days        | `AGENTLANE_LOGS`, `AGENTLANE_EVIDENCE`      |
 
-One lane can hold a device and a browser at once, so a project with a mobile app and a web app runs both in one lane. [Environment variables](environment.md) lists every variable.
+One lane can hold a device and a browser at once, so a project with a mobile app and a web app runs both in one lane. A lane brought up with `up --no-app` holds only its resources. [Environment variables](environment.md) lists every variable.
+
+The server a lane's database lives in isn't the lane's own. It is a [shared service](shared.md), one per repository, which the lanes of all its worktrees use together. A lane whose resources or services name it in `needs` keeps it running while the lane is active, neither parked nor ended, and agentlane stops it 5 minutes after the last such lane parks or ends.
 
 ## Claim and release
 
@@ -54,7 +56,7 @@ lanes (1):
       process      metro pid 51388 (started Tue Oct 13 22:18:40 2026 UTC)  running
 ```
 
-Each process the lane started shows as `running`, `gone`, or `can't tell` when `ps` can't read it. A pid that another process has taken counts as gone. `lanes --json` prints the same for tools. The machine-wide settings live beside the registry in `config.json`:
+Each process the lane started shows as `running`, `gone`, or `can't tell` when `ps` can't read it. A pid that another process has taken counts as gone. After the lanes, `status` lists each shared service: whether it runs, the lanes that need it, and when it stops. `lanes --json` prints the same for tools, with the shared services in a top-level `shared` array. The machine-wide settings live beside the registry in `config.json`:
 
 | Setting            | Default  | What it limits                                                     |
 | ------------------ | -------- | ------------------------------------------------------------------ |
@@ -114,6 +116,8 @@ A parked lane has stopped its dev servers, its browser, its driver and Maestro, 
 
 The next call brings everything back before it runs: `exec`, `restart`, `up`, any MCP tool, and the CLI's `look`, `run`, `screenshot`, `record`, `driver start`, `evidence` and `device`. The lane gets its own device back when that is still free, and another from the pool when it isn't, waiting in the queue as `up` does when the pool is full. It skips the setup hook and the resources' `create`, since the lane still has what they made. `doctor` doesn't wake a lane: it warns `parked` and names the calls that do. A call that comes while the lane is being parked or brought back waits for that to finish, for up to 30 minutes, then refuses with `lane-busy`.
 
+A parked lane no longer needs its shared services. When the last lane that needs one parks, the shared service stops 5 minutes later, and its data stays. Waking a lane starts its shared services again before its services start, so the lane comes back to the same database.
+
 ### Holding a lane up
 
 When a person will look at the running app, the session holds its lane, so the simulator stays booted and the servers keep running past the park window:
@@ -142,9 +146,10 @@ There is no daemon and nothing to install. Every agentlane command checks, as it
 - asks the process table about the owners that no call or check has shown alive in the last few minutes, and parks the lanes of those that are gone;
 - ends the lanes whose owner has been gone for 30 minutes;
 - stops a screen recording that an ended lane left running;
+- stops a [shared service](shared.md#when-it-stops) 5 minutes after the last lane that needs it parks or ends, and tries a failed stop again a minute later;
 - removes an ended lane's folder, its evidence with it, seven days after the lane ended.
 
-When there is nothing to do, no sweep starts, and a sweep in which every owner was seen lately runs no `ps`. To run it on a schedule of your own, such as cron or launchd, call `reap`, which runs it now and prints what it did:
+When there is nothing to do, no sweep starts, and a sweep in which every owner was seen lately runs no `ps`. With no agentlane process running, such as no agent session with the MCP server open, work that is due, a shared service's stop included, happens at the next agentlane command. To run it on a schedule of your own, such as cron or launchd, call `reap`, which runs it now, prints what it did, and exits 1 when something failed, such as a shared service's stop:
 
 ```sh
 npx agentlane reap
