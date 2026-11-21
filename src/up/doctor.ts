@@ -328,6 +328,7 @@ export async function diagnose(deps: EnvDeps, input: DoctorInput): Promise<Docto
   if (!config || !lane || mismatch) return finish(lane, checks);
   checks.push(...resourceChecks(config, lane));
   checks.push(...(await sharedChecks(deps, config, lane)));
+  if (config.platform === null) return finish(lane, checks);
   const tools = deps.browser ?? realBrowserTools;
   if (hasBrowser(lane)) checks.push(...(await browserChecks(tools, stateDir(deps.env), lane, deps.env)));
   else if (!mobile && config.web) {
@@ -437,7 +438,7 @@ async function sharedReady(deps: EnvDeps, spec: SharedServiceConfig): Promise<Do
   const fix = `${UP} (it starts ${spec.name})`;
   const timeoutMs = Math.min(spec.timeoutMs, SHARED_READY_RUN_MAX_MS);
   try {
-    const run = await runCheck(spec.ready, { cwd: spec.cwd, env: hookEnvironment(deps.env, {}), timeoutMs });
+    const run = await runCheck(spec.ready, { cwd: spec.cwd, env: hookEnvironment(deps.env, {}), timeoutMs, ownGroup: true });
     if (run.code === 0) return { name, ok: true, detail: `running: its ready passes (${spec.ready})`, fix: '' };
     const how =
       run.code !== null

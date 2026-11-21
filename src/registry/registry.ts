@@ -51,6 +51,7 @@ import {
   failResource,
   failTeardown,
   finishResource,
+  followResourceNeeds,
   holdersBeforeLock,
   pendingTeardowns,
   startResource,
@@ -2500,6 +2501,14 @@ export class Registry {
       this.requireLane(ref);
       this.store.db.prepare('DELETE FROM processes WHERE claim_id = ? AND service = ?').run(ref.id, service);
       this.store.db.prepare('DELETE FROM process_alive WHERE claim_id = ? AND service = ?').run(ref.id, service);
+    });
+  }
+
+  /** Records on each of the lane's resources the shared services it needs now, and the lane's repository, for its teardown to start. */
+  followResourceNeeds(ref: LaneRef, resources: readonly Pick<ResourceSpec, 'name' | 'needs'>[]): void {
+    this.store.write(() => {
+      const row = this.requireLane(ref);
+      followResourceNeeds(this.store.db, { id: ref.id, repository: text(row, 'project_root') }, resources);
     });
   }
 

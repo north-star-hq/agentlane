@@ -141,7 +141,13 @@ function maestroDevice(
   }
   if (!config.driver) return { refusal: `${config.file} has no driver block\nto fix: add "driver": {} to ${config.file}` };
   const held = lane.device;
-  if (!held) return { refusal: `the lane holds no simulator or emulator\nto fix: ${CLI} release, then ${CLI} up` };
+  if (!held) {
+    const fix =
+      config.platform === null
+        ? `${CLI} up   (it brings the app up in this lane, which has the project's data only)`
+        : `${CLI} release, then ${CLI} up`;
+    return { refusal: `the lane holds no simulator or emulator\nto fix: ${fix}` };
+  }
   if (held.platform !== 'android') return { device: held.id };
   if (held.serial === null) {
     return {

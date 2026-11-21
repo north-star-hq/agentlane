@@ -5,6 +5,7 @@ import { sweepMaestroRunLinks } from '../driver/maestro-runs.ts';
 import { pruneDriverFiles } from '../driver/paths.ts';
 import { deviceRecordingMarked } from '../evidence/files.ts';
 import { evidenceDir } from '../hooks/env.ts';
+import type { Platform } from '../devices/backend.ts';
 import type { LaunchMode, ProjectPlatform } from '../project/config.ts';
 import { lanesRoot } from '../registry/paths.ts';
 import { HISTORY_KEEP_MS } from '../registry/registry.ts';
@@ -15,9 +16,9 @@ export interface UpRecord {
   version: 1;
   lane: string;
   config: string;
-  /** The platform `up` ran for last. */
-  platform: ProjectPlatform;
-  /** Every platform `up` brought this lane up for: a lane can hold a device and a browser at once. */
+  /** The platform `up` ran for last; null while `up --no-app` alone has run for the lane, which has the project's data only. */
+  platform: ProjectPlatform | null;
+  /** Every platform `up` brought this lane up for: a lane can hold a device and a browser at once, or neither. */
   platforms?: ProjectPlatform[];
   /** The mobile app's; null for a web lane. */
   bundleId: string | null;
@@ -60,6 +61,23 @@ export function readUpRecord(dir: string): UpRecord | null {
   } catch {
     return null;
   }
+}
+
+/** Every platform `up` brought the lane up for; none for a lane with the project's data only, or one `up` never ran for. */
+export function upPlatforms(record: UpRecord | null): ProjectPlatform[] {
+  if (!record) return [];
+  return record.platforms ?? (record.platform === null ? [] : [record.platform]);
+}
+
+/**
+ * The platform to read a lane's config for: the one `up` ran for last, null for a lane with the project's data only,
+ * and the lane's device's platform when `up` never ran for it.
+ */
+export function configPlatform(
+  record: UpRecord | null,
+  lane: { device: { platform: Platform } | null } | null,
+): ProjectPlatform | null | undefined {
+  return record ? record.platform : lane?.device?.platform;
 }
 
 /**

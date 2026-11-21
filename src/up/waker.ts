@@ -1,8 +1,8 @@
 import { stateDir } from '../registry/paths.ts';
 import { Registry } from '../registry/registry.ts';
 import type { EnvDeps } from './deps.ts';
-import { laneDir, readUpRecord, wakeFolder } from './lane-files.ts';
-import { up } from './up.ts';
+import { laneDir, readUpRecord, upPlatforms, wakeFolder } from './lane-files.ts';
+import { up, type UpOptions } from './up.ts';
 import type { LaneWaker } from './wake.ts';
 
 /** How long waking a lane waits for a pool device, as `up` does by default. */
@@ -10,7 +10,8 @@ export const WAKE_WAIT_MS = 600_000;
 
 /**
  * Wakes a lane through the steps `up` takes, minus setup and resource creation, for each platform `up` brought it up
- * for; a lane `up` never ran for gets its device back, booted if it was.
+ * for; a lane with the project's data only gets the shared services its resources need back, and nothing else; a lane
+ * `up` never ran for gets its device back, booted if it was.
  */
 export function upWaker(deps: EnvDeps): LaneWaker {
   return async (lane, park) => {
@@ -18,12 +19,10 @@ export function upWaker(deps: EnvDeps): LaneWaker {
     const record = readUpRecord(laneDir(state, lane.id));
     if (record) {
       const folder = wakeFolder(state, lane);
-      for (const platform of record.platforms ?? [record.platform]) {
-        await up(
-          { ...deps, cwd: folder },
-          { setup: false, cacheMode: 'use', waitMs: WAKE_WAIT_MS, worktree: folder, platform, waking: true },
-        );
-      }
+      const wake: UpOptions = { setup: false, cacheMode: 'use', waitMs: WAKE_WAIT_MS, worktree: folder, waking: true };
+      const platforms = upPlatforms(record);
+      if (platforms.length === 0) await up({ ...deps, cwd: folder }, { ...wake, app: false });
+      for (const platform of platforms) await up({ ...deps, cwd: folder }, { ...wake, platform });
       return;
     }
     const device = park.restarts.device;

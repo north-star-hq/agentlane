@@ -1,4 +1,4 @@
-import { laneEnvironment } from '../hooks/env.ts';
+import { hookEnvironment, laneEnvironment, resourceVariables } from '../hooks/env.ts';
 import { CLI, CONFIG_FILE, TOOL } from '../name.ts';
 import type { ServiceConfig } from '../project/config.ts';
 import { findProjectConfig, loadLaneConfig } from '../project/config.ts';
@@ -10,10 +10,18 @@ import { recordCall } from '../registry/touch.ts';
 import type { ServiceProcess } from '../registry/types.ts';
 import { resolveFolder } from '../registry-cli.ts';
 import { ServiceFailed } from '../services/services.ts';
-import { laneDir, readUpRecord } from './lane-files.ts';
+import { configPlatform, laneDir, readUpRecord, upPlatforms } from './lane-files.ts';
 import type { LaneServices } from './lane-services.ts';
-import { claimedPort, recordedProcess, startClaimedService, stopClaimedService } from './lane-services.ts';
+import {
+  claimedPort,
+  recordedProcess,
+  servicesOfPlatforms,
+  sharedNeedsOfPlatforms,
+  startClaimedService,
+  stopClaimedService,
+} from './lane-services.ts';
 import type { EnvDeps } from './deps.ts';
+import { startSharedForLane } from './shared.ts';
 import { enterLane } from './wake.ts';
 import { upWaker } from './waker.ts';
 
@@ -78,9 +86,15 @@ export async function restart(deps: EnvDeps, names: readonly string[], worktree?
         `write one at the project's root; '${CLI} schema' prints its JSON Schema`,
       );
     }
-    const config = loadLaneConfig(file, record?.platform ?? lane.device?.platform);
-    const platforms = record?.platforms ?? [config.platform];
-    const own = config.allServices.filter(s => s.platforms === null || s.platforms.some(p => platforms.includes(p)));
+    const config = loadLaneConfig(file, configPlatform(record, lane));
+    const platforms = record ? upPlatforms(record) : config.platform === null ? [] : [config.platform];
+    if (platforms.length === 0) {
+      throw new UsageError(
+        `lane ${lane.id} has the project's data only, so it runs no service to restart`,
+        `${CLI} up   (it brings the app and its services up in this lane, and keeps its resources)`,
+      );
+    }
+    const own = servicesOfPlatforms(config, platforms);
 
     const targets: Target[] = [...new Set(names)].map(name => {
       const service = own.find(s => s.name === name);
@@ -112,6 +126,21 @@ export async function restart(deps: EnvDeps, names: readonly string[], worktree?
     });
 
     const ref = { id: lane.id, token: lane.token };
+    const needed = sharedNeedsOfPlatforms(config, platforms);
+    if (needed.length > 0) registry.touch(ref, 'restart: shared');
+    registry.followResourceNeeds(ref, config.resources);
+    await startSharedForLane(
+      {
+        env: hookEnvironment(deps.env, {}, resourceVariables(config)),
+        clock: deps.clock,
+        log: line => {
+          deps.log(`${TOOL} restart: shared: ${line}`);
+        },
+      },
+      registry,
+      ref,
+      needed,
+    );
     const services: LaneServices = {
       deps,
       registry,

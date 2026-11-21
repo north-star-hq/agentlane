@@ -20,7 +20,7 @@ import { resolveFolder } from '../registry-cli.ts';
 import type { LanePark } from '../registry/parks.ts';
 import type { Lane } from '../registry/types.ts';
 import type { ServiceSystem } from '../services/system.ts';
-import { laneDir, readUpRecord } from './lane-files.ts';
+import { configPlatform, laneDir, readUpRecord } from './lane-files.ts';
 import type { EnvDeps } from './deps.ts';
 import { reversePorts } from './doctor.ts';
 import { driverVariables } from './maestro-env.ts';
@@ -29,7 +29,7 @@ import { upWaker } from './waker.ts';
 
 function lenientConfig(
   file: string | null,
-  platform: ProjectPlatform | undefined,
+  platform: ProjectPlatform | null | undefined,
   log: (line: string) => void,
 ): { config: ProjectConfig | null; problem: string | null } {
   if (!file) return { config: null, problem: null };
@@ -118,7 +118,7 @@ export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promis
   const record = readUpRecord(dir);
   const { config, problem } = lenientConfig(
     record?.config ?? findProjectConfig(deps.cwd),
-    record?.platform ?? lane.device?.platform,
+    configPlatform(record, lane),
     deps.log,
   );
   let env = laneEnvironment(deps.env, lane, config, dir, await driverVariables(deps, config, lane, dir, problem));
