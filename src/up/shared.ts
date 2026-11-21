@@ -294,10 +294,10 @@ async function bringUp(
       const doing = claim.state === 'starting' ? 'starting' : 'stopping';
       const left = `the ${claim.state === 'starting' ? 'start' : 'stop'} of shared service ${name} that pid ${String(holder.pid)} left running when it died`;
       if (orphan?.overdue) {
-        say(`ending ${left}, pid ${String(orphan.group.pid)}: it ran past its ${seconds(claim.timeoutMs)}`);
-        killGroup(orphan.group.pid);
+        say(`ending ${left}, pid ${String(orphan.shell.pid)}: it ran past its ${seconds(claim.timeoutMs)}`);
+        killGroup(orphan.shell.pid);
       } else {
-        const pid = orphan ? orphan.group.pid : holder.pid;
+        const pid = orphan ? orphan.shell.pid : holder.pid;
         if (deps.clock.now() > claim.since + sharedHoldMs(claim.timeoutMs)) {
           throw new SharedServiceFailed(
             name,
@@ -367,15 +367,16 @@ export async function startSharedForTeardown(
  * The sweep's part: stops each shared service no active lane and no running teardown has needed for SHARED_IDLE_MS,
  * with the commands recorded at its last start. A stop whose folder is gone runs in the shared service's log folder. A
  * failed stop leaves it recorded as running with the problem, for a later sweep to try again. The command of a start or
- * stop whose process died is waited for, and ended once it runs past its timeout.
+ * stop whose process died is waited for while its shell runs, and its process group ended once that shell runs past its
+ * timeout. What the shell leaves running once it exits is the server, which only a stop ends.
  */
 export async function stopUnneededShared(deps: SharedRunDeps, registry: Registry): Promise<SharedStopped[]> {
   const stopped: SharedStopped[] = [];
   for (const key of registry.sharedStopCandidates()) {
     let claim = registry.beginSharedStop(key);
     if (claim.kind === 'left' && claim.orphan?.overdue) {
-      deps.log?.(`shared service ${key.name}: ending pid ${String(claim.orphan.group.pid)}: ${claim.reason}, past its timeout`);
-      killGroup(claim.orphan.group.pid);
+      deps.log?.(`shared service ${key.name}: ending pid ${String(claim.orphan.shell.pid)}: ${claim.reason}, past its timeout`);
+      killGroup(claim.orphan.shell.pid);
       claim = registry.beginSharedStop(key);
     }
     if (claim.kind === 'left') continue;

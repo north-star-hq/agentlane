@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { ProcessIdentity, ProcessTable } from '../processes.ts';
-import { groupAlive, startMs } from '../processes.ts';
+import { startMs } from '../processes.ts';
 import { isProven, judgeProcess } from './owner.ts';
 import type { LanePark } from './parks.ts';
 import { readPark } from './parks.ts';
@@ -61,10 +61,10 @@ export interface SharedCommands {
 /** Whom a start is for: an active lane, or a resource teardown this process holds. */
 export type SharedNeed = { kind: 'lane'; repository: string; lane: string } | { kind: 'teardown'; repository: string };
 
-/** A start or stop command whose holder died while it ran. */
+/** A start or stop command whose holder died while its shell still runs. */
 export interface OrphanCommand {
   /** Its shell, which leads the command's process group. */
-  group: ProcessIdentity;
+  shell: ProcessIdentity;
   /** It has run past its timeout, when its holder would have ended it. */
   overdue: boolean;
 }
@@ -79,7 +79,7 @@ export type SharedStartClaim =
       holder: ProcessIdentity;
       since: number;
       timeoutMs: number;
-      /** The command its holder, now dead, left running; null while the holder lives. */
+      /** The command its holder, now dead, left running, while that command's shell runs; null while the holder lives. */
       orphan: OrphanCommand | null;
     }
   /** This process holds the start: it runs ready, and start unless ready passes. */
@@ -198,14 +198,12 @@ function readRow(db: DatabaseSync, key: SharedKey): Row | undefined {
 }
 
 /**
- * The holders of shared services and of resource rows, and the commands of shared services, as `ps` saw them before
- * the write lock.
+ * The holders of shared services and of resource rows, and the shells of shared services' commands, as `ps` saw them
+ * before the write lock.
  */
 export interface SharedHolders {
   table: ReadonlyMap<number, string> | undefined;
   seen: ReadonlySet<string>;
-  /** The commands, by pid, whose shell was gone at the snapshot while a process of its group was left. */
-  groups: ReadonlySet<number>;
   /** The wall clock at the snapshot, which a command's own timeout runs on. */
   wallNow: number;
 }
@@ -230,12 +228,7 @@ export function sharedHoldersBeforeLock(db: DatabaseSync, processes: ProcessTabl
     pids.add(pid);
   }
   const table = pids.size === 0 ? new Map<number, string>() : processes.startTimes([...pids]);
-  const groups = new Set<number>();
-  for (const row of commands) {
-    const pid = int(row, 'pid');
-    if (table && !table.has(pid) && groupAlive(pid)) groups.add(pid);
-  }
-  return { table, seen, groups, wallNow: Date.now() };
+  return { table, seen, wallNow: Date.now() };
 }
 
 /** Whether `holder` was in the snapshot and the snapshot proves it gone; a holder taken on after the snapshot counts as alive. */
@@ -250,24 +243,20 @@ function sameHolder(row: Row, me: ProcessIdentity): boolean {
 }
 
 /**
- * The command a row's holder recorded and left running, unless the snapshot proves its process group gone: its shell's
- * pid reused, or its shell gone with no process of its group left. A command recorded after the snapshot counts as
- * running.
+ * The command a row's holder recorded and left running, unless the snapshot proves its shell gone. A command has ended
+ * once its shell has exited, as it has for a live holder: what it left running then is the server it started. A command
+ * recorded after the snapshot counts as running.
  */
 function orphanOf(row: Row, holders: SharedHolders): OrphanCommand | null {
-  const group = commandOf(row);
-  if (!group) return null;
-  if (holders.seen.has(seenKey(group.pid, group.start))) {
-    const verdict = judgeProcess(group, holders.table);
-    if (verdict === 'pid-reused') return null;
-    if (verdict === 'dead' && !holders.groups.has(group.pid)) return null;
-  }
-  return { group, overdue: holders.wallNow - startMs(group.start) > int(row, 'timeout_ms') + PS_START_SLACK_MS };
+  const shell = commandOf(row);
+  if (!shell) return null;
+  if (provenGone(shell, holders)) return null;
+  return { shell, overdue: holders.wallNow - startMs(shell.start) > int(row, 'timeout_ms') + PS_START_SLACK_MS };
 }
 
 function describeOrphan(state: SharedState, holder: ProcessIdentity, orphan: OrphanCommand): string {
   const what = state === 'starting' ? 'start' : 'stop';
-  return `the ${what} that pid ${String(holder.pid)} left running when it died still runs as pid ${String(orphan.group.pid)}`;
+  return `the ${what} that pid ${String(holder.pid)} left running when it died still runs as pid ${String(orphan.shell.pid)}`;
 }
 
 /**
@@ -330,8 +319,8 @@ export function markNeedsUnneeded(db: DatabaseSync, needs: readonly SharedKey[],
 /**
  * Takes the start of a shared service for `need`, or says why not: `running` when it is recorded as running with no
  * problem (unless `foundDown`, when the caller found it not answering), `busy` while a live process starts or stops it,
- * or while the command of one that died still runs. A start or stop whose holder the snapshot proves gone, and whose
- * command it proves ended, is taken over. The commands recorded are `spec`, or for a teardown, those of its last start.
+ * or while the shell of the command of one that died still runs. A start or stop whose holder the snapshot proves gone,
+ * and whose command's shell it proves exited, is taken over. The commands recorded are `spec`, or for a teardown, those of its last start.
  * Either way it no longer counts as unneeded.
  */
 export function beginStart(
@@ -405,13 +394,13 @@ export function beginStart(
  * Records the shell of the start or stop command `me` runs for a shared service, which leads a process group of its
  * own, so a process taking over once `me` has died waits for that command. False when `me` no longer holds it.
  */
-export function noteCommand(db: DatabaseSync, key: SharedKey, group: ProcessIdentity, me: ProcessIdentity): boolean {
+export function noteCommand(db: DatabaseSync, key: SharedKey, shell: ProcessIdentity, me: ProcessIdentity): boolean {
   const noted = db
     .prepare(
       `UPDATE shared_services SET command_pid = ?, command_start = ?
          WHERE repository = ? AND name = ? AND holder_pid = ? AND holder_start = ?`,
     )
-    .run(group.pid, group.start, key.repository, key.name, me.pid, me.start);
+    .run(shell.pid, shell.start, key.repository, key.name, me.pid, me.start);
   return noted.changes > 0;
 }
 
@@ -458,8 +447,8 @@ export interface StopWindows {
 /**
  * Takes the stop of a shared service once nothing needs it: no active lane, and no resource row held by a process the
  * snapshot doesn't prove gone. It must have been unneeded since `windows.idleSince`; one nothing needs that was never
- * marked is marked now. A start or stop whose holder the snapshot proves gone is taken over once its command has ended;
- * until then it is left, with that command.
+ * marked is marked now. A start or stop whose holder the snapshot proves gone is taken over once its command's shell
+ * has exited; until then it is left, with that command.
  */
 export function beginStop(
   db: DatabaseSync,

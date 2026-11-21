@@ -5,7 +5,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { systemClock } from '../src/clock.ts';
-import { groupAlive, identityOf, killGroup, systemProcesses } from '../src/processes.ts';
+import { identityOf, killGroup, systemProcesses } from '../src/processes.ts';
 import type { SharedServiceConfig } from '../src/project/config.ts';
 import type { RegistryConfig } from '../src/registry/config.ts';
 import { MINUTE_MS } from '../src/registry/config.ts';
@@ -1191,6 +1191,19 @@ function realWorld(): RealWorld {
   };
 }
 
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function groupAlive(pgid: number): boolean {
+  return alive(-pgid);
+}
+
 function realDeps(said: string[]): SharedRunDeps {
   return { env: process.env, clock: systemClock, log: line => said.push(line) };
 }
@@ -1359,6 +1372,51 @@ test('a holder killed once its command is launched but before the registry recor
     assert.equal(registry.sharedServices()[0]?.state, 'running');
   } finally {
     registry.close();
+    r.close();
+  }
+});
+
+test('a start whose holder died and whose shell then exited has done its job: the next lane keeps the server it left and runs no second start', async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  const serverFile = path.join(r.root, 'server.pid');
+  const servers = () => (fs.existsSync(serverFile) ? fs.readFileSync(serverFile, 'utf8').trim().split('\n').map(Number) : []);
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `sleep 600 & echo $! >> '${serverFile}'; echo start >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done`,
+      stop: `echo stop >> '${r.log}'; kill $(cat '${serverFile}')`,
+      ready: `kill -0 $(tail -n 1 '${serverFile}')`,
+      cwd: r.repo,
+      timeoutMs: 1000,
+    };
+    const a = await r.lane('a');
+    const starter = await r.killMidway({ kind: 'start', lane: refOf(a), spec }, 0, 'start');
+    const shell = recordedCommand(r.stateDir);
+    assert.ok(shell !== null);
+    const [server] = servers();
+    assert.ok(server !== undefined);
+    fs.writeFileSync(r.gate, '');
+    await until(() => !alive(shell));
+    assert.ok(alive(server) && groupAlive(shell), "the server runs on in its shell's process group");
+
+    const b = await r.lane('b');
+    const said: string[] = [];
+    const started = await startSharedForLane(realDeps(said), registry, refOf(b), [spec]);
+    assert.deepEqual(
+      started.map(s => [s.outcome, s.took]),
+      [['found-running', { state: 'starting', pid: starter }]],
+    );
+    assert.deepEqual(
+      said.filter(line => line.startsWith('ending ') || line.startsWith('waiting ')),
+      [],
+    );
+    assert.ok(alive(server), 'the server the start left is never ended by a takeover');
+    assert.deepEqual(r.lines(), ['start']);
+    assert.equal(registry.sharedServices()[0]?.state, 'running');
+  } finally {
+    registry.close();
+    for (const pid of servers()) if (alive(pid)) process.kill(pid, 'SIGKILL');
     r.close();
   }
 });
