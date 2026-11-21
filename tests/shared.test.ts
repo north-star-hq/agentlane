@@ -1317,3 +1317,48 @@ test('a lane start killed mid-start leaves its start running: the sweep stops th
     r.close();
   }
 });
+
+test('a holder killed once its command is launched but before the registry records it runs no command, and the next lane starts the service alone', async () => {
+  const r = realWorld();
+  const registry = r.registry();
+  try {
+    const spec: SharedServiceConfig = {
+      name: 'db',
+      start: `echo start >> '${r.log}'; sleep 0.3; touch '${r.up}'`,
+      stop: `echo stop >> '${r.log}'; rm -f '${r.up}'`,
+      ready: `test -f '${r.up}'`,
+      cwd: r.repo,
+      timeoutMs: 20_000,
+    };
+    const a = await r.lane('a');
+    const plan: SharedHolderPlan = {
+      stateDir: r.stateDir,
+      config: HOLDER_CONFIG,
+      aheadMs: 0,
+      action: { kind: 'start', lane: refOf(a), spec },
+      dieMidCommand: 'launched',
+    };
+    const holder = spawn(process.execPath, [HOLDER, JSON.stringify(plan)], { stdio: ['ignore', 'ignore', 'inherit'] });
+    const signal = await new Promise(resolve => {
+      holder.once('exit', (_code, killedBy) => {
+        resolve(killedBy);
+      });
+    });
+    assert.equal(signal, 'SIGKILL');
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.deepEqual(r.lines(), [], 'its start never ran');
+    assert.equal(recordedCommand(r.stateDir), null);
+
+    const b = await r.lane('b');
+    const started = await startSharedForLane(realDeps([]), registry, refOf(b), [spec]);
+    assert.deepEqual(
+      started.map(s => [s.outcome, s.took]),
+      [['started', { state: 'starting', pid: holder.pid }]],
+    );
+    assert.deepEqual(r.lines(), ['start']);
+    assert.equal(registry.sharedServices()[0]?.state, 'running');
+  } finally {
+    registry.close();
+    r.close();
+  }
+});

@@ -403,13 +403,16 @@ export function beginStart(
 
 /**
  * Records the shell of the start or stop command `me` runs for a shared service, which leads a process group of its
- * own, so a process taking over once `me` has died waits for that command.
+ * own, so a process taking over once `me` has died waits for that command. False when `me` no longer holds it.
  */
-export function noteCommand(db: DatabaseSync, key: SharedKey, group: ProcessIdentity, me: ProcessIdentity): void {
-  db.prepare(
-    `UPDATE shared_services SET command_pid = ?, command_start = ?
-       WHERE repository = ? AND name = ? AND holder_pid = ? AND holder_start = ?`,
-  ).run(group.pid, group.start, key.repository, key.name, me.pid, me.start);
+export function noteCommand(db: DatabaseSync, key: SharedKey, group: ProcessIdentity, me: ProcessIdentity): boolean {
+  const noted = db
+    .prepare(
+      `UPDATE shared_services SET command_pid = ?, command_start = ?
+         WHERE repository = ? AND name = ? AND holder_pid = ? AND holder_start = ?`,
+    )
+    .run(group.pid, group.start, key.repository, key.name, me.pid, me.start);
+  return noted.changes > 0;
 }
 
 /** Forgets the command `me` recorded, once it has ended. */

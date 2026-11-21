@@ -51,27 +51,30 @@ function runShell(
   env: NodeJS.ProcessEnv,
   out: number,
   timeoutMs: number | undefined,
-  onSpawn: ((pid: number) => void) | undefined,
+  beforeRun: ((pid: number) => void) | undefined,
 ): Promise<CommandResult> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawn('/bin/sh', ['-c', command], {
+    const child = spawn('/bin/sh', ['-c', beforeRun ? `read -r _ || exit 125\n${command}` : command], {
       cwd,
       env,
-      stdio: ['ignore', out, out],
+      stdio: [beforeRun ? 'pipe' : 'ignore', out, out],
       detached: timeoutMs !== undefined,
     });
     let timedOut = false;
+    const killAll = () => {
+      try {
+        process.kill(-(child.pid ?? 0), 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
     const timer =
       timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             timedOut = true;
-            try {
-              process.kill(-(child.pid ?? 0), 'SIGKILL');
-            } catch {
-              child.kill('SIGKILL');
-            }
+            killAll();
           }, timeoutMs);
     child.once('error', error => {
       clearTimeout(timer);
@@ -81,7 +84,17 @@ function runShell(
       clearTimeout(timer);
       resolve({ code, signal, ms: Date.now() - started, ...(timedOut ? { timedOut } : {}) });
     });
-    if (child.pid !== undefined) onSpawn?.(child.pid);
+    if (!beforeRun || child.pid === undefined) return;
+    child.stdin?.on('error', () => undefined);
+    try {
+      beforeRun(child.pid);
+    } catch (error) {
+      clearTimeout(timer);
+      killAll();
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    child.stdin?.end('\n');
   });
 }
 
@@ -93,8 +106,11 @@ export async function runHook(
     env: NodeJS.ProcessEnv;
     log: string;
     timeoutMs?: number;
-    /** Called with the shell's pid once it runs; with a timeout, the shell leads a process group of its own. */
-    onSpawn?: (pid: number) => void;
+    /**
+     * Called with the shell's pid before the command runs. The command runs once it returns, and never when it throws
+     * or this process dies first. With a timeout, the shell leads a process group of its own.
+     */
+    beforeRun?: (pid: number) => void;
   },
 ): Promise<HookRun> {
   fs.mkdirSync(path.dirname(options.log), { recursive: true });
@@ -102,7 +118,7 @@ export async function runHook(
   const fd = fs.openSync(options.log, 'a');
   let result: CommandResult;
   try {
-    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs, options.onSpawn);
+    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs, options.beforeRun);
   } finally {
     fs.closeSync(fd);
   }

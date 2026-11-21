@@ -5,6 +5,7 @@ import type { RegistryConfig } from '../../src/registry/config.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import type { LaneRef } from '../../src/registry/types.ts';
 import { startSharedForLane, stopUnneededShared } from '../../src/up/shared.ts';
+import type { CommandDeath } from './die-mid-command.ts';
 import { dieMidCommand } from './die-mid-command.ts';
 
 /** A process that starts a lane's shared service, or stops the unneeded ones as a sweep does, for a test to kill midway. */
@@ -14,8 +15,8 @@ export interface SharedHolderPlan {
   /** How far ahead of the wall clock this process's clock runs, so a stop is already due. */
   aheadMs: number;
   action: { kind: 'start'; lane: LaneRef; spec: SharedServiceConfig } | { kind: 'stop' };
-  /** Die by SIGKILL the moment the registry records a start or stop command of this process, which runs on. */
-  dieMidCommand?: boolean;
+  /** Die by SIGKILL at this point of a start or stop command of this process. */
+  dieMidCommand?: CommandDeath;
 }
 
 async function main(): Promise<void> {
@@ -37,7 +38,7 @@ async function main(): Promise<void> {
     self,
     clock,
   });
-  if (plan.dieMidCommand) dieMidCommand(registry);
+  if (plan.dieMidCommand) dieMidCommand(registry, plan.dieMidCommand);
   const deps = { env: process.env, clock };
   const { action } = plan;
   const result =

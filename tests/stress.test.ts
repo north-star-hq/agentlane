@@ -658,7 +658,13 @@ async function runSharedSeed(seed: number): Promise<void> {
   };
   const doomedEnv = { ...process.env, STRESS_COMMAND_SECONDS: DOOMED_COMMAND_SECONDS };
   const doomedSweep = async (): Promise<'died' | 'lived'> => {
-    const plan: SharedHolderPlan = { stateDir, config, aheadMs: nextAheadMs(), action: { kind: 'stop' }, dieMidCommand: true };
+    const plan: SharedHolderPlan = {
+      stateDir,
+      config,
+      aheadMs: nextAheadMs(),
+      action: { kind: 'stop' },
+      dieMidCommand: 'running',
+    };
     const exit = await runChild(SHARED_HOLDER, plan, doomedEnv);
     state.sweeps++;
     if (exit.signal === 'SIGKILL') {
@@ -687,7 +693,11 @@ async function runSharedSeed(seed: number): Promise<void> {
     await sweepUntilStopped('with every lane parked');
     const lane = await runChild(
       SHARED_CLAIMER,
-      { ...claimerPlan(SHARED_CLAIMERS + SHARED_DOOMED_CLAIMERS, [{ upMs: 0, parkedMs: 0 }]), startMs: 0, dieMidCommand: true },
+      {
+        ...claimerPlan(SHARED_CLAIMERS + SHARED_DOOMED_CLAIMERS, [{ upMs: 0, parkedMs: 0 }]),
+        startMs: 0,
+        dieMidCommand: 'running',
+      },
       doomedEnv,
     );
     if (lane.signal === 'SIGKILL') state.midStart++;
@@ -709,7 +719,7 @@ async function runSharedSeed(seed: number): Promise<void> {
           parkedMs: 150 + Math.floor(random() * 300),
         })),
       ),
-      dieMidCommand: i >= SHARED_CLAIMERS,
+      ...(i >= SHARED_CLAIMERS ? { dieMidCommand: 'running' as const } : {}),
       barrier: { round: SHARED_BARRIER_ROUND, parked: parkedAtBarrier(i), go },
     }));
     const exited = new Set<number>();

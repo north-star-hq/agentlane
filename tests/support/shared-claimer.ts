@@ -7,6 +7,7 @@ import type { RegistryConfig } from '../../src/registry/config.ts';
 import type { Owner } from '../../src/registry/owner.ts';
 import { Registry } from '../../src/registry/registry.ts';
 import { startSharedForLane } from '../../src/up/shared.ts';
+import type { CommandDeath } from './die-mid-command.ts';
 import { dieMidCommand } from './die-mid-command.ts';
 import { parkNow } from './world.ts';
 
@@ -21,8 +22,8 @@ export interface SharedClaimerPlan {
   startMs: number;
   /** For each round: how long the lane stays up after its start returns, then how long it stays parked. */
   rounds: { upMs: number; parkedMs: number }[];
-  /** Die by SIGKILL the moment the registry records a start command this claimer runs, which runs on. */
-  dieMidCommand?: boolean;
+  /** Die by SIGKILL at this point of a start command this claimer runs. */
+  dieMidCommand?: CommandDeath;
   /** Once parked in round `round`, create `parked` and stay parked until `go` exists. */
   barrier?: { round: number; parked: string; go: string };
 }
@@ -54,7 +55,7 @@ async function main(): Promise<void> {
     lockWaitMs: 30_000,
     self,
   });
-  if (plan.dieMidCommand) dieMidCommand(registry);
+  if (plan.dieMidCommand) dieMidCommand(registry, plan.dieMidCommand);
   const waited = { stopping: 0, starting: 0, orphaned: 0 };
   const deps = {
     env: process.env,

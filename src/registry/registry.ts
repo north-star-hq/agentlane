@@ -2609,15 +2609,17 @@ export class Registry {
 
   /**
    * Records the shell of the start or stop command this process runs for a shared service it holds, so a process taking
-   * over once this one has died waits for that command. Nothing is recorded when the shell has already exited.
+   * over once this one has died waits for that command. Nothing is recorded when the shell has already exited. Throws
+   * when `ps` can't be read, or when this process no longer holds the shared service.
    */
   noteSharedCommand(key: SharedKey, pid: number): void {
     const me = this.self();
-    const group = identityOf(this.processes, pid);
-    if (!group) return;
-    this.store.write(() => {
-      noteCommand(this.store.db, key, group, me);
-    });
+    const table = this.processes.startTimes([pid]);
+    if (!table) throw new Error(`could not read the start time of its shell, pid ${String(pid)}`);
+    const start = table.get(pid);
+    if (start === undefined) return;
+    const noted = this.store.write(() => noteCommand(this.store.db, key, { pid, start }, me));
+    if (!noted) throw new Error(`this process no longer holds shared service ${key.name}`);
   }
 
   /** Forgets the command this process recorded for a shared service, once it has ended. */

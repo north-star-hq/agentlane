@@ -183,7 +183,10 @@ function quoted(output: string): string {
   return output.trim() === '' ? '  | (no output)' : lines.map(line => `  | ${line}`).join('\n');
 }
 
-/** Runs the start or stop command of a shared service this process holds, recording its shell while it runs. */
+/**
+ * Runs the start or stop command of a shared service this process holds, once its shell is recorded on the row, so a
+ * process taking over after this one dies waits for it. One that cannot be recorded never runs.
+ */
 function runFenced(
   registry: Registry,
   key: SharedKey,
@@ -195,10 +198,8 @@ function runFenced(
   return runHook(`shared ${key.name} ${what}`, command, {
     ...place,
     timeoutMs,
-    onSpawn: pid => {
-      quietly(() => {
-        registry.noteSharedCommand(key, pid);
-      });
+    beforeRun: pid => {
+      registry.noteSharedCommand(key, pid);
     },
   });
 }
