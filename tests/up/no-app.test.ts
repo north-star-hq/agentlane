@@ -455,3 +455,20 @@ test('up --no-app in a project that declares no resources refuses before claimin
   assert.deepEqual(lanes(w), []);
   assert.deepEqual(d.lines(), []);
 });
+
+test('restart in a data-only lane refuses, naming up, and starts nothing', async t => {
+  const w = world(t);
+  const d = db(w);
+  w.write(dataConfig(d));
+  const result = await up(w.deps(), DATA_ONLY);
+  assert.equal(result.doctor.ok, true, failures(result));
+
+  w.lines.length = 0;
+  assert.equal(await runUpCommand('restart', ['api'], w.deps(), () => undefined), 2);
+  assert.equal(
+    w.lines.join('\n'),
+    `agentlane: lane ${result.lane.id} has the project's data only, so it runs no service to restart\nto fix: node_modules/.bin/agentlane up   (it brings the app and its services up in this lane, and keeps its resources)`,
+  );
+  holdsNothing(only(w));
+  assert.deepEqual(d.lines(), ['start', `create ${result.lane.id}`]);
+});

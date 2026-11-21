@@ -438,7 +438,7 @@ async function sharedReady(deps: EnvDeps, spec: SharedServiceConfig): Promise<Do
   const fix = `${UP} (it starts ${spec.name})`;
   const timeoutMs = Math.min(spec.timeoutMs, SHARED_READY_RUN_MAX_MS);
   try {
-    const run = await runCheck(spec.ready, { cwd: spec.cwd, env: hookEnvironment(deps.env, {}), timeoutMs });
+    const run = await runCheck(spec.ready, { cwd: spec.cwd, env: hookEnvironment(deps.env, {}), timeoutMs, ownGroup: true });
     if (run.code === 0) return { name, ok: true, detail: `running: its ready passes (${spec.ready})`, fix: '' };
     const how =
       run.code !== null

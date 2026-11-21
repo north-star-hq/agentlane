@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import { systemClock } from '../src/clock.ts';
 import { identityOf, killGroup, systemProcesses } from '../src/processes.ts';
 import type { SharedServiceConfig } from '../src/project/config.ts';
@@ -251,7 +251,7 @@ test('a lane that comes up while the sweep stops the service waits for the stop,
     const repo = w.folder('repo');
     const spec = f.spec({
       start: `echo start-begin >> '${log}'; touch '${f.up}'; echo start-end >> '${log}'`,
-      stop: `echo stop-begin >> '${log}'; while [ ! -f '${gate}' ]; do sleep 0.02; done; rm -f '${f.up}'; echo stop-end >> '${log}'`,
+      stop: `echo stop-begin >> '${log}'; ${untilGate(gate)}; rm -f '${f.up}'; echo stop-end >> '${log}'`,
     });
     const a = await lane(w, 'a', repo);
     await startSharedForLane(deps(w), w.registry(), refOf(a), [spec]);
@@ -1113,9 +1113,45 @@ interface RealWorld {
   lines(): string[];
   /** Runs a holder in a process of its own and kills it once `log` shows `marker` and its command is recorded; resolves to its pid. */
   killMidway(plan: SharedHolderPlan['action'], aheadMs: number, marker: string): Promise<number>;
-  /** Lets any command still waiting on the gate finish, ends a recorded command's group, and removes the folder. */
-  close(): void;
+  /** Ends the recorded command's process group and every process still running that names this folder, then removes it. */
+  close(): Promise<void>;
 }
+
+/** Shell that waits until `gate` exists, giving up after about a minute. */
+function untilGate(gate: string): string {
+  return `n=0; while [ ! -f '${gate}' ] && [ "$n" -lt 3000 ]; do n=$((n + 1)); sleep 0.02; done`;
+}
+
+interface Running {
+  pid: number;
+  pgid: number;
+}
+
+/** The processes other than this one whose command line names `dir`. */
+function processesNaming(dir: string): Running[] {
+  const ps = spawnSync('ps', ['-A', '-ww', '-o', 'pid=,pgid=,command='], { encoding: 'utf8' });
+  assert.equal(ps.status, 0, ps.stderr);
+  return ps.stdout.split('\n').flatMap(line => {
+    const [, pid, pgid, command] = /^\s*(\d+)\s+(\d+)\s(.*)$/.exec(line) ?? [];
+    if (pid === undefined || pgid === undefined || command?.includes(dir) !== true) return [];
+    return Number(pid) === process.pid ? [] : [{ pid: Number(pid), pgid: Number(pgid) }];
+  });
+}
+
+/** Kills the process, with its process group when it leads one. */
+function end(running: Running): void {
+  try {
+    process.kill(running.pid === running.pgid ? -running.pgid : running.pid, 'SIGKILL');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+}
+
+const realRoots: string[] = [];
+
+after(() => {
+  for (const root of realRoots) assert.deepEqual(processesNaming(root), [], `a process of ${root} outlived its test`);
+});
 
 function recordedCommand(stateDir: string): number | null {
   const db = new DatabaseSync(databasePath(stateDir));
@@ -1130,6 +1166,7 @@ function recordedCommand(stateDir: string): number | null {
 /** A registry on the real process table and clock, for holders that are real processes killed mid-command. */
 function realWorld(): RealWorld {
   const root = tempDir('shared-real');
+  realRoots.push(root);
   const stateDir = path.join(root, 'state');
   const repo = path.join(root, 'repo');
   fs.mkdirSync(repo, { recursive: true });
@@ -1182,10 +1219,11 @@ function realWorld(): RealWorld {
       }
       return child.pid ?? 0;
     },
-    close: () => {
-      fs.writeFileSync(path.join(root, 'gate'), '');
+    close: async () => {
       const command = recordedCommand(stateDir);
       if (command !== null) killGroup(command);
+      for (const running of processesNaming(root)) end(running);
+      await until(() => processesNaming(root).length === 0);
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
@@ -1215,7 +1253,7 @@ test("a sweeper killed mid-stop leaves its stop running: a lane's start waits fo
     const spec: SharedServiceConfig = {
       name: 'db',
       start: `echo start >> '${r.log}'; touch '${r.up}'`,
-      stop: `echo stop-begin >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done; rm -f '${r.up}'; echo stop-end >> '${r.log}'`,
+      stop: `echo stop-begin >> '${r.log}'; ${untilGate(r.gate)}; rm -f '${r.up}'; echo stop-end >> '${r.log}'`,
       ready: `test -f '${r.up}'`,
       cwd: r.repo,
       timeoutMs: 20_000,
@@ -1247,7 +1285,7 @@ test("a sweeper killed mid-stop leaves its stop running: a lane's start waits fo
     assert.equal(registry.sharedServices()[0]?.state, 'running');
   } finally {
     registry.close();
-    r.close();
+    await r.close();
   }
 });
 
@@ -1286,7 +1324,7 @@ test('the command of a holder that died is ended once it runs past its timeout, 
     assert.deepEqual(r.lines(), ['start', 'stop-begin']);
   } finally {
     registry.close();
-    r.close();
+    await r.close();
   }
 });
 
@@ -1298,7 +1336,7 @@ test('a lane start killed mid-start leaves its start running: the sweep stops th
   try {
     const spec: SharedServiceConfig = {
       name: 'db',
-      start: `echo start-begin >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done; touch '${r.up}'; echo start-end >> '${r.log}'`,
+      start: `echo start-begin >> '${r.log}'; ${untilGate(r.gate)}; touch '${r.up}'; echo start-end >> '${r.log}'`,
       stop: `echo stop >> '${r.log}'; rm -f '${r.up}'`,
       ready: `test -f '${r.up}'`,
       cwd: r.repo,
@@ -1327,7 +1365,7 @@ test('a lane start killed mid-start leaves its start running: the sweep stops th
   } finally {
     registry.close();
     sweeping.close();
-    r.close();
+    await r.close();
   }
 });
 
@@ -1372,7 +1410,7 @@ test('a holder killed once its command is launched but before the registry recor
     assert.equal(registry.sharedServices()[0]?.state, 'running');
   } finally {
     registry.close();
-    r.close();
+    await r.close();
   }
 });
 
@@ -1384,7 +1422,7 @@ test('a start whose holder died and whose shell then exited has done its job: th
   try {
     const spec: SharedServiceConfig = {
       name: 'db',
-      start: `sleep 600 & echo $! >> '${serverFile}'; echo start >> '${r.log}'; while [ ! -f '${r.gate}' ]; do sleep 0.02; done`,
+      start: `sleep 600 & echo $! >> '${serverFile}'; echo start >> '${r.log}'; ${untilGate(r.gate)}`,
       stop: `echo stop >> '${r.log}'; kill $(cat '${serverFile}')`,
       ready: `kill -0 $(tail -n 1 '${serverFile}')`,
       cwd: r.repo,
@@ -1417,7 +1455,7 @@ test('a start whose holder died and whose shell then exited has done its job: th
   } finally {
     registry.close();
     for (const pid of servers()) if (alive(pid)) process.kill(pid, 'SIGKILL');
-    r.close();
+    await r.close();
   }
 });
 
@@ -1472,6 +1510,27 @@ test("a dead holder's command whose shell runs past its timeout and can't be end
     assert.equal(registry.sharedServices()[0]?.state, 'starting');
   } finally {
     registry.close();
-    r.close();
+    await r.close();
   }
+});
+
+test('closing a real world ends each process of its own still running: one polling a gate that never comes, and one past its gate', async () => {
+  const r = realWorld();
+  const shell = (command: string) => {
+    const child = spawn('/bin/sh', ['-c', command], { detached: true, stdio: 'ignore' });
+    const state = { exited: false };
+    child.once('exit', () => {
+      state.exited = true;
+    });
+    return { pgid: child.pid ?? 0, exited: () => state.exited };
+  };
+  const polling = shell(untilGate(path.join(r.root, 'never')));
+  const past = shell(`${untilGate(r.gate)}; echo past >> '${r.log}'; sleep 30`);
+  fs.writeFileSync(r.gate, '');
+  await until(() => r.lines().includes('past'));
+
+  await r.close();
+  await until(() => polling.exited() && past.exited(), 5000);
+  await until(() => !groupAlive(polling.pgid) && !groupAlive(past.pgid), 5000);
+  assert.equal(fs.existsSync(r.root), false);
 });

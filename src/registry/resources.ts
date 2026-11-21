@@ -72,6 +72,22 @@ function busy(row: Row, spec: ResourceSpec): Refusal {
   );
 }
 
+function followNeeds(db: DatabaseSync, seq: number, repository: string, needs: readonly string[]): void {
+  db.prepare('UPDATE resources SET repository = ?, needs = ? WHERE seq = ?').run(repository, JSON.stringify(needs), seq);
+}
+
+/** Records on each of the lane's resources the shared services it needs now, and the lane's repository, for its teardown to start. */
+export function followResourceNeeds(
+  db: DatabaseSync,
+  lane: { id: string; repository: string },
+  resources: readonly Pick<ResourceSpec, 'name' | 'needs'>[],
+): void {
+  for (const resource of resources) {
+    const row = db.prepare('SELECT seq FROM resources WHERE claim_id = ? AND name = ?').get(lane.id, resource.name);
+    if (row) followNeeds(db, int(row, 'seq'), lane.repository, resource.needs);
+  }
+}
+
 export function startResource(
   db: DatabaseSync,
   lane: { id: string; worktree: string; repository: string },
@@ -85,7 +101,10 @@ export function startResource(
     const held = holdOf(row, holders);
     if (held === 'held') throw busy(row, spec);
     const exports = optValues(row, 'exports');
-    if (exports !== null && held === 'free') return { kind: 'kept', exports, createdAt: int(row, 'created_at') };
+    if (exports !== null && held === 'free') {
+      followNeeds(db, int(row, 'seq'), lane.repository, spec.needs);
+      return { kind: 'kept', exports, createdAt: int(row, 'created_at') };
+    }
     db.prepare(
       `UPDATE resources SET cwd = ?, teardown = ?, timeout_ms = ?, env = ?, cleared = ?, repository = ?, needs = ?,
          exports = NULL, problem = NULL WHERE seq = ?`,
