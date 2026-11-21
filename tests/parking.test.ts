@@ -202,7 +202,7 @@ test('a parked lane keeps its ports and resource values exactly, and no teardown
   const w = world();
   try {
     const a = await w.registry().claim(w.request(w.procs.owner(), w.folder('a')));
-    const spec = { name: 'db', cwd: a.lane.worktree, teardown: 'drop-db', timeoutMs: 1000, env: {}, cleared: [] };
+    const spec = { name: 'db', cwd: a.lane.worktree, teardown: 'drop-db', timeoutMs: 1000, env: {}, cleared: [], needs: [] };
     const maker = w.registry();
     maker.startResource(refOf(a.lane), spec);
     maker.finishResource(a.lane.id, 'db', { DATABASE_URL: 'postgres://db/app_a' });

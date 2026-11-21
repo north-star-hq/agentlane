@@ -5,6 +5,7 @@ import { formatTime } from './format.ts';
 import { isProven, judgeProcess } from './owner.ts';
 import { Refusal } from './refusal.ts';
 import { names, optValues, values } from './rows.ts';
+import { markUnneeded } from './shared.ts';
 import type { Row } from './store.ts';
 import { int, optInt, optText, text } from './store.ts';
 import type { PendingTeardown, ResourceSpec, ResourceStart, ResourceTeardown, ResourceValues } from './types.ts';
@@ -73,7 +74,7 @@ function busy(row: Row, spec: ResourceSpec): Refusal {
 
 export function startResource(
   db: DatabaseSync,
-  lane: { id: string; worktree: string },
+  lane: { id: string; worktree: string; repository: string },
   spec: ResourceSpec,
   me: ProcessIdentity,
   holders: Holders,
@@ -86,15 +87,25 @@ export function startResource(
     const exports = optValues(row, 'exports');
     if (exports !== null && held === 'free') return { kind: 'kept', exports, createdAt: int(row, 'created_at') };
     db.prepare(
-      'UPDATE resources SET cwd = ?, teardown = ?, timeout_ms = ?, env = ?, cleared = ?, exports = NULL, problem = NULL WHERE seq = ?',
-    ).run(spec.cwd, spec.teardown, spec.timeoutMs, JSON.stringify(spec.env), JSON.stringify(spec.cleared), int(row, 'seq'));
+      `UPDATE resources SET cwd = ?, teardown = ?, timeout_ms = ?, env = ?, cleared = ?, repository = ?, needs = ?,
+         exports = NULL, problem = NULL WHERE seq = ?`,
+    ).run(
+      spec.cwd,
+      spec.teardown,
+      spec.timeoutMs,
+      JSON.stringify(spec.env),
+      JSON.stringify(spec.cleared),
+      lane.repository,
+      JSON.stringify(spec.needs),
+      int(row, 'seq'),
+    );
     hold(db, int(row, 'seq'), me, now);
     return { kind: 'create', retry: optText(row, 'problem') ?? 'its last create did not finish' };
   }
   db.prepare(
-    `INSERT INTO resources (claim_id, name, worktree, cwd, teardown, timeout_ms, env, cleared, created_at,
+    `INSERT INTO resources (claim_id, name, worktree, cwd, teardown, timeout_ms, env, cleared, repository, needs, created_at,
        holder_pid, holder_start, holder_since)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     lane.id,
     spec.name,
@@ -104,6 +115,8 @@ export function startResource(
     spec.timeoutMs,
     JSON.stringify(spec.env),
     JSON.stringify(spec.cleared),
+    lane.repository,
+    JSON.stringify(spec.needs),
     now,
     me.pid,
     me.start,
@@ -112,13 +125,46 @@ export function startResource(
   return { kind: 'create', retry: null };
 }
 
-export function finishResource(db: DatabaseSync, lane: string, name: string, exports: ResourceValues, me: ProcessIdentity): void {
+/** The shared services a resource row `me` holds needs, read before the row is let go, so they can be marked unneeded after. */
+function heldNeeds(
+  db: DatabaseSync,
+  lane: string,
+  name: string,
+  me: ProcessIdentity,
+): { repository: string; needs: string[] } | null {
+  const row = db.prepare(`SELECT repository, needs FROM resources WHERE ${MINE}`).get(lane, name, me.pid, me.start);
+  const repository = row ? optText(row, 'repository') : null;
+  return row && repository !== null ? { repository, needs: names(row, 'needs') } : null;
+}
+
+function letGo(db: DatabaseSync, held: { repository: string; needs: string[] } | null, now: number): void {
+  if (held) markUnneeded(db, held.repository, held.needs, now);
+}
+
+export function finishResource(
+  db: DatabaseSync,
+  lane: string,
+  name: string,
+  exports: ResourceValues,
+  me: ProcessIdentity,
+  now: number,
+): void {
+  const held = heldNeeds(db, lane, name, me);
   db.prepare(
     `UPDATE resources SET exports = ?, problem = NULL, holder_pid = NULL, holder_start = NULL, holder_since = NULL WHERE ${MINE}`,
   ).run(JSON.stringify(exports), lane, name, me.pid, me.start);
+  letGo(db, held, now);
 }
 
-export function failResource(db: DatabaseSync, lane: string, name: string, problem: string, me: ProcessIdentity): void {
+export function failResource(
+  db: DatabaseSync,
+  lane: string,
+  name: string,
+  problem: string,
+  me: ProcessIdentity,
+  now: number,
+): void {
+  const held = heldNeeds(db, lane, name, me);
   db.prepare(`UPDATE resources SET problem = ?, holder_pid = NULL, holder_start = NULL, holder_since = NULL WHERE ${MINE}`).run(
     problem,
     lane,
@@ -126,6 +172,7 @@ export function failResource(db: DatabaseSync, lane: string, name: string, probl
     me.pid,
     me.start,
   );
+  letGo(db, held, now);
 }
 
 export interface TeardownChoice {
@@ -154,11 +201,13 @@ export function takeTeardowns(
       lane: text(row, 'claim_id'),
       name: text(row, 'name'),
       worktree: text(row, 'worktree'),
+      repository: optText(row, 'repository'),
       cwd: text(row, 'cwd'),
       teardown: text(row, 'teardown'),
       timeoutMs: int(row, 'timeout_ms'),
       env: values(row, 'env'),
       cleared: names(row, 'cleared'),
+      needs: names(row, 'needs'),
       exports: optValues(row, 'exports'),
       createdAt: int(row, 'created_at'),
       attempts: int(row, 'attempts'),
@@ -167,8 +216,10 @@ export function takeTeardowns(
   return taken;
 }
 
-export function endTeardown(db: DatabaseSync, lane: string, name: string, me: ProcessIdentity): void {
+export function endTeardown(db: DatabaseSync, lane: string, name: string, me: ProcessIdentity, now: number): void {
+  const held = heldNeeds(db, lane, name, me);
   db.prepare(`DELETE FROM resources WHERE ${MINE}`).run(lane, name, me.pid, me.start);
+  letGo(db, held, now);
 }
 
 export function failTeardown(
@@ -179,10 +230,12 @@ export function failTeardown(
   me: ProcessIdentity,
   now: number,
 ): void {
+  const held = heldNeeds(db, lane, name, me);
   db.prepare(
     `UPDATE resources SET attempts = attempts + 1, last_attempt_at = ?, problem = ?,
        holder_pid = NULL, holder_start = NULL, holder_since = NULL WHERE ${MINE}`,
   ).run(now, problem, lane, name, me.pid, me.start);
+  letGo(db, held, now);
 }
 
 export function pendingTeardowns(db: DatabaseSync): PendingTeardown[] {

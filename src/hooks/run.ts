@@ -51,26 +51,30 @@ function runShell(
   env: NodeJS.ProcessEnv,
   out: number,
   timeoutMs: number | undefined,
+  beforeRun: ((pid: number) => void) | undefined,
 ): Promise<CommandResult> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawn('/bin/sh', ['-c', command], {
+    const child = spawn('/bin/sh', ['-c', beforeRun ? `read -r _ || exit 125\n${command}` : command], {
       cwd,
       env,
-      stdio: ['ignore', out, out],
+      stdio: [beforeRun ? 'pipe' : 'ignore', out, out],
       detached: timeoutMs !== undefined,
     });
     let timedOut = false;
+    const killAll = () => {
+      try {
+        process.kill(-(child.pid ?? 0), 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
     const timer =
       timeoutMs === undefined
         ? undefined
         : setTimeout(() => {
             timedOut = true;
-            try {
-              process.kill(-(child.pid ?? 0), 'SIGKILL');
-            } catch {
-              child.kill('SIGKILL');
-            }
+            killAll();
           }, timeoutMs);
     child.once('error', error => {
       clearTimeout(timer);
@@ -80,20 +84,41 @@ function runShell(
       clearTimeout(timer);
       resolve({ code, signal, ms: Date.now() - started, ...(timedOut ? { timedOut } : {}) });
     });
+    if (!beforeRun || child.pid === undefined) return;
+    child.stdin?.on('error', () => undefined);
+    try {
+      beforeRun(child.pid);
+    } catch (error) {
+      clearTimeout(timer);
+      killAll();
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    child.stdin?.end('\n');
   });
 }
 
 export async function runHook(
   hook: string,
   command: string,
-  options: { cwd: string; env: NodeJS.ProcessEnv; log: string; timeoutMs?: number },
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    log: string;
+    timeoutMs?: number;
+    /**
+     * Called with the shell's pid before the command runs. The command runs once it returns, and never when it throws
+     * or this process dies first. With a timeout, the shell leads a process group of its own.
+     */
+    beforeRun?: (pid: number) => void;
+  },
 ): Promise<HookRun> {
   fs.mkdirSync(path.dirname(options.log), { recursive: true });
   fs.appendFileSync(options.log, `--- ${new Date().toISOString()} ${hook}: ${command}\n`);
   const fd = fs.openSync(options.log, 'a');
   let result: CommandResult;
   try {
-    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs);
+    result = await runShell(command, options.cwd, options.env, fd, options.timeoutMs, options.beforeRun);
   } finally {
     fs.closeSync(fd);
   }
@@ -118,11 +143,22 @@ export function runCheck(
 ): Promise<CheckOutcome> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawn('/bin/sh', ['-c', command], { cwd: options.cwd, env: options.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('/bin/sh', ['-c', command], {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
+    });
     const chunks: Buffer[] = [];
     child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on('data', (chunk: Buffer) => chunks.push(chunk));
-    const timer = setTimeout(() => child.kill('SIGKILL'), options.timeoutMs ?? 30_000);
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-(child.pid ?? 0), 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    }, options.timeoutMs ?? 30_000);
     child.once('error', error => {
       clearTimeout(timer);
       reject(error);

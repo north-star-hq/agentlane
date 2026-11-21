@@ -14,7 +14,16 @@ const NO_DEVICE = { device: null, services: [] } as const;
 const SCHEMA_0_1_3 = fs.readFileSync(path.join(import.meta.dirname, '..', 'fixtures', 'registry-0.1.3.sql'), 'utf8');
 
 function spec(over: Partial<ResourceSpec> = {}): ResourceSpec {
-  return { name: 'db', cwd: '/repo', teardown: 'drop-db', timeoutMs: 1000, env: {}, cleared: ['DATABASE_URL'], ...over };
+  return {
+    name: 'db',
+    cwd: '/repo',
+    teardown: 'drop-db',
+    timeoutMs: 1000,
+    env: {},
+    cleared: ['DATABASE_URL'],
+    needs: [],
+    ...over,
+  };
 }
 
 async function claimed(w: World, folder = 'wt'): Promise<Lane> {

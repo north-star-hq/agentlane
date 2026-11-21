@@ -46,6 +46,9 @@ Options:
 
 const GROUPS: readonly UsageGroup<string>[] = [REGISTRY_HELP, UP_HELP, DRIVER_HELP, HOOK_HELP, AGENT_HELP, BENCH_HELP];
 
+/** The commands that don't pass by the sweep first: those that run it, those that pass by later, and `schema`, which never opens the state folder. */
+const WITHOUT_PASS_BY: ReadonlySet<string> = new Set(['hook', SWEEP_COMMAND, 'reap', 'schema']);
+
 function commandHelp(command: string): string | null {
   for (const group of GROUPS) {
     const text = helpOf(group, command);
@@ -96,7 +99,7 @@ async function main(args: string[]): Promise<number> {
   const passingBy = () => {
     passBy({ dir: state }, startSweep);
   };
-  if (command !== 'hook' && command !== SWEEP_COMMAND && command !== 'reap') passingBy();
+  if (!WITHOUT_PASS_BY.has(command)) passingBy();
   const mac = process.platform === 'darwin';
   const android = createEmulatorBackend({ env: process.env, logDir: path.join(state, 'emulators') });
   const devices = mac ? { ios: simctlBackend, android } : { android };

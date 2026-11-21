@@ -103,7 +103,7 @@ export const projectSchema = {
     },
     shared: {
       type: 'object',
-      description: `The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in \`needs\`. ${TOOL} starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one.`,
+      description: `The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in \`needs\`. ${TOOL} starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one. A shared service whose start failed may be partly up, so it counts as running and stops under the same rule. A stop runs the commands, with the PATH and the variables that choose a container tool's daemon and project, as they were at the shared service's last start, so a change to them counts from its next start.`,
       propertyNames: { pattern: SERVICE_NAME_PATTERN },
       additionalProperties: { $ref: '#/$defs/shared' },
     },
@@ -241,7 +241,7 @@ export const projectSchema = {
           type: 'string',
           minLength: 1,
           description:
-            'A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped.',
+            'A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped, or only partly started.',
         },
         ready: {
           type: 'string',
@@ -253,7 +253,8 @@ export const projectSchema = {
           type: 'number',
           exclusiveMinimum: 0,
           default: DEFAULT_SHARED_SECONDS,
-          description: 'How long start may run, and then how long ready may take to pass, before the start counts as failed.',
+          description:
+            'How long start may run, and then how long ready may take to pass, before the start counts as failed; and how long stop may run before it counts as failed.',
         },
       },
     },

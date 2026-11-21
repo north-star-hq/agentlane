@@ -138,6 +138,26 @@ export function environmentOf(pid: number): string | undefined {
   return result.status === 0 ? result.stdout : undefined;
 }
 
+/** Whether any process is left in process group `pgid`, by a signal 0 to the group. */
+export function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Sends SIGKILL to every process of group `pgid`; false when none was left. */
+export function killGroup(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 'SIGKILL');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function identityOf(table: ProcessTable, pid: number): ProcessIdentity | undefined {
   const start = table.startTimes([pid])?.get(pid);
   return start === undefined ? undefined : { pid, start };

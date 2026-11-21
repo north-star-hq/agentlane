@@ -66,7 +66,7 @@ const scenarios: Record<RefusalCode, Scenario> = {
     const owner = w.procs.owner();
     const held = await w.registry().claim(w.request(owner, w.folder('holder'), NO_DEVICE));
     const ref = { id: held.lane.id, token: held.lane.token };
-    const spec = { name: 'db', cwd: held.lane.worktree, teardown: 'true', timeoutMs: 1000, env: {}, cleared: [] };
+    const spec = { name: 'db', cwd: held.lane.worktree, teardown: 'true', timeoutMs: 1000, env: {}, cleared: [], needs: [] };
     w.registry().startResource(ref, spec);
     const refusal = await refusalOf(() => w.registry().startResource(ref, spec));
     return { refusal, holderFolder: held.lane.worktree };
