@@ -147,6 +147,7 @@ async function answers(commands: SharedCommands, place: Place, budgetMs: number)
       cwd: place.cwd,
       env: place.env,
       timeoutMs: Math.min(budgetMs, SHARED_READY_RUN_MAX_MS),
+      ownGroup: true,
     });
     return { ok: run.code === 0, output: run.output };
   } catch (error) {
