@@ -74,7 +74,11 @@ function busy(row: Row, spec: ResourceSpec): Refusal {
 
 function addNeeds(db: DatabaseSync, row: Row, repository: string, needs: readonly string[]): void {
   const kept = [...new Set([...needs, ...names(row, 'needs')])];
-  db.prepare('UPDATE resources SET repository = ?, needs = ? WHERE seq = ?').run(repository, JSON.stringify(kept), int(row, 'seq'));
+  db.prepare('UPDATE resources SET repository = ?, needs = ? WHERE seq = ?').run(
+    repository,
+    JSON.stringify(kept),
+    int(row, 'seq'),
+  );
 }
 
 /**
