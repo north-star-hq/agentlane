@@ -32,14 +32,18 @@ The site builds the tool sections below from the server's own tool definitions.
 
 `init` adds the server under the name `agentlane` to each agent's own config:
 
-| Agent          | File                      |
-| -------------- | ------------------------- |
-| Claude Code    | `.mcp.json`               |
-| Codex          | `.codex/config.toml`      |
-| Cursor         | `.cursor/mcp.json`        |
-| GitHub Copilot | `.mcp.json`               |
-| Gemini CLI     | `.gemini/settings.json`   |
-| Antigravity    | `.agents/mcp_config.json` |
+| Agent          | File                      | Time limit on one call                                 |
+| -------------- | ------------------------- | ------------------------------------------------------ |
+| Claude Code    | `.mcp.json`               | `"timeout": 1800000` only in place of a shorter one you set; Claude Code's own is about 28 hours |
+| Codex          | `.codex/config.toml`      | `tool_timeout_sec = 1800`                              |
+| Cursor         | `.cursor/mcp.json`        | none; Cursor has no setting for it                     |
+| GitHub Copilot | `.mcp.json`               | `"timeout": 1800000`                                   |
+| Gemini CLI     | `.gemini/settings.json`   | `"timeout": 1800000`                                   |
+| Antigravity    | `.agents/mcp_config.json` | `"timeoutSeconds": 1800`                               |
+
+Each agent stops an MCP call that runs past its own limit: 60 seconds in Codex, 30 in GitHub Copilot, 3 minutes in Antigravity and 10 in Gemini CLI. A first `look` or `screenshot` on a fresh iOS simulator can take several minutes, and the server waits up to 28 minutes for a `run`, so `init` sets each of those limits to 30 minutes. It raises a shorter value, and keeps a longer one or Antigravity's `-1`, which turns its limits off. In GitHub Copilot, Gemini CLI and Antigravity the same value also limits how long the server has to start, and 30 minutes is longer than each one's default. Where Copilot is wired too, Claude Code reads the same 30 minutes from `.mcp.json`. `doctor` warns when an entry has no limit or a shorter one, and names the file, the key and the value it needs.
+
+The Cursor app documents no limit on an MCP call. Cursor's CLI and `agent acp` stop one after 60 seconds, and a project can't change that, so there a first call on a fresh iOS simulator can fail before the server answers.
 
 Each entry runs a short `sh` script that looks for `node_modules/.bin/agentlane` from the project folder upwards and runs its `mcp` command, so the tools always come from the version the project installed. Without agentlane installed, the server exits with a message that says to add it:
 

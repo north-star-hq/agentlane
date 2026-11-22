@@ -78,7 +78,7 @@ A lane brought up with `up --no-app` gets the `config`, wiring, `lane`, hook loc
 A `warn` line doesn't fail `doctor`. It flags something to fix soon:
 
 - a project with no agent wired at all, with the `init` command that wires them;
-- wiring that has gone stale, such as stubs or hooks an older version wrote;
+- wiring that has gone stale, such as stubs or hooks an older version wrote, or an MCP server entry with no time limit or one shorter than agentlane's calls, named with the key and the value it needs;
 - Claude Code's skills or MCP server wired twice, by the plugin and by the project's own files;
 - a project that enables the Claude Code plugin when Claude Code hasn't installed it on this machine;
 - `parked`: the lane is parked, with what its next call brings back. `doctor` skips the device and service checks then, and any call on the lane, such as `look`, `exec` or `up`, brings it back first.
