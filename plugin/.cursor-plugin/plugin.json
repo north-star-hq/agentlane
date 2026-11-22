@@ -5,5 +5,5 @@
     "name": "North Star"
   },
   "skills": "skills/",
-  "mcpServers": ".mcp.json"
+  "mcpServers": "mcp.json"
 }
