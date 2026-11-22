@@ -113,6 +113,18 @@ test('a first look that times out on two fresh Maestros says the driver tried on
     assert.equal(world.spawns().length, 2);
   }));
 
+test("a look whose runner never starts tells the agent what works, not Maestro's advice the driver overrides", () =>
+  withWorld({ env: { FAKE_NOT_READY_TIMES: '2' } }, async world => {
+    const response = await callEngine(world.target(), { op: 'look', args: {} });
+    assert.equal(response.ok, false);
+    assert.equal(response.sessionFailure?.kind, 'timeout');
+    assert.doesNotMatch(response.error ?? '', /MAESTRO_DRIVER_STARTUP_TIMEOUT/);
+    assert.match(
+      response.error ?? '',
+      /^Maestro's session failed \(timeout\) and failed again when the driver tried once more: .*\. The next call starts a fresh Maestro and XCTest runner\. The driver's log: /,
+    );
+  }));
+
 test("when the XCTest runner dies, Maestro's whole process group goes, and the next call starts fresh", () =>
   withWorld({}, async world => {
     assert.equal((await callEngine(world.target(), { op: 'look', args: {} })).ok, true);

@@ -313,7 +313,7 @@ export class DriverSession {
       if (!(error instanceof SessionFailure)) throw error;
       return {
         ok: false,
-        error: `Maestro's session failed during the run and the flow was not sent again (${error.kind}): ${error.message}`,
+        error: `Maestro's session failed during the run and the flow was not sent again (${error.kind}): ${error.detail}`,
       };
     }
   }

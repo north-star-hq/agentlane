@@ -128,7 +128,7 @@ const ACTIONS: Record<ToolOp, string> = {
 
 function sessionFailureText(error: SessionFailure): string {
   const again = error.attempts.length > 1 ? ' and failed again when the driver tried once more' : '';
-  return `Maestro's session failed (${error.kind})${again}: ${error.message}`;
+  return `Maestro's session failed (${error.kind})${again}: ${error.detail}`;
 }
 
 /**

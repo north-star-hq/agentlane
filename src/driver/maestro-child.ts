@@ -66,14 +66,16 @@ export const RUNNER_TOKEN_ENV = 'MAESTRO_RUNNER_TOKEN';
 
 /**
  * How long Maestro polls a fresh XCTest runner before it gives up, which Maestro reads from
- * MAESTRO_DRIVER_STARTUP_TIMEOUT (milliseconds). 120 s is Maestro's own default (SERVER_LAUNCH_TIMEOUT_MS).
+ * MAESTRO_DRIVER_STARTUP_TIMEOUT (milliseconds). 120 s is Maestro's own iOS default (SERVER_LAUNCH_TIMEOUT_MS). Maestro's
+ * Android driver reads the same variable for its own startup loops, with a 15 s default.
  */
 export const RUNNER_STARTUP_MS = 120_000;
 export const INITIALIZE_TIMEOUT_MS = 60_000;
 
 /**
  * The environment Maestro runs in: JDK 17 first on PATH, the lane's runner token, and for a simulator an `adb` that
- * fails fast ahead of any real one; for an emulator, the SDK's own adb, emulator and avdmanager instead.
+ * fails fast ahead of any real one and the runner's startup time; for an emulator, the SDK's own adb, emulator and
+ * avdmanager instead.
  */
 export function maestroEnv(
   options: Pick<MaestroChildOptions, 'javaHome' | 'env' | 'token' | 'androidSdk'>,
@@ -95,9 +97,8 @@ export function maestroEnv(
     PATH: [...head, options.env.PATH ?? '/usr/bin:/bin'].join(path.delimiter),
     MAESTRO_CLI_NO_ANALYTICS: '1',
     MAESTRO_DISABLE_UPDATE_CHECK: 'true',
-    MAESTRO_DRIVER_STARTUP_TIMEOUT: String(RUNNER_STARTUP_MS),
     [RUNNER_TOKEN_ENV]: options.token,
-    ...(sdk ? { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } : {}),
+    ...(sdk ? { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } : { MAESTRO_DRIVER_STARTUP_TIMEOUT: String(RUNNER_STARTUP_MS) }),
   };
   env.MAESTRO_OPTS = [options.env.MAESTRO_OPTS, `-Djava.io.tmpdir=${tempDir}`].filter(Boolean).join(' ');
   return env;

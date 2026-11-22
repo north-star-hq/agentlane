@@ -19,11 +19,19 @@ export class SessionFailure extends Error {
   override name = 'SessionFailure';
   readonly kind: SessionFailureKind;
   readonly attempts: string[];
+  /** What the caller can do next, when the failure has a known way forward. */
+  readonly advice: string | undefined;
 
-  constructor(kind: SessionFailureKind, attempts: string[]) {
+  constructor(kind: SessionFailureKind, attempts: string[], advice?: string) {
     super(attempts.join('; then '));
     this.kind = kind;
     this.attempts = attempts;
+    this.advice = advice;
+  }
+
+  /** The attempts, then the advice when there is any. */
+  get detail(): string {
+    return this.advice === undefined ? this.message : `${this.message}. ${this.advice}`;
   }
 }
 
@@ -38,12 +46,15 @@ export interface SupervisorOptions extends Omit<MaestroChildOptions, 'log'> {
   runnerWatchMs?: number;
   rows?: () => Promise<ProcessRow[]>;
   timeouts?: Partial<Record<string, number>>;
-  /** What the first call on a fresh Maestro gets on top of its tool's limit, for the XCTest runner to start. */
+  /** What the first call on a fresh Maestro gets on top of its tool's limit on iOS, for the XCTest runner to start. */
   runnerStartupMs?: number;
 }
 
 export interface CallOptions {
-  /** Whether the call may be sent again after Maestro died or timed out under it (reads and screenshots; never a flow). */
+  /**
+   * Whether the call may be sent again on a fresh Maestro (reads and screenshots; never a flow): after Maestro died
+   * under it, lost the device, or, on iOS, timed out on the first call that waited for the XCTest runner.
+   */
   retry: boolean;
 }
 
@@ -63,18 +74,25 @@ export function warmCallMs(name: string): number {
 }
 
 /**
- * The longest a call can take before it answers or fails: Maestro's start and a first call that waits for the runner,
- * twice when a timed-out call is retried on a fresh Maestro.
+ * The longest an iOS call can take before it answers or fails: Maestro's start and a first call that waits for the
+ * XCTest runner, twice when a timed-out call is retried on a fresh Maestro.
  */
-export function longestCallMs(name: string, options: CallOptions): number {
+export function longestIosCallMs(name: string, options: CallOptions): number {
   const once = INITIALIZE_TIMEOUT_MS + warmCallMs(name) + RUNNER_STARTUP_MS;
   return options.retry ? 2 * once : once;
 }
 
 // Maestro reports a device it lost this way, and a fresh session reaches it again.
 const UNREACHABLE = /Device became unreachable/i;
-// Maestro's LocalXCTestInstaller.start() throws this when the runner hasn't answered within MAESTRO_DRIVER_STARTUP_TIMEOUT.
+// Maestro's LocalXCTestInstaller.start() throws this, with advice to raise MAESTRO_DRIVER_STARTUP_TIMEOUT, when the
+// runner hasn't answered within that time.
 const RUNNER_NOT_READY = /iOS driver not ready in time/i;
+const MAESTRO_STARTUP_ADVICE = /,?\s*consider increasing timeout by configuring MAESTRO_DRIVER_STARTUP_TIMEOUT env variable/i;
+const RUNNER_NOT_READY_ADVICE = 'The next call starts a fresh Maestro and XCTest runner';
+
+function runnerNotReady(text: string): string {
+  return `${text.replace(MAESTRO_STARTUP_ADVICE, '')} (the XCTest runner didn't answer within ${String(RUNNER_STARTUP_MS / 1000)} s)`;
+}
 // Maestro's MCP server says this when it opens a session for a device adb doesn't list at that moment. An emulator's
 // adb transport drops now and then; the next call rebuilds the session (patch 0002) and reinstalls the driver.
 const NOT_CONNECTED = /Device with id \S+ is not connected/i;
@@ -219,8 +237,8 @@ export class Supervisor {
         }
         throw new SessionFailure('start-failed', attempts);
       }
-      const first = child !== this.answered;
-      const timeoutMs = first ? limitMs + (this.options.runnerStartupMs ?? RUNNER_STARTUP_MS) : limitMs;
+      const waitsForRunner = this.options.platform === 'ios' && child !== this.answered;
+      const timeoutMs = waitsForRunner ? limitMs + (this.options.runnerStartupMs ?? RUNNER_STARTUP_MS) : limitMs;
       let result: ToolResult;
       try {
         result = await child.callTool(name, { ...args, device_id: this.options.deviceId }, timeoutMs);
@@ -228,7 +246,7 @@ export class Supervisor {
         if (error instanceof CallTimeout) {
           attempts.push(error.message);
           await this.restart(error.message);
-          if (first && options.retry && attempt === 0 && !this.stopping) {
+          if (waitsForRunner && options.retry && attempt === 0 && !this.stopping) {
             respawned = true;
             continue;
           }
@@ -245,14 +263,14 @@ export class Supervisor {
         }
         throw error;
       }
-      if (result.isError && first && RUNNER_NOT_READY.test(textOf(result))) {
-        attempts.push(textOf(result));
+      if (result.isError && waitsForRunner && RUNNER_NOT_READY.test(textOf(result))) {
+        attempts.push(runnerNotReady(textOf(result)));
         await this.restart(textOf(result));
         if (options.retry && attempt === 0 && !this.stopping) {
           respawned = true;
           continue;
         }
-        throw new SessionFailure('timeout', attempts);
+        throw new SessionFailure('timeout', attempts, RUNNER_NOT_READY_ADVICE);
       }
       if (result.isError && NOT_CONNECTED.test(textOf(result))) {
         attempts.push(textOf(result));
@@ -277,8 +295,8 @@ export class Supervisor {
         this.log(`first ${name} on this Maestro answered ${String(Date.now() - this.startedAt)} ms after it was spawned`);
         this.startedAt = undefined;
       }
-      this.answered = child;
       await this.adoptRunner();
+      if (!result.isError || this.runnerPid !== undefined) this.answered = child;
       return { result, respawned };
     }
     throw new SessionFailure('session-died', attempts);

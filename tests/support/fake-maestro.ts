@@ -48,6 +48,7 @@ const unreachableAfter = env.FAKE_UNREACHABLE_AFTER === undefined ? Infinity : N
 const notConnectedOn = env.FAKE_NOT_CONNECTED_ON === undefined ? -1 : Number(env.FAKE_NOT_CONNECTED_ON);
 const delays = JSON.parse(env.FAKE_DELAYS ?? '[]') as number[];
 const notReadyTimes = Number(env.FAKE_NOT_READY_TIMES ?? '0');
+const errorOn = env.FAKE_ERROR_ON === undefined ? -1 : Number(env.FAKE_ERROR_ON);
 const JPEG =
   '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==';
 let calls = 0;
@@ -147,6 +148,13 @@ input.on('line', line => {
       const why =
         'iOS driver not ready in time, consider increasing timeout by configuring MAESTRO_DRIVER_STARTUP_TIMEOUT env variable';
       send({ id: message.id, result: text(`Failed to inspect screen: ${why}`, true) });
+      return;
+    }
+    if (calls === errorOn) {
+      send({
+        id: message.id,
+        result: text('Failed to inspect screen: xcodebuild exited with code 65 before the runner started', true),
+      });
       return;
     }
     if (name === 'inspect_screen') {
