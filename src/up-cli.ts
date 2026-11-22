@@ -158,22 +158,29 @@ async function runUp(args: string[], deps: EnvDeps, stdout: (text: string) => vo
       'no-setup': { type: 'boolean', default: false },
       'no-cache': { type: 'boolean', default: false },
       'refresh-cache': { type: 'boolean', default: false },
-      timeout: { type: 'string', default: '600' },
+      timeout: { type: 'string' },
       worktree: { type: 'string' },
       platform: { type: 'string' },
       json: { type: 'boolean', default: false },
     },
   });
   const platform = parsePlatform(values.platform);
-  if (values['no-app'] && platform !== undefined) {
-    throw new UsageError('--no-app and --platform are exclusive', 'pass one of them');
+  if (values['no-app']) {
+    const given: [string, boolean][] = [
+      ['--platform', platform !== undefined],
+      ['--no-cache', values['no-cache']],
+      ['--refresh-cache', values['refresh-cache']],
+      ['--timeout', values.timeout !== undefined],
+    ];
+    const clash = given.find(([, on]) => on)?.[0];
+    if (clash) throw new UsageError(`--no-app and ${clash} are exclusive`, 'pass one of them');
   }
   const result = await up(deps, {
     platform,
     app: !values['no-app'],
     setup: !values['no-setup'],
     cacheMode: cacheMode(values['no-cache'], values['refresh-cache']),
-    waitMs: parseSeconds(values.timeout, '--timeout'),
+    waitMs: parseSeconds(values.timeout ?? '600', '--timeout'),
     worktree: values.worktree,
   });
   if (values.json) {

@@ -221,7 +221,7 @@ test('up --no-app runs preflight, setup, the shared service the resource needs a
   );
 });
 
-test('up --no-app prints the exports of the lane and its resource, and refuses --platform', async t => {
+test('up --no-app prints the exports of the lane and its resource, and refuses --platform and the build and queue flags', async t => {
   const w = world(t);
   const d = db(w);
   w.write(dataConfig(d));
@@ -242,9 +242,11 @@ test('up --no-app prints the exports of the lane and its resource, and refuses -
   );
   assert.match(w.lines.join('\n'), /^ready$/m);
 
-  w.lines.length = 0;
-  assert.equal(await runUpCommand('up', ['--no-app', '--platform', 'ios'], w.deps(), () => undefined), 2);
-  assert.match(w.lines.join('\n'), /--no-app and --platform are exclusive/);
+  for (const flags of [['--platform', 'ios'], ['--no-cache'], ['--refresh-cache'], ['--timeout', '600'], ['--timeout=5']]) {
+    w.lines.length = 0;
+    assert.equal(await runUpCommand('up', ['--no-app', ...flags], w.deps(), () => undefined), 2, flags.join(' '));
+    assert.match(w.lines.join('\n'), new RegExp(`--no-app and ${flags[0]?.split('=')[0] ?? ''} are exclusive`));
+  }
   holdsNothing(only(w));
 });
 
