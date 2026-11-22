@@ -40,6 +40,7 @@ The server a project's lane databases live in can now be declared under `shared`
 - **`restart` starts any shared service the lane needs that isn't running**, before it stops the service, so a failed shared start leaves the running service alone.
 - **The guard hooks start Node for commands that name `docker` or `podman`**, as they do for device and browser tools. `setsid` now passes through like `nohup`, so `setsid <device command>` gets the device check.
 - **`up`'s claim step** reads `claimed lane <id>: no device, browser or port` for a lane that holds none, and a lane with no ports no longer ends the line with a stray comma.
+- **The README, the docs home and the package description now open on the problem agentlane solves**, coding agents on one machine fighting over ports, simulators and databases.
 
 ### Fixed
 

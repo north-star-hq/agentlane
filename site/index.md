@@ -11,7 +11,7 @@ badge:
 headline: Stop your coding agents fighting over ports, simulators and databases.
 marked: fighting
 sentence: The fast, light way to run a copy of your app for every agent, with tools to see it and drive it, all at the same time.
-figure: '**Reads the screen 50x faster** than stock Maestro on two simulators.'
+figure: '**Reads the screen 50x faster** than stock Maestro.'
 buttons:
   - label: Get started
     href: docs/getting-started.html
@@ -73,7 +73,7 @@ about:
       takes you from one command to a ready lane.
 speed:
   - value: 0.15 s
-    label: to read an iOS screen on a warm lane
+    label: to read an iOS screen
   - value: 0.16 s
     label: to read a page in the lane's browser
   - value: 6.5 s
