@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { androidToolchain, CacheKeyError, xcodeVersion } from '../cache/key.ts';
 import type { DeviceBackend, DeviceSpec } from '../devices/backend.ts';
 import { findAndroidSdk } from '../devices/emulator.ts';
+import { SimctlTimeout } from '../devices/simctl.ts';
 import { registeredJdk17 } from '../driver/install.ts';
 import { HOOK_LOCALE, JAVA_HOME_ENV } from '../hooks/env.ts';
 import { runCheck } from '../hooks/run.ts';
@@ -215,9 +216,11 @@ export async function toolchainFindings(config: ProjectConfig, deps: PreflightDe
         const fix =
           error instanceof UsageError
             ? error.fix
-            : android
-              ? 'install a system image: sdkmanager "system-images;android-36;google_apis;arm64-v8a"'
-              : 'install an iOS simulator runtime: xcodebuild -downloadPlatform iOS';
+            : error instanceof SimctlTimeout
+              ? "run 'xcrun simctl list runtimes' to see whether simctl answers, then try again"
+              : android
+                ? 'install a system image: sdkmanager "system-images;android-36;google_apis;arm64-v8a"'
+                : 'install an iOS simulator runtime: xcodebuild -downloadPlatform iOS';
         return Promise.resolve({ name: runtimeName, ok: false, detail: message(error), fix });
       }
     },

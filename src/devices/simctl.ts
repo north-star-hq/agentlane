@@ -33,7 +33,24 @@ interface SimDevice {
 const UDID = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/;
 const execFileAsync = promisify(execFile);
 
-function simctl(args: string[], timeoutMs = 60_000): string {
+// On a GitHub macos-26 runner, listing the runtimes in up's preflight took longer than 60 s (run 44985632277).
+const RUNTIMES_TIMEOUT_MS = 180_000;
+
+export class SimctlTimeout extends DeviceBackendError {
+  constructor(args: readonly string[], timeoutMs: number) {
+    super(`xcrun simctl ${args.join(' ')} didn't finish within ${String(Math.round(timeoutMs / 1000))} s`);
+    this.name = 'SimctlTimeout';
+  }
+}
+
+function failure(args: readonly string[], error: unknown, timeoutMs: number, timedOut: boolean): DeviceBackendError {
+  if (timedOut) return new SimctlTimeout(args, timeoutMs);
+  const e = error as Error & { stderr?: string };
+  const stderr = e.stderr?.trim() ?? '';
+  return new DeviceBackendError(`xcrun simctl ${args.join(' ')} failed: ${stderr === '' ? e.message.trim() : stderr}`);
+}
+
+export function simctl(args: string[], timeoutMs = 60_000): string {
   try {
     return execFileSync('xcrun', ['simctl', ...args], {
       encoding: 'utf8',
@@ -41,14 +58,14 @@ function simctl(args: string[], timeoutMs = 60_000): string {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (error) {
-    const e = error as NodeJS.ErrnoException & { stderr?: string };
+    const e = error as NodeJS.ErrnoException;
     if (e.code === 'ENOENT') {
       throw new UsageError(
         'xcrun is not on PATH, so iOS simulators are unavailable',
         'install Xcode, or claim without a device (--no-device)',
       );
     }
-    throw new DeviceBackendError(`xcrun simctl ${args.join(' ')} failed: ${(e.stderr ?? e.message).trim()}`);
+    throw failure(args, error, timeoutMs, e.code === 'ETIMEDOUT');
   }
 }
 
@@ -132,7 +149,7 @@ export const simctlBackend: DeviceBackend = {
   platform: 'ios',
 
   resolveSpec(request) {
-    const parsed = JSON.parse(simctl(['list', '-j', 'runtimes'])) as { runtimes?: SimRuntime[] };
+    const parsed = JSON.parse(simctl(['list', '-j', 'runtimes'], RUNTIMES_TIMEOUT_MS)) as { runtimes?: SimRuntime[] };
     return resolveSimSpec(parsed.runtimes ?? [], request);
   },
 
@@ -163,11 +180,12 @@ export const simctlBackend: DeviceBackend = {
   },
 
   async boot(id) {
+    const args = ['bootstatus', id, '-b'];
+    const timeoutMs = 300_000;
     try {
-      await execFileAsync('xcrun', ['simctl', 'bootstatus', id, '-b'], { timeout: 300_000 });
+      await execFileAsync('xcrun', ['simctl', ...args], { timeout: timeoutMs });
     } catch (error) {
-      const e = error as Error & { stderr?: string };
-      throw new DeviceBackendError(`xcrun simctl bootstatus ${id} -b failed: ${(e.stderr ?? e.message).trim()}`);
+      throw failure(args, error, timeoutMs, (error as { killed?: boolean }).killed === true);
     }
   },
 };
