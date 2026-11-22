@@ -5,7 +5,7 @@ import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { buildSite, pageMarkdown } from '../site/build/build.ts';
 import { checkSite } from '../site/build/check.ts';
-import { loadLanding, loadSections, SITE } from '../site/build/content.ts';
+import { loadLanding, loadSections, SITE, type Landing } from '../site/build/content.ts';
 import { checkFacts, undocumentedVariables } from '../site/build/facts.ts';
 import { expandGenerated, referenceGaps } from '../site/build/reference.ts';
 import { MAESTRO_RELEASE } from '../src/driver/release.ts';
@@ -54,12 +54,18 @@ describe('the docs site', () => {
     assert.ok(home.includes(`<title>${landing.title}: ${landing.problem}</title>`));
   });
 
-  test("titles each docs page with its own name first, then the problem the home's title names", () => {
+  test('titles each docs page with its own name, then the name of the site', () => {
     const landing = loadLanding();
     for (const page of loadSections().flatMap(s => s.pages)) {
       const html = fs.readFileSync(path.join(out, 'docs', `${page.slug}.html`), 'utf8');
-      assert.ok(html.includes(`<title>${page.title} | ${landing.title}: ${landing.problem}</title>`), page.slug);
+      assert.ok(html.includes(`<title>${page.title} | ${landing.title}</title>`), page.slug);
     }
+  });
+
+  test('gives a heading with an apostrophe an id without one', () => {
+    const lanes = fs.readFileSync(path.join(out, 'docs', 'lanes.html'), 'utf8');
+    assert.ok(lanes.includes('id="whats-in-a-lane"'));
+    for (const page of pages) assert.ok(!fs.readFileSync(path.join(out, page), 'utf8').includes('-39-'), page);
   });
 
   test('names a page by its label in the sidebar, the pager and the docs list, and by its title in its h1 and <title>', () => {
@@ -239,7 +245,7 @@ describe('the docs site', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
-    function load(edit: (text: string) => string): () => unknown {
+    function load(edit: (text: string) => string): () => Landing {
       const file = path.join(dir, 'index.md');
       fs.writeFileSync(file, edit(fs.readFileSync(path.join(SITE, 'index.md'), 'utf8')));
       return () => loadLanding(file);
@@ -249,6 +255,63 @@ describe('the docs site', () => {
       assert.throws(
         load(t => t.replace('marked: fighting', 'marked: racing')),
         /marked is "racing", which the headline before its full stop doesn't contain/,
+      );
+    });
+
+    test('marks a whole word of the headline', () => {
+      const landing = load(t => t.replace('marked: fighting', 'marked: coding'))();
+      assert.deepEqual(landing.marked, {
+        before: 'Stop your ',
+        text: 'coding',
+        after: ' agents fighting over ports, simulators and databases',
+      });
+    });
+
+    test('rejects a marked word that is only part of a word in the headline', () => {
+      assert.throws(
+        load(t => t.replace('marked: fighting', 'marked: fight')),
+        /marked is "fight", which the headline before its full stop doesn't contain/,
+      );
+      assert.throws(
+        load(t =>
+          t.replace('headline: Stop your coding', 'headline: Stop your cafe\u0301').replace('marked: fighting', 'marked: cafe'),
+        ),
+        /marked is "cafe", which the headline before its full stop doesn't contain/,
+      );
+      assert.throws(
+        load(t =>
+          t.replace('headline: Stop your coding', 'headline: Stop your foo_bar').replace('marked: fighting', 'marked: foo'),
+        ),
+        /marked is "foo", which the headline before its full stop doesn't contain/,
+      );
+    });
+
+    test('names the file when the front matter is not a set of fields', () => {
+      assert.throws(
+        load(t => t.replace(/^---\n[\s\S]*?\n---\n/, '---\nhello\n---\n')),
+        /index\.md: front matter needs fields/,
+      );
+      assert.throws(
+        load(t => t.replace(/^---\n[\s\S]*?\n---\n/, '---\n\n---\n')),
+        /index\.md: front matter needs fields/,
+      );
+    });
+
+    test('names a key the build does not read', () => {
+      assert.throws(
+        load(t => t.replace('    primary: true', '    primay: true')),
+        /index\.md: front matter has buttons\[0\]\.primay, which the build doesn't read/,
+      );
+      assert.throws(
+        load(t => t.replace('headline:', 'headlin:')),
+        /index\.md: front matter has headlin, which the build doesn't read/,
+      );
+    });
+
+    test('rejects an install step with both a command and a prompt', () => {
+      assert.throws(
+        load(t => t.replace('    command: npx agentlane init\n', '    command: npx agentlane init\n    prompt: Set it up.\n')),
+        /index\.md: front matter needs install\[0\] to have a command or a prompt, not both/,
       );
     });
 
@@ -292,6 +355,26 @@ describe('the docs site', () => {
         load(t => t.replace('kept after the agent is done.', 'kept in [the evidence folder](docs/evidence.html).')),
         /the card "Proof you can open" is a link already/,
       );
+    });
+  });
+
+  describe("a docs page's front matter", () => {
+    let dir: string;
+
+    before(() => {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-docs-'));
+      fs.cpSync(path.join(SITE, 'docs.yaml'), path.join(dir, 'docs.yaml'));
+      fs.cpSync(path.join(SITE, 'docs'), path.join(dir, 'docs'), { recursive: true });
+    });
+
+    after(() => {
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    test('names a key the build does not read', () => {
+      const file = path.join(dir, 'docs', 'services.md');
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^summary:/m, 'summray:'));
+      assert.throws(() => loadSections(dir), /services\.md: front matter has summray, which the build doesn't read/);
     });
   });
 
