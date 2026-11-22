@@ -96,21 +96,29 @@ function fields(value: unknown, file: string, name: string): Fields {
   return value as Fields;
 }
 
+function only(value: Fields, file: string, prefix: string, keys: string[]): Fields {
+  const extra = Object.keys(value).find(key => !keys.includes(key));
+  if (extra !== undefined)
+    throw new Error(`${path.relative(REPO, file)}: front matter has ${prefix}${extra}, which the build doesn't read`);
+  return value;
+}
+
 function list<T>(value: unknown, file: string, name: string, item: (value: unknown, name: string) => T): T[] {
   if (!Array.isArray(value) || value.length === 0) throw needs(file, `${name}, a list`);
   return value.map((entry, i) => item(entry, `${name}[${String(i)}]`));
 }
 
-export function loadSections(): Section[] {
-  const nav = parse(fs.readFileSync(path.join(SITE, 'docs.yaml'), 'utf8')) as { title: string; pages: string[] }[];
+export function loadSections(site = SITE): Section[] {
+  const nav = parse(fs.readFileSync(path.join(site, 'docs.yaml'), 'utf8')) as { title: string; pages: string[] }[];
   const listed = new Set<string>();
   const sections = nav.map((entry, s) => {
     const number = String(s + 1);
     const pages = entry.pages.map((name, p): DocPage => {
       if (listed.has(name)) throw new Error(`docs.yaml lists ${name} twice`);
       listed.add(name);
-      const file = path.join(SITE, 'docs', `${name}.md`);
+      const file = path.join(site, 'docs', `${name}.md`);
       const { data, body } = frontMatter(file);
+      only(data, file, '', ['title', 'label', 'short', 'summary', 'status']);
       const markdown = expandGenerated(body).trim() + '\n';
       const { html, headings } = renderMarkdown(markdown);
       const title = text(data.title, file, 'title');
@@ -130,22 +138,40 @@ export function loadSections(): Section[] {
     });
     return { number, title: entry.title, pages };
   });
-  const unlisted = fs.readdirSync(path.join(SITE, 'docs')).filter(f => f.endsWith('.md') && !listed.has(f.slice(0, -3)));
+  const unlisted = fs.readdirSync(path.join(site, 'docs')).filter(f => f.endsWith('.md') && !listed.has(f.slice(0, -3)));
   if (unlisted.length > 0) throw new Error(`site/docs has pages docs.yaml doesn't list: ${unlisted.join(', ')}`);
   return sections;
 }
 
 export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
   const { data } = frontMatter(file);
+  only(data, file, '', [
+    'title',
+    'problem',
+    'description',
+    'badge',
+    'headline',
+    'marked',
+    'sentence',
+    'figure',
+    'buttons',
+    'install',
+    'agents',
+    'heroAlt',
+    'cards',
+    'about',
+    'speed',
+  ]);
   const where = path.relative(REPO, file);
   const headline = text(data.headline, file, 'headline');
   const marked = text(data.marked, file, 'marked');
   const sentence = headline.replace(/\.$/, '');
-  const at = sentence.indexOf(marked);
+  const word = marked.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const at = sentence.search(new RegExp(`(?<![\\p{L}\\p{N}])${word}(?![\\p{L}\\p{N}])`, 'u'));
   if (at === -1) throw new Error(`${where}: marked is "${marked}", which the headline before its full stop doesn't contain`);
-  const badge = fields(data.badge, file, 'badge');
+  const badge = only(fields(data.badge, file, 'badge'), file, 'badge.', ['text', 'href']);
   const buttons = list(data.buttons, file, 'buttons', (value, name): Link => {
-    const button = fields(value, file, name);
+    const button = only(fields(value, file, name), file, `${name}.`, ['label', 'href', 'icon', 'primary']);
     if (button.primary !== undefined && typeof button.primary !== 'boolean')
       throw needs(file, `${name}.primary to be true or false`);
     return {
@@ -156,15 +182,16 @@ export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
     };
   });
   const install = list(data.install, file, 'install', (value, name): InstallStep => {
-    const step = fields(value, file, name);
+    const step = only(fields(value, file, name), file, `${name}.`, ['label', 'command', 'prompt']);
     const label = text(step.label, file, `${name}.label`);
-    if ((step.command === undefined) === (step.prompt === undefined)) throw needs(file, `${name} to have a command or a prompt`);
+    if ((step.command === undefined) === (step.prompt === undefined))
+      throw needs(file, `${name} to have a command or a prompt, not both`);
     return step.command === undefined
       ? { label, prompt: text(step.prompt, file, `${name}.prompt`) }
       : { label, command: text(step.command, file, `${name}.command`) };
   });
   const cards = list(data.cards, file, 'cards', (value, name): Card => {
-    const card = fields(value, file, name);
+    const card = only(fields(value, file, name), file, `${name}.`, ['icon', 'title', 'text', 'href']);
     return {
       icon: text(card.icon, file, `${name}.icon`),
       title: text(card.title, file, `${name}.title`),
@@ -177,7 +204,7 @@ export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
   for (const card of cards)
     if (/\[[^\]]*\]\(/.test(card.text))
       throw new Error(`${where}: the card "${card.title}" is a link already, so its text can't hold one`);
-  const about = fields(data.about, file, 'about');
+  const about = only(fields(data.about, file, 'about'), file, 'about.', ['title', 'paragraphs']);
   return {
     title: text(data.title, file, 'title'),
     problem: text(data.problem, file, 'problem'),
@@ -197,7 +224,7 @@ export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
       paragraphs: list(about.paragraphs, file, 'about.paragraphs', (value, name) => text(value, file, name)),
     },
     speed: list(data.speed, file, 'speed', (value, name) => {
-      const stat = fields(value, file, name);
+      const stat = only(fields(value, file, name), file, `${name}.`, ['value', 'label']);
       return { value: text(stat.value, file, `${name}.value`), label: text(stat.label, file, `${name}.label`) };
     }),
   };
