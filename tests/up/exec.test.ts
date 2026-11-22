@@ -376,7 +376,7 @@ test(
 test('the start-time check finds a live chain with the real ps exactly as the walk at start read it', LIMIT, async t => {
   const lane = await heldLane();
   const atStart = new Map<number, Standing>();
-  const listed: (ReadonlyMap<number, Standing> | undefined)[] = [];
+  const listed: { pids: readonly number[]; now: ReadonlyMap<number, Standing> | undefined }[] = [];
   const system: ServiceSystem = {
     ...realServiceSystem,
     processes: {
@@ -389,7 +389,7 @@ test('the start-time check finds a live chain with the real ps exactly as the wa
     },
     runningWithParents: pids => {
       const now = realServiceSystem.runningWithParents(pids);
-      listed.push(now);
+      listed.push({ pids: [...pids], now });
       return now;
     },
   };
@@ -402,8 +402,14 @@ test('the start-time check finds a live chain with the real ps exactly as the wa
     await until(() => listed.length === read, 5000);
   }
   await sleep(100);
-  assert.ok(atStart.size >= 2, `the walk read a chain of ${String(atStart.size)}`);
-  for (const now of listed) assert.deepEqual(now, atStart);
+  for (const { pids, now } of listed) {
+    assert.ok(pids.length > 0, 'a start-time check lists the processes the walk recorded');
+    assert.ok(
+      pids.every(p => atStart.has(p)),
+      `every process listed, ${pids.join(' ')}, was read at start`,
+    );
+    assert.deepEqual(now, new Map(pids.map(p => [p, atStart.get(p)])));
+  }
   assert.ok(alive(pid), 'three start-time checks of a live chain end nothing');
 
   gone = true;

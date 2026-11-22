@@ -2,12 +2,6 @@
 
 Newest first.
 
-## Unreleased
-
-### Fixed
-
-- **`exec` ends its command if the process that ran it, or any process above it, exits, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid, parent pid and start time of each process above it as it starts. Once a second it asks whether each still exists, which starts no process. Every 10 seconds it also reads their start times and parent pids with one `ps`. A process whose start time and parent pid have both changed counts as replaced, which catches a pid the system gave to a new process and lets a clock step pass. Under Codex, the shared app-server daemon and the processes above it don't count, since the daemon outlives the Codex window that started it.
-
 ## 0.6.1
 
 The first look or screenshot no longer fails when the XCTest runner takes over a minute to start, and a simctl timeout and a failed Maestro download now say what happened.
@@ -19,6 +13,7 @@ The first look or screenshot no longer fails when the XCTest runner takes over a
 - **A session failure says whether the driver tried again.** A call tried once read `failed again after a restart`. It now reads `Maestro's session failed (timeout): ...`, and a call tried twice reads `... and failed again when the driver tried once more: ...`.
 - **A simctl command that runs out of time says so.** `up`'s preflight read `simulator runtime: xcrun simctl list -j runtimes failed: ` with nothing after it, and told you to install a runtime that was installed. It now reads `xcrun simctl list -j runtimes didn't finish within 180 s`, with a fix that says to run the listing by hand. Listing the runtimes gets 180 s instead of 60. A simctl command that fails without writing to stderr now names its exit status or signal.
 - **A failed Maestro download is an error `up` reports.** When `up` downloaded Maestro for a sign-in hook and the download couldn't connect, it crashed with `TypeError: fetch failed` and a stack trace. A download that can't connect is now tried once more, and a failed one reads `downloading Maestro <version> from <url> failed: <reason>`, with a fix. In the sign-in step, `up` exits as it does for any failed step. In `up`'s driver step, as before, it prints `driver: not started (...)` and carries on.
+- **`exec` ends its command if the process that ran it, or any process above it, exits, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid, parent pid and start time of each process above it as it starts. Once a second it asks whether each still exists, which starts no process. Every 10 seconds it also reads their start times and parent pids with one `ps`. A process whose start time and parent pid have both changed counts as replaced, which catches a pid the system gave to a new process and lets a clock step pass. Under Codex, the shared app-server daemon and the processes above it don't count, since the daemon outlives the Codex window that started it.
 
 ## 0.6.0
 
