@@ -10,7 +10,7 @@ import { agentWiringChecks } from '../../src/agents/wiring-check.ts';
 import type { Platform } from '../../src/devices/backend.ts';
 import { LONGEST_ANSWER_MS, PING_TIMEOUT_MS, responseTimeoutMs, START_TIMEOUT_MS } from '../../src/driver/client.ts';
 import type { EngineRequest } from '../../src/driver/engine.ts';
-import { INSTALL_WAITS_MS } from '../../src/driver/install.ts';
+import { INSTALL_WAITS_MS, JDK_LOOKUP_MS } from '../../src/driver/install.ts';
 import { WAKE_WAIT_MS } from '../../src/up/waker.ts';
 import { tempDir } from '../support/fakes.ts';
 import { recordingInstaller } from '../support/installer.ts';
@@ -63,7 +63,7 @@ function codexTable(dir: string): string {
   return text.slice(start, next === -1 ? undefined : next);
 }
 
-const SLOW_CALL_MS = WAKE_WAIT_MS + INSTALL_WAITS_MS + START_TIMEOUT_MS + PING_TIMEOUT_MS + LONGEST_ANSWER_MS;
+const SLOW_CALL_MS = WAKE_WAIT_MS + JDK_LOOKUP_MS + INSTALL_WAITS_MS + START_TIMEOUT_MS + PING_TIMEOUT_MS + LONGEST_ANSWER_MS;
 
 test('the timeout written for each host covers a slow call that succeeds: one wake, a Maestro install, the engine start and the longest answer', () => {
   for (const platform of PLATFORMS)
