@@ -341,9 +341,17 @@ test('a data-only lane parks after the idle cutoff, its shared service stops 5 m
   );
   assert.deepEqual(d.lines(), ['start', `create ${id}`, 'stop']);
 
+  assert.deepEqual(only(w).park?.restarts, { device: null, services: [], shared: ['db'], browser: null, app: null });
+  const parkedLine = (await doctor(w)).checks.find(c => c.name === 'parked');
+  assert.match(parkedLine?.detail ?? '', /, and its next call brings back shared services db$/);
+  const status: string[] = [];
+  assert.equal(await runRegistryCommand('status', [], cli(w, status)), 0);
+  assert.match(status.join(''), /its next call brings back shared services db$/m);
+
   w.lines.length = 0;
   const later = ahead(since + SHARED_IDLE_MS + 1000 - Date.now());
   assert.equal(await execInLane(w.deps({ clock: later }), ['test', '-f', d.up]), 0, w.lines.join('\n'));
+  assert.match(w.lines.join('\n'), new RegExp(`lane ${id} was parked \\w+ ago; bringing back shared services db$`, 'm'));
   assert.deepEqual(d.lines(), ['start', `create ${id}`, 'stop', 'start']);
   assert.ok(
     w.lines.some(l => l.startsWith('agentlane up: shared: db started (')),

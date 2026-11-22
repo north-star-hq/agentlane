@@ -23,6 +23,8 @@ export interface ParkedDevice {
 export interface ParkRestarts {
   device: ParkedDevice | null;
   services: string[];
+  /** The shared services the lane needed when it parked. */
+  shared: string[];
   browser: BrowserDriverName | null;
   app: string | null;
 }
@@ -37,13 +39,18 @@ export interface LanePark {
   problems: string[];
 }
 
-export const NOTHING_TO_RESTART: ParkRestarts = { device: null, services: [], browser: null, app: null };
+export const NOTHING_TO_RESTART: ParkRestarts = { device: null, services: [], shared: [], browser: null, app: null };
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((s): s is string => typeof s === 'string') : [];
+}
 
 function restartsOf(raw: string): ParkRestarts {
   const parsed = JSON.parse(raw) as Partial<ParkRestarts>;
   return {
     device: parsed.device ?? null,
-    services: Array.isArray(parsed.services) ? parsed.services.filter((s): s is string => typeof s === 'string') : [],
+    services: strings(parsed.services),
+    shared: strings(parsed.shared),
     browser: parsed.browser ?? null,
     app: typeof parsed.app === 'string' ? parsed.app : null,
   };
@@ -107,6 +114,7 @@ export function mergeRestarts(earlier: ParkRestarts, later: ParkRestarts): ParkR
   return {
     device: later.device ?? earlier.device,
     services: [...new Set([...earlier.services, ...later.services])],
+    shared: [...new Set([...earlier.shared, ...later.shared])],
     browser: later.browser ?? earlier.browser,
     app: later.app ?? earlier.app,
   };
@@ -117,6 +125,7 @@ export function describeRestarts(restarts: ParkRestarts): string {
   const { device } = restarts;
   const parts = [
     ...(device ? [`${DEVICE_NOUN[device.platform]} ${device.name} (${device.deviceTypeName}, ${device.runtimeName})`] : []),
+    ...(restarts.shared.length > 0 ? [`shared services ${restarts.shared.join(', ')}`] : []),
     ...(restarts.services.length > 0 ? [`services ${restarts.services.join(', ')}`] : []),
     ...(restarts.app ? [`the app ${restarts.app}`] : []),
     ...(restarts.browser ? [`the ${restarts.browser} browser`] : []),
