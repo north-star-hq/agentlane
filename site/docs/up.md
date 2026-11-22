@@ -1,7 +1,7 @@
 ---
 title: "Bring a worktree up"
 short: "`agentlane up`, from a bare worktree to the running app."
-summary: "`agentlane up` takes a worktree from bare to the running app on its own simulator or emulator, or to its web app's services in its own browser. It runs the preflight, claims the lane, runs setup, creates resources, builds through the build cache, starts the services, applies capture hygiene, launches and signs in, then runs doctor. Run it again and it reuses the lane."
+summary: "`agentlane up` takes a worktree from bare to the running app on its own simulator or emulator, or to its web app's services in its own browser. It runs the preflight, claims the lane, runs setup, starts the shared services the lane needs, creates resources, builds through the build cache, starts the services, applies capture hygiene, launches and signs in, then runs doctor. Run it again and it reuses the lane."
 ---
 
 ## The steps
@@ -18,6 +18,7 @@ npx agentlane up
 | claim               | Claims the lane: a port per service, and a pool simulator or emulator for a mobile app or a browser for a web app. |
 | setup               | Runs your `setup` hook, such as the dependency install. The device boots at the same time.                    |
 | build preconditions | Runs your `before: build` preconditions.                                                                      |
+| shared              | Starts each [shared service](shared.md) the lane's resources and services name in `needs`, unless it already answers. |
 | resources           | Runs each resource's `create` the first time, and passes the values it exports on.                            |
 | build               | Runs your `build` hook through the [build cache](build-cache.md), or installs a cached build.                 |
 | services            | Starts each service on its port in its own process group, and waits for its ready check.                      |
@@ -27,7 +28,7 @@ npx agentlane up
 | driver              | Starts the warm Maestro session, so the first `look` is fast.                                                 |
 | doctor              | Runs every [doctor](doctor.md) check and prints the result.                                                   |
 
-A web app skips the device steps. It claims a browser, opens the web app in it, and signs in through the same `signin` hook, which writes the saved login the browser starts with. This is `up --platform web` on the example app in the agentlane repository, on Linux:
+The `shared` step shows only when `agentlane.json` declares shared services. A web app skips the device steps. It claims a browser, opens the web app in it, and signs in through the same `signin` hook, which writes the saved login the browser starts with. This is `up --platform web` on the example app in the agentlane repository, on Linux:
 
 ```text
 agentlane up: preflight: hook locale (0.0 s)
@@ -63,6 +64,24 @@ Run `up` again in the same folder and it reuses the lane. It keeps every healthy
 
 When a step fails, the lane stays, so the next `up` picks up where it stopped. `up` releases the lane only when it made the lane in this run and a precondition refused before anything started.
 
+## Only the data: `--no-app`
+
+Tests that read the project's database need its data, not its app. `up --no-app` brings up the data alone:
+
+```sh
+npx agentlane up --no-app
+npx agentlane exec -- pnpm test
+```
+
+It runs the preflight with only the checks that need no device or browser, the preconditions that name no platform, setup, the `shared` step with the shared services the resources need, the resources, and doctor. It claims no device, browser or port, and builds, starts and launches nothing. The commands then run under `exec`, which gives them the resources' values.
+
+- A project that declares no resources is refused, since there is no data to bring up.
+- `--no-app` can't be used with `--platform`, `--no-cache`, `--refresh-cache` or `--timeout`, since it builds nothing and waits for no simulator.
+- In a folder whose lane already has the app, `--no-app` is refused, and `exec` gives the command the resources' values there.
+- A plain `up` later in the same folder adds the app to the lane, with the same data.
+
+A data-only lane parks and wakes like any other: waking starts its shared services again. `doctor` checks its lane, its resources and its shared services, and `restart` refuses, since it runs no service.
+
 ## Restarting one service
 
 To change one service's environment, such as a feature switch or an admin toggle, restart that service instead of the whole lane:
@@ -71,7 +90,7 @@ To change one service's environment, such as a feature switch or an admin toggle
 FEATURE_CHECKOUT_V2=1 npx agentlane restart api
 ```
 
-`restart` stops the service and starts it again on the same port, with the lane's variables plus that call's environment, and returns once its ready check passes. The device, the app and the other services stay as they are. A variable you passed to `up` and not to `restart` is gone, so pass every one you still want.
+`restart` stops the service and starts it again on the same port, with the lane's variables plus that call's environment, and returns once its ready check passes. The device, the app and the other services stay as they are. A variable you passed to `up` and not to `restart` is gone, so pass every one you still want. Before it stops the service, `restart` starts any shared service the lane needs that isn't running, so a failed shared start leaves the running service alone.
 
 ## Exports and JSON output
 
@@ -87,6 +106,10 @@ An agent's shell commands often start with a fresh environment, so `exec` is the
 ```sh
 npx agentlane exec -- npx playwright test
 ```
+
+`exec` brings a [parked](lanes.md#parking) lane back before the command starts, and counts as a call on the lane once a minute while the command runs. The command reads what was piped to `exec`, and a Ctrl-C in the terminal reaches it. `exec` exits with the command's exit code.
+
+`exec` ends with the process that ran it. When that process exits while the command runs, as when an agent's shell is killed, `exec` sends SIGTERM to the command and every process under it, then SIGKILL to whatever still runs 5 seconds later, and exits 129. So a test run or server started under `exec` doesn't outlive the agent that started it. If the caller is already gone when the command would start, the command never runs.
 
 `up --json` prints the result as JSON instead: the lane, the platform, the web app's URL, the variables, each step with its time, and the doctor report.
 

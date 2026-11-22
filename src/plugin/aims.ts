@@ -1,5 +1,6 @@
+import fs from 'node:fs';
 import path from 'node:path';
-import { TOOL } from '../name.ts';
+import { envName, TOOL } from '../name.ts';
 import type { Word } from './shell.ts';
 import { splitCommands } from './shell.ts';
 
@@ -14,7 +15,8 @@ export type Aim =
   | { kind: 'unselected' }
   | { kind: 'browser-session'; driver: BrowserDriver; session: string }
   | { kind: 'browser-port'; driver: BrowserDriver; port: number }
-  | { kind: 'every-browser'; driver: BrowserDriver };
+  | { kind: 'every-browser'; driver: BrowserDriver }
+  | { kind: 'container' };
 
 export interface AimedCommand {
   aim: Aim;
@@ -25,13 +27,146 @@ export interface AimedCommand {
 interface Scope {
   env: Map<string, string | null>;
   cwd: string | null;
+  containersOnly: boolean;
 }
+
+/** The leading assignment, or variable in the hook's environment, that lets a container start through the guard. */
+export const ALLOW_CONTAINER_ENV = envName('ALLOW_CONTAINER');
 
 const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
 const RUNNERS = new Set(['npx', 'bunx', 'pnpx']);
 const PACKAGE_MANAGERS = new Set(['pnpm', 'npm', 'yarn', 'bun']);
-const PASS_THROUGH = new Set(['exec', 'nohup', 'builtin', 'noglob']);
+const PASS_THROUGH = new Set(['exec', 'nohup', 'setsid', 'builtin', 'noglob']);
+const PACKAGE_MANAGER_WITH_VALUE = new Set(['-C', '--dir', '--prefix', '--cwd', '--filter', '-F', '-w', '--workspace']);
+const PACKAGE_MANAGER_CWD = new Set(['-C', '--dir', '--prefix', '--cwd']);
+const LIFECYCLE_SCRIPTS = new Map([
+  ['start', 'start'],
+  ['test', 'test'],
+  ['t', 'test'],
+  ['restart', 'restart'],
+  ['stop', 'stop'],
+]);
+const MAX_SCRIPT_DEPTH = 8;
+
+const CONTAINER_GLOBAL_WITH_VALUE = new Set([
+  '-c',
+  '--config',
+  '--context',
+  '-H',
+  '--host',
+  '-l',
+  '--log-level',
+  '--tlscacert',
+  '--tlscert',
+  '--tlskey',
+  '--connection',
+  '--url',
+  '--identity',
+  '--root',
+  '--runroot',
+  '--storage-driver',
+  '--storage-opt',
+  '--cgroup-manager',
+  '--events-backend',
+  '--hooks-dir',
+  '--network-cmd-path',
+  '--network-config-dir',
+  '--runtime',
+  '--runtime-flag',
+  '--tmpdir',
+  '--module',
+  '--ssh',
+  '--conmon',
+  '--imagestore',
+  '--volumepath',
+  '--db-backend',
+  '--out',
+  '--cni-config-dir',
+  '--registries-conf',
+  '--cdi-spec-dir',
+]);
+const COMPOSE_GLOBAL_WITH_VALUE = new Set([
+  '-f',
+  '--file',
+  '-p',
+  '--project-name',
+  '--profile',
+  '--env-file',
+  '--project-directory',
+  '--ansi',
+  '--parallel',
+  '--progress',
+  '--podman-path',
+  '--podman-args',
+  '--podman-pull-args',
+  '--podman-push-args',
+  '--podman-build-args',
+  '--podman-inspect-args',
+  '--podman-run-args',
+  '--podman-start-args',
+  '--podman-stop-args',
+  '--podman-rm-args',
+  '--podman-volume-args',
+  '--pod-args',
+  '--in-pod',
+  '--x-podman',
+]);
+const CONTAINER_COMMANDS = new Set(
+  (
+    'attach build builder buildx bake checkpoint commit compose config container context cp create debug ' +
+    'desktop diff events exec export extension history image images import info init inspect kill load ' +
+    'login logout logs ls manifest model network node pause plugin port prune ps pull push rename restart ' +
+    'rm rmi run save sbom scout search secret service stack start stats stop swarm system tag top trust ' +
+    'unpause update version volume wait help ai mcp offload auto-update artifact farm generate ' +
+    'healthcheck kube machine mount play pod quadlet unmount umount unshare untag varlink'
+  ).split(' '),
+);
+const COMPOSE_COMMANDS = new Set(
+  (
+    'attach build commit config cp create down events exec export images kill logs ls pause port ps ' +
+    'publish pull push restart rm run scale start stats stop top unpause up version volumes wait watch ' +
+    'alpha bridge viz help systemd'
+  ).split(' '),
+);
+/** The flags of `run` in docker, podman and compose that take no value; their parsers give every other flag the next word. */
+const RUN_BOOLEAN_FLAGS = new Set([
+  '--detach',
+  '--disable-content-trust',
+  '--help',
+  '--init',
+  '--interactive',
+  '--no-healthcheck',
+  '--oom-kill-disable',
+  '--privileged',
+  '--publish-all',
+  '--quiet',
+  '--read-only',
+  '--rm',
+  '--sig-proxy',
+  '--tty',
+  '--use-api-socket',
+  '--env-host',
+  '--http-proxy',
+  '--no-hosts',
+  '--passwd',
+  '--read-only-tmpfs',
+  '--replace',
+  '--rmi',
+  '--rootfs',
+  '--tls-verify',
+  '--build',
+  '--no-deps',
+  '--remove-orphans',
+  '--service-ports',
+  '--use-aliases',
+  '--quiet-pull',
+  '--no-TTY',
+  '--quiet-build',
+]);
+const RUN_BOOLEAN_SHORTS = /^[ditTPq]*/;
+const UP_BOOLEAN_SHORTS = /^[dVwy]*/;
+const TRUE = new Set(['1', 't', 'T', 'true', 'TRUE', 'True']);
 
 const ADB_READ_ONLY = new Set([
   'devices',
@@ -95,12 +230,83 @@ function skipOptions(words: readonly Word[], start: number, withValue: ReadonlyS
   return i;
 }
 
+/**
+ * The index of the subcommand: the first word that names one, past the options before it and any word that names none,
+ * such as the value of a global option this list doesn't know.
+ */
+function subcommandAt(
+  args: readonly Word[],
+  start: number,
+  withValue: ReadonlySet<string>,
+  known: ReadonlySet<string>,
+  scope: Scope,
+): number {
+  let i = start;
+  while (i < args.length) {
+    const t = value(args[i], scope);
+    if (t !== null && known.has(t)) return i;
+    i += t !== null && withValue.has(t) ? 2 : 1;
+  }
+  return i;
+}
+
+/** Whether `run`'s options, up to the image or service, detach: `-d`, `--detach[=true]`, or `d` in a cluster like `-itd`. */
+function runDetaches(args: readonly Word[], scope: Scope): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const t = value(args[i], scope);
+    if (t === null || t === '--' || !t.startsWith('-') || t === '-') return false;
+    if (t.startsWith('--')) {
+      const [flag = '', given] = t.split(/=(.*)/s);
+      if (flag === '--detach' && (given === undefined || TRUE.has(given))) return true;
+      if (given === undefined && !RUN_BOOLEAN_FLAGS.has(flag)) i++;
+      continue;
+    }
+    const cluster = t.slice(1);
+    const flags = RUN_BOOLEAN_SHORTS.exec(cluster)?.[0] ?? '';
+    if (flags.includes('d')) return true;
+    if (flags.length === cluster.length - 1) i++;
+  }
+  return false;
+}
+
+/** Whether `compose up` detaches: `-d`, `--detach`, or `--wait`, which compose documents as implying detached mode. */
+function upDetaches(args: readonly Word[], scope: Scope): boolean {
+  return args.some(word => {
+    const t = value(word, scope);
+    if (t === null || !t.startsWith('-') || t === '-') return false;
+    const [flag = '', given] = t.split(/=(.*)/s);
+    if (flag === '--detach' || flag === '--wait') return given === undefined || TRUE.has(given);
+    if (t.startsWith('--')) return false;
+    return (UP_BOOLEAN_SHORTS.exec(t.slice(1))?.[0] ?? '').includes('d');
+  });
+}
+
+function nearestScripts(cwd: string | null): { dir: string; scripts: Record<string, unknown> } | null {
+  if (cwd === null) return null;
+  for (let dir = cwd; ; dir = path.dirname(dir)) {
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
+    } catch {
+      if (path.dirname(dir) === dir) return null;
+      continue;
+    }
+    try {
+      const { scripts } = JSON.parse(text) as { scripts?: unknown };
+      return typeof scripts === 'object' && scripts !== null ? { dir, scripts: scripts as Record<string, unknown> } : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 class Interpreter {
   readonly aims: AimedCommand[] = [];
   private readonly scope: Scope;
+  private depth = 0;
 
   constructor(env: NodeJS.ProcessEnv, cwd: string | null) {
-    this.scope = { env: new Map(Object.entries(env).map(([k, v]) => [k, v ?? null])), cwd };
+    this.scope = { env: new Map(Object.entries(env).map(([k, v]) => [k, v ?? null])), cwd, containersOnly: false };
   }
 
   script(text: string, scope: Scope = this.scope): void {
@@ -108,12 +314,13 @@ class Interpreter {
   }
 
   private aim(aim: Aim, words: readonly Word[], scope: Scope): void {
+    if (scope.containersOnly && aim.kind !== 'container') return;
     this.aims.push({ aim, command: joined(words), cwd: scope.cwd });
   }
 
   command(words: readonly Word[], outer: Scope): void {
     let i = 0;
-    const local: Scope = { env: new Map(outer.env), cwd: outer.cwd };
+    const local: Scope = { ...outer, env: new Map(outer.env) };
     for (; i < words.length; i++) {
       const word = words[i];
       const match = word?.literal ? ASSIGNMENT.exec(word.text) : null;
@@ -217,6 +424,14 @@ class Interpreter {
       case 'avdmanager':
         this.avdmanager(words, args, scope);
         return;
+      case 'docker':
+      case 'podman':
+        this.container(words, args, scope);
+        return;
+      case 'docker-compose':
+      case 'podman-compose':
+        this.compose(words, args, scope);
+        return;
       default:
         break;
     }
@@ -227,7 +442,7 @@ class Interpreter {
     if (SHELLS.has(head)) {
       const c = args.findIndex(w => w.literal && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(w.text));
       const script = c === -1 ? null : value(args[c + 1], scope);
-      if (script !== null) this.script(script, { env: new Map(scope.env), cwd: scope.cwd });
+      if (script !== null) this.script(script, { ...scope, env: new Map(scope.env) });
       return;
     }
     if (RUNNERS.has(head)) {
@@ -236,6 +451,10 @@ class Interpreter {
     }
     if (PACKAGE_MANAGERS.has(head) && (args[0]?.text === 'exec' || args[0]?.text === 'dlx' || args[0]?.text === 'x')) {
       this.command(args.slice(skipOptions(args, 1, new Set())), scope);
+      return;
+    }
+    if (PACKAGE_MANAGERS.has(head)) {
+      this.packageScript(head, args, scope);
       return;
     }
     if (head === TOOL && args[0]?.text === 'exec') {
@@ -288,6 +507,86 @@ class Interpreter {
     if (session) this.aim({ kind: 'browser-session', driver, session }, words, scope);
   }
 
+  private container(words: readonly Word[], args: readonly Word[], scope: Scope): void {
+    const at = subcommandAt(args, 0, CONTAINER_GLOBAL_WITH_VALUE, CONTAINER_COMMANDS, scope);
+    let sub = value(args[at], scope);
+    let rest = args.slice(at + 1);
+    if (sub === 'container') {
+      const inner = subcommandAt(rest, 0, new Set(), CONTAINER_COMMANDS, scope);
+      sub = value(rest[inner], scope);
+      rest = rest.slice(inner + 1);
+    }
+    if (sub === 'compose') {
+      this.compose(words, rest, scope);
+      return;
+    }
+    const texts = rest.map(w => value(w, scope));
+    const starts =
+      (sub === 'run' && runDetaches(rest, scope)) ||
+      ((sub === 'start' || sub === 'restart') && !texts.includes('--help')) ||
+      (sub === 'pod' && (texts[0] === 'start' || texts[0] === 'restart')) ||
+      (((sub === 'kube' && texts[0] === 'play') || (sub === 'play' && texts[0] === 'kube')) && !texts.includes('--down'));
+    if (starts) this.startsContainer(words, scope);
+  }
+
+  private compose(words: readonly Word[], args: readonly Word[], scope: Scope): void {
+    const at = subcommandAt(args, 0, COMPOSE_GLOBAL_WITH_VALUE, COMPOSE_COMMANDS, scope);
+    const sub = value(args[at], scope);
+    const rest = args.slice(at + 1);
+    const starts =
+      (sub === 'up' && upDetaches(rest, scope)) ||
+      (sub === 'run' && runDetaches(rest, scope)) ||
+      sub === 'start' ||
+      sub === 'restart';
+    if (starts) this.startsContainer(words, scope);
+  }
+
+  private startsContainer(words: readonly Word[], scope: Scope): void {
+    if (scope.env.get(ALLOW_CONTAINER_ENV) === '1') return;
+    this.aim({ kind: 'container' }, words, scope);
+  }
+
+  /**
+   * npm runs a script with `run`, `run-script` or a lifecycle command, along with its pre- and post-scripts; pnpm, yarn
+   * and bun also run one named as the command itself. Each runs the script through `sh -c` in the folder of the nearest
+   * package.json.
+   */
+  private packageScript(manager: string, args: readonly Word[], scope: Scope): void {
+    if (this.depth >= MAX_SCRIPT_DEPTH) return;
+    let cwd = scope.cwd;
+    let i = 0;
+    while (i < args.length) {
+      const t = args[i]?.literal ? (args[i]?.text ?? '') : '';
+      if (!t.startsWith('-') || t === '-') break;
+      const [flag = '', given] = t.split(/=(.*)/s);
+      if (PACKAGE_MANAGER_CWD.has(flag)) {
+        const dir = given ?? value(args[i + 1], scope);
+        cwd = dir === null || (cwd === null && !path.isAbsolute(dir)) ? null : path.resolve(cwd ?? '/', dir);
+      }
+      i += given === undefined && PACKAGE_MANAGER_WITH_VALUE.has(flag) ? 2 : 1;
+    }
+    const sub = value(args[i], scope);
+    if (sub === null) return;
+    let name: string | null | undefined;
+    if (sub === 'run' || sub === 'run-script') name = value(args[skipOptions(args, i + 1, new Set())], scope);
+    else if (manager !== 'bun' && LIFECYCLE_SCRIPTS.has(sub)) name = LIFECYCLE_SCRIPTS.get(sub);
+    else if (manager !== 'npm') name = sub;
+    if (!name) return;
+    const found = nearestScripts(cwd);
+    if (found === null) return;
+    const names = manager === 'npm' ? [`pre${name}`, name, `post${name}`] : [name];
+    const inner: Scope = { env: new Map(scope.env), cwd: found.dir, containersOnly: true };
+    this.depth++;
+    try {
+      for (const key of names) {
+        const body = found.scripts[key];
+        if (typeof body === 'string') this.script(body, inner);
+      }
+    } finally {
+      this.depth--;
+    }
+  }
+
   private cd(args: readonly Word[], scope: Scope): string | null {
     const target = args.find(w => !(w.literal && w.text.startsWith('-') && w.text !== '-'));
     if (!target) return scope.env.get('HOME') ?? null;
@@ -299,7 +598,7 @@ class Interpreter {
   }
 
   private env(args: readonly Word[], scope: Scope): void {
-    const local: Scope = { env: new Map(scope.env), cwd: scope.cwd };
+    const local: Scope = { ...scope, env: new Map(scope.env) };
     let i = 0;
     while (i < args.length) {
       const w = args[i];

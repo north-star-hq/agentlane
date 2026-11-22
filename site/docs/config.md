@@ -56,9 +56,15 @@ Or a TCP check, which passes when the port accepts a connection:
 
 ## resources
 
-Data each lane gets its own copy of, such as a database, by name. `up` runs each `create` once per lane, in the order listed, after the setup hook. Teardowns run when the lane ends, last created first. [A database per lane](resources.md) walks through one.
+Data each lane gets its own copy of, such as a database, by name. `up` runs each `create` once per lane, in the order listed, after the setup hook. Teardowns run when the lane ends, last created first. A resource whose data lives in a shared service names it in `needs`. [A database per lane](resources.md) walks through one.
 
 <!-- generated: config resource -->
+
+## shared
+
+The servers the lanes of a repository use together, such as the database server each lane's database lives in, by name. A lane needs one when one of its resources or services names it in `needs`. agentlane starts it in `up`'s `shared` step, when a parked lane wakes, and before a teardown that needs it, and stops it 5 minutes after the last lane that needs it parks or ends. It never removes one. `start` and `stop` must cope with running twice and with finding the server already in the state they set, and `stop` must keep the data. [A server the lanes share](shared.md) walks through one.
+
+<!-- generated: config shared -->
 
 ## hooks
 
@@ -68,7 +74,7 @@ Shell commands the project owns. Each one reads the lane from the environment, r
 
 ## preconditions
 
-Checks `up` runs before a slow step, each with the fix to print when it fails. Use one per tool a hook calls that the project doesn't install, one for the dependency install, and one per env file a hook needs.
+Checks `up` runs before a slow step, each with the fix to print when it fails. Use one per tool a hook calls that the project doesn't install, one for the dependency install, and one per env file a hook needs. A precondition checks state, such as that Docker is running, and never starts a server: a server the lanes need goes under `shared`, where agentlane also stops it.
 
 <!-- generated: config precondition -->
 

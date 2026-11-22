@@ -24,6 +24,8 @@ export const GUARDED_WORDS = [
   'playwright-cli',
   '@playwright/cli',
   'agent-browser',
+  'docker',
+  'podman',
 ] as const;
 
 /**
@@ -50,7 +52,7 @@ function worktreeFallback(): string {
 /**
  * The command an agent's hook runs: the project's own toolkit, found from the folder the hook runs in upwards, else in
  * the first worktree of the same repository that has one. The guard starts the toolkit only for a command that names
- * a device or browser tool. Without a toolkit it allows and exits 0, because Copilot denies the tool call on any other
+ * a device, browser or container tool. Without a toolkit it allows and exits 0, because Copilot denies the tool call on any other
  * exit and Gemini on exit 2 or more, and Cursor needs a JSON answer.
  */
 export function hookCommand(agent: Agent, event: HookEvent): string {

@@ -16,6 +16,7 @@ import {
   DEFAULT_DIAL_VALUE,
   DEFAULT_READY_HOST,
   DEFAULT_READY_SECONDS,
+  DEFAULT_SHARED_SECONDS,
   DEFAULT_TEARDOWN_SECONDS,
   DEFAULT_VARIANT,
   DEFAULT_WEB_PATH,
@@ -68,6 +69,8 @@ export interface ServiceConfig {
   dial: { argument: string; value: string } | null;
   /** The platforms that need the service; null for every platform. */
   platforms: ProjectPlatform[] | null;
+  /** The shared services it uses, by name. */
+  needs: string[];
 }
 
 export interface Precondition {
@@ -96,13 +99,29 @@ export interface ResourceConfig {
   teardown: string;
   cwd: string;
   teardownTimeoutMs: number;
+  /** The shared services it uses, by name. */
+  needs: string[];
+}
+
+/** A server the lanes of one repository use together, declared under `shared`. */
+export interface SharedServiceConfig {
+  name: string;
+  start: string;
+  stop: string;
+  ready: string;
+  cwd: string;
+  /** Bounds start, and then the wait for ready to pass. */
+  timeoutMs: number;
 }
 
 export interface ProjectConfig {
   file: string;
   dir: string;
-  /** The platform this view of the config is for: `up --platform`, else the app's platform, else web. */
-  platform: ProjectPlatform;
+  /**
+   * The platform this view of the config is for: `up --platform`, else the app's platform, else web. Null for the view
+   * of the project's data alone, which `up --no-app` brings up.
+   */
+  platform: ProjectPlatform | null;
   /** The mobile app, as `up` sees it on `platform` when that is a mobile platform. */
   app: AppConfig | null;
   platformApps: Partial<Record<Platform, PlatformAppConfig>>;
@@ -113,6 +132,7 @@ export interface ProjectConfig {
   /** Every service, whatever platform needs it. */
   allServices: ServiceConfig[];
   resources: ResourceConfig[];
+  shared: SharedServiceConfig[];
   hooks: Partial<Record<HookName, string>>;
   preconditions: Precondition[];
   hygiene: { location?: Coordinate; appearance?: Appearance };
@@ -120,12 +140,15 @@ export interface ProjectConfig {
   driver: { flows: string | null } | null;
 }
 
+/** The config as `up` sees it for a platform: the one it was loaded with, or the one `forPlatform` chose. */
+export type PlatformConfig = ProjectConfig & { platform: ProjectPlatform };
+
 /** The config as `up` sees it for a mobile platform. */
 export type MobileConfig = ProjectConfig & { platform: Platform; app: AppConfig };
 
 export function asMobile(config: ProjectConfig): MobileConfig | null {
   const { app, platform } = config;
-  return app !== null && platform !== WEB_PLATFORM ? { ...config, app, platform } : null;
+  return app !== null && platform !== null && platform !== WEB_PLATFORM ? { ...config, app, platform } : null;
 }
 
 export class ProjectConfigError extends Error {
@@ -153,6 +176,7 @@ interface RawService {
   timeoutSeconds?: number;
   dial?: { argument: string; value?: string };
   platforms?: ProjectPlatform[];
+  needs?: string[];
 }
 
 interface RawResource {
@@ -161,11 +185,21 @@ interface RawResource {
   teardown: string;
   cwd?: string;
   teardownTimeoutSeconds?: number;
+  needs?: string[];
+}
+
+interface RawShared {
+  start: string;
+  stop: string;
+  ready: string;
+  cwd?: string;
+  timeoutSeconds?: number;
 }
 
 interface RawConfig {
   web?: { service?: string; path?: string; browser?: { driver?: BrowserDriverName; headed?: boolean } };
   resources?: Record<string, RawResource>;
+  shared?: Record<string, RawShared>;
   app?: {
     platform: Platform;
     bundleId: string;
@@ -286,13 +320,40 @@ function resourceProblems(raw: RawConfig): SchemaProblem[] {
   return problems;
 }
 
+function needsProblems(raw: RawConfig): SchemaProblem[] {
+  const declared = Object.keys(raw.shared ?? {});
+  const users: [string, { needs?: string[] }][] = [
+    ...Object.entries(raw.resources ?? {}).map(([name, r]): [string, RawResource] => [`/resources/${name}`, r]),
+    ...Object.entries(raw.services ?? {}).map(([name, s]): [string, RawService] => [`/services/${name}`, s]),
+  ];
+  const problems: SchemaProblem[] = [];
+  for (const [at, user] of users) {
+    (user.needs ?? []).forEach((name, i) => {
+      if (declared.includes(name)) return;
+      problems.push(
+        problem(
+          `${at}/needs/${String(i)}`,
+          `${name} is not a shared service; declare it under shared, or name one of: ${declared.join(', ') || 'none'}`,
+        ),
+      );
+    });
+  }
+  return problems;
+}
+
 function crossFieldProblems(raw: RawConfig): SchemaProblem[] {
   const services = Object.entries(raw.services ?? {});
   const problems: SchemaProblem[] = [];
   if (!raw.app && !raw.web) {
     problems.push(problem('', 'declares no app: add app (a mobile app), web (a web app), or both'));
   }
-  problems.push(...appProblems(raw, services), ...webProblems(raw, services), ...browserProblems(raw), ...resourceProblems(raw));
+  problems.push(
+    ...appProblems(raw, services),
+    ...webProblems(raw, services),
+    ...browserProblems(raw),
+    ...resourceProblems(raw),
+    ...needsProblems(raw),
+  );
   for (const [name, service] of services) {
     if (BROWSER_SERVICES.includes(name)) {
       problems.push(problem(`/services/${name}`, `${name} is the name of the lane's browser ports; name the service otherwise`));
@@ -313,7 +374,7 @@ function crossFieldProblems(raw: RawConfig): SchemaProblem[] {
   return problems;
 }
 
-function normalize(raw: RawConfig, file: string): ProjectConfig {
+function normalize(raw: RawConfig, file: string): PlatformConfig {
   const dir = path.dirname(file);
   const services = Object.entries(raw.services ?? {}).map(([name, s]): ServiceConfig => {
     const host = s.ready.host ?? DEFAULT_READY_HOST;
@@ -330,6 +391,7 @@ function normalize(raw: RawConfig, file: string): ProjectConfig {
       timeoutMs: (s.timeoutSeconds ?? DEFAULT_READY_SECONDS) * 1000,
       dial: s.dial ? { argument: s.dial.argument, value: s.dial.value ?? DEFAULT_DIAL_VALUE } : null,
       platforms: s.platforms ?? null,
+      needs: s.needs ?? [],
     };
   });
   const { app } = raw;
@@ -376,6 +438,15 @@ function normalize(raw: RawConfig, file: string): ProjectConfig {
       teardown: r.teardown,
       cwd: path.resolve(dir, r.cwd ?? '.'),
       teardownTimeoutMs: (r.teardownTimeoutSeconds ?? DEFAULT_TEARDOWN_SECONDS) * 1000,
+      needs: r.needs ?? [],
+    })),
+    shared: Object.entries(raw.shared ?? {}).map(([name, s]) => ({
+      name,
+      start: s.start,
+      stop: s.stop,
+      ready: s.ready,
+      cwd: path.resolve(dir, s.cwd ?? '.'),
+      timeoutMs: (s.timeoutSeconds ?? DEFAULT_SHARED_SECONDS) * 1000,
     })),
     hooks: { ...raw.hooks },
     preconditions: (raw.preconditions ?? []).map(p => ({
@@ -423,7 +494,7 @@ export function declaredPlatforms(config: ProjectConfig): ProjectPlatform[] {
  * The config as `up` sees it for one platform: app.ios or app.android replace the app's fields they name. A platform
  * the config declares no app for is refused.
  */
-export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): ProjectConfig {
+export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): PlatformConfig {
   if (platform === WEB_PLATFORM) {
     if (!config.web) {
       throw new UsageError(
@@ -450,13 +521,25 @@ export function forPlatform(config: ProjectConfig, platform: ProjectPlatform): P
   return { ...config, platform, app: resolveApp(config.baseApp, config.platformApps, platform), services };
 }
 
-/** The config a lane was brought up with: for its platform, while the config still declares that platform. */
-export function loadLaneConfig(file: string, platform: ProjectPlatform | undefined): ProjectConfig {
+/**
+ * The config as `up --no-app` sees it: the project's data alone, for no platform, with no app, web app or service to
+ * run. Its resources, shared services, hooks and preconditions stay.
+ */
+export function withoutApp(config: ProjectConfig): ProjectConfig {
+  return { ...config, platform: null, app: null, web: null, services: [] };
+}
+
+/**
+ * The config a lane was brought up with: for its platform, while the config still declares that platform, and the
+ * project's data alone for a lane `up --no-app` made (`platform` null).
+ */
+export function loadLaneConfig(file: string, platform: ProjectPlatform | null | undefined): ProjectConfig {
   const loaded = loadProjectConfig(file);
+  if (platform === null) return withoutApp(loaded);
   return platform !== undefined && declaredPlatforms(loaded).includes(platform) ? forPlatform(loaded, platform) : loaded;
 }
 
-export function parseProjectConfig(raw: unknown, file: string): ProjectConfig {
+export function parseProjectConfig(raw: unknown, file: string): PlatformConfig {
   const problems = validator.validate(raw);
   if (problems.length > 0) throw new ProjectConfigError(file, problems);
   const typed = raw as RawConfig;
@@ -465,7 +548,7 @@ export function parseProjectConfig(raw: unknown, file: string): ProjectConfig {
   return normalize(typed, file);
 }
 
-export function loadProjectConfig(file: string): ProjectConfig {
+export function loadProjectConfig(file: string): PlatformConfig {
   if (path.basename(file) === FORMER.configFile) throw formerConfigError(file);
   const text = fs.readFileSync(file, 'utf8');
   let raw: unknown;

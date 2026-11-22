@@ -49,6 +49,11 @@ export function tempDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `agentlane-${label}-`));
 }
 
+/** Shell that waits until `gate` exists, giving up after about a minute. */
+export function untilGate(gate: string): string {
+  return `n=0; while [ ! -f '${gate}' ] && [ "$n" -lt 3000 ]; do n=$((n + 1)); sleep 0.02; done`;
+}
+
 export class FakeProcesses implements ProcessTable {
   private readonly table = new Map<number, { start: string; ppid: number; command: string }>([
     [1, { start: 'Sun Oct 11 07:00:00 2026', ppid: 0, command: '/sbin/launchd' }],

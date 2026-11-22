@@ -57,6 +57,7 @@ It also sets the driver's own variables that bind it to the lane: `PLAYWRIGHT_CL
 | `AGENTLANE_JAVA_HOME`            | The JDK 17 for Maestro and the Android build, ahead of `JAVA_HOME`.                   |
 | `AGENTLANE_MAESTRO`              | A Maestro binary to use instead of the pinned build, such as a local build. `doctor` flags it as not the release. |
 | `AGENTLANE_PLAYWRIGHT_BROWSERS`  | A Playwright browsers folder to use instead of the pinned builds, for a host they aren't pinned for. |
+| `AGENTLANE_ALLOW_CONTAINER`      | Set to `1` in front of a command, or in the agent's environment, to let the [guard](guard.md#containers) pass a `docker` or `podman` command that leaves a container running. An agent sets it only when the user has asked, in that conversation, for a container outside lanes. agentlane doesn't track or stop that container. |
 | `AGENTLANE_INIT_PACKAGE`         | What `init` adds as the dev dependency instead of `agentlane@<its own version>`, such as a local tarball when you try out a build. |
 
 `AGENTLANE_STATE_DIR`, `AGENTLANE_OWNER_PID` and `AGENTLANE_JAVA_HOME` pass through to a lane's hooks, services and `exec` commands. Every other `AGENTLANE_` variable in the caller's environment is dropped there, so one lane's values never leak into another's. agentlane also reads `XDG_STATE_HOME` and `XDG_DATA_HOME` for its folders, `JAVA_HOME` for the JDK, and `ANDROID_HOME` or `ANDROID_SDK_ROOT` for the Android SDK.

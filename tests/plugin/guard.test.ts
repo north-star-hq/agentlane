@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
 import type { Platform } from '../../src/devices/backend.ts';
 import type { GuardContext } from '../../src/plugin/guard.ts';
 import { guard } from '../../src/plugin/guard.ts';
 import type { OwnerState } from '../../src/registry/owner.ts';
 import type { LaneStatus, DeviceState } from '../../src/registry/types.ts';
+import { tempDir } from '../support/fakes.ts';
 
 const NOW = Date.UTC(2026, 9, 11, 12, 0, 0);
 const OTHER_UDID = 'A1B2C3D4-0000-4000-8000-00000000000A';
@@ -416,4 +419,208 @@ test('guard: a session with no browser of its own is told to claim one', () => {
   const verdict = guard('agent-browser --session agentlane-2222bbbb snapshot', {}, context([otherAb]));
   assert.equal(verdict.allow, false);
   assert.match(verdict.reason, /agentlane up --platform web {3}\(claims a browser of your own/);
+});
+
+const STARTS_A_CONTAINER = [
+  'docker run -d postgres:16',
+  'docker run --detach postgres:16',
+  'docker run --detach=true postgres:16',
+  'docker run -dit --name db postgres:16',
+  'docker run -itd postgres:16',
+  'docker run --rm -e POSTGRES_PASSWORD=x -p 5432:5432 -d postgres:16',
+  'docker run -p5432:5432 -d postgres:16',
+  'podman run -d postgres:16',
+  'docker --context colima run -d postgres:16',
+  'docker -H unix:///var/run/docker.sock --log-level warn run -d postgres:16',
+  'docker --some-new-flag value run -d postgres:16',
+  'docker container run -d postgres:16',
+  'docker start db',
+  'docker restart db',
+  'docker container start db',
+  'docker container restart db',
+  'podman start db',
+  'podman pod start pod1',
+  'podman kube play pod.yaml',
+  'docker compose up -d',
+  'docker compose up --detach db',
+  'docker compose up --wait',
+  'docker compose -f a.yml -p proj up -d',
+  'docker compose up db -d',
+  'docker compose up -Vd',
+  'docker compose up -wd',
+  'docker compose up -yd',
+  'docker compose up -dw',
+  'docker compose up -ywd db',
+  'docker compose start',
+  'docker compose run -d db',
+  'docker --context x compose --file a.yml up -d',
+  'podman compose up -d',
+  'docker-compose up -d',
+  'podman-compose up -d',
+  "sh -c 'docker run -d postgres:16'",
+  'bash -lc "docker compose up -d"',
+  'do""cker run -d postgres:16',
+  "'docker' run -d postgres:16",
+  'd{o,}cker run -d postgres:16',
+  'npx docker-compose up -d',
+  'pnpm exec docker compose up -d',
+  'env DOCKER_HOST=unix:///x docker run -d postgres:16',
+  'sudo docker run -d postgres:16',
+  '/usr/local/bin/docker run -d postgres:16',
+  'nohup docker run -d postgres:16 &',
+  'setsid docker run -d postgres:16',
+  'cd /tmp && docker run -d postgres:16 && echo started',
+  'echo "$(docker run -d postgres:16)"',
+  'AGENTLANE_ALLOW_CONTAINER=1 true; docker run -d x',
+  'AGENTLANE_ALLOW_CONTAINER=0 docker run -d x',
+];
+
+const STARTS_NO_CONTAINER = [
+  'docker run --rm alpine echo hi',
+  'docker run --rm -it alpine sh',
+  'docker run --rm alpine ls -d /',
+  'docker run --rm --name probe -e X=-d alpine true',
+  'docker run --detach=false alpine true',
+  'docker run --rm -- alpine -d',
+  'docker create --name db postgres:16',
+  'docker ps -a',
+  'docker logs -f db',
+  'docker exec -it db psql',
+  'docker exec -d db touch /tmp/x',
+  'docker inspect db',
+  'docker stop db',
+  'docker rm -f db',
+  'docker build -t app .',
+  'docker pull postgres:16',
+  'docker images',
+  'docker start --help',
+  'docker compose down',
+  'docker compose ps',
+  'docker compose logs -f',
+  'docker compose up',
+  'docker compose up --build db',
+  'docker compose up -w',
+  'docker compose up -wy db',
+  'docker compose up -yt 5',
+  'docker compose run --rm db psql',
+  'docker compose -f docker-compose.yml config',
+  'docker-compose down -v',
+  'podman ps',
+  'podman kube play --down pod.yaml',
+  'nohup some-server &',
+  'nohup pnpm dev > dev.log 2>&1 &',
+  'setsid node server.js &',
+  'node server.js & disown',
+  'cat docker-compose.yml',
+  'grep -rn "docker run -d" docs/',
+  'echo docker run -d postgres',
+  'AGENTLANE_ALLOW_CONTAINER=1 docker run -d postgres:16',
+  'AGENTLANE_ALLOW_CONTAINER=1 docker compose up -d',
+  "AGENTLANE_ALLOW_CONTAINER=1 sh -c 'docker run -d postgres:16'",
+  'export AGENTLANE_ALLOW_CONTAINER=1; docker run -d postgres:16',
+  'env AGENTLANE_ALLOW_CONTAINER=1 docker run -d postgres:16',
+];
+
+for (const command of STARTS_A_CONTAINER) {
+  test(`guard: a container that outlives the command is blocked: ${command}`, () => {
+    const verdict = guard(command, {}, context());
+    assert.equal(verdict.allow, false, `expected a block for: ${command}`);
+    assert.match(verdict.reason, /^agentlane: blocked: `.*` starts a container that keeps running after the command ends/);
+  });
+}
+
+for (const command of STARTS_NO_CONTAINER) {
+  test(`guard: a command that starts no lasting container is allowed: ${command}`, () => {
+    const verdict = guard(command, {}, context([]));
+    assert.equal(verdict.allow, true, verdict.allow ? '' : verdict.reason);
+  });
+}
+
+test('guard: the container block names the lane routes and the bypass the user has to ask for', () => {
+  const verdict = guard('cd /w/mine && docker run -d -p 5432:5432 postgres:16', {}, context());
+  assert.equal(verdict.allow, false);
+  assert.equal(
+    verdict.reason,
+    [
+      'agentlane: blocked: `docker run -d -p 5432:5432 postgres:16` starts a container that keeps running after the command ends, and no lane will stop it.',
+      'to recover:',
+      '  declare the server under "shared" in agentlane.json (or its data as a resource), then node_modules/.bin/agentlane up, or node_modules/.bin/agentlane up --no-app for the data alone',
+      "  node_modules/.bin/agentlane exec -- <command>   (runs the work with that lane's servers and data)",
+      "  AGENTLANE_ALLOW_CONTAINER=1 docker run -d -p 5432:5432 postgres:16   (only if the user has asked, in this conversation, for a container outside lanes; agentlane won't track or stop it)",
+    ].join('\n'),
+  );
+});
+
+test('guard: the bypass in the environment the hook sees lets a container start through', () => {
+  assert.equal(guard('docker run -d postgres:16', { AGENTLANE_ALLOW_CONTAINER: '1' }, context()).allow, true);
+  assert.equal(guard('docker compose up -d', { AGENTLANE_ALLOW_CONTAINER: '1' }, context()).allow, true);
+  assert.equal(guard('docker run -d postgres:16', { AGENTLANE_ALLOW_CONTAINER: '' }, context()).allow, false);
+  assert.equal(
+    guard('env -u AGENTLANE_ALLOW_CONTAINER docker run -d x', { AGENTLANE_ALLOW_CONTAINER: '1' }, context()).allow,
+    false,
+  );
+});
+
+test('guard: a device command is judged as before beside a container start the bypass allows', () => {
+  const verdict = guard(`AGENTLANE_ALLOW_CONTAINER=1 docker run -d x; xcrun simctl erase ${OTHER_UDID}`, {}, context());
+  assert.equal(verdict.allow, false);
+  assert.ok(verdict.reason.includes(`lane ${otherIos.id}`), verdict.reason);
+});
+
+test('guard: a package script that starts a container is blocked through the package manager that runs it', () => {
+  const dir = fs.realpathSync(tempDir('guard-scripts'));
+  try {
+    const sub = path.join(dir, 'apps', 'api');
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({
+        scripts: {
+          'db:up': 'docker compose up -d',
+          'db:down': 'docker compose down',
+          dev: 'pnpm run db:up && next dev',
+          predb: 'docker start pg',
+          db: 'node seed.js',
+          start: 'docker run -d app',
+          test: 'node --test',
+          loop: 'pnpm loop',
+          ios: `xcrun simctl erase ${OTHER_UDID}`,
+        },
+      }),
+    );
+    const blocked = (command: string, cwd = dir) => !guard(command, {}, context(ALL, cwd)).allow;
+    for (const command of [
+      'pnpm run db:up',
+      'pnpm db:up',
+      'npm run db:up',
+      'npm run-script db:up',
+      'yarn db:up',
+      'yarn run db:up',
+      'bun run db:up',
+      'pnpm run dev',
+      'npm run db',
+      'npm start',
+      'pnpm start',
+      `pnpm -C ${dir} run db:up`,
+      `pnpm --dir=${dir} db:up`,
+      'sh -c "pnpm run db:up"',
+    ])
+      assert.equal(blocked(command), true, `blocks ${command}`);
+    assert.equal(blocked('pnpm run db:up', sub), true, 'from a folder below the package.json');
+    for (const command of [
+      'pnpm run db:down',
+      'pnpm test',
+      'npm test',
+      'pnpm run db',
+      'pnpm loop',
+      'pnpm run missing',
+      'pnpm install',
+      'AGENTLANE_ALLOW_CONTAINER=1 pnpm run db:up',
+      'pnpm run ios',
+    ])
+      assert.equal(blocked(command), false, `allows ${command}`);
+    assert.equal(blocked('pnpm run db:up', '/'), false, 'no package.json above the folder');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -254,6 +254,7 @@ const CONFIG_NODES: Record<string, (schema: Schema) => { node: SchemaNode; prefi
   'ready-http': schema => ({ node: resolve(schema, { $ref: '#/$defs/httpReady' }), prefix: 'ready.' }),
   'ready-tcp': schema => ({ node: resolve(schema, { $ref: '#/$defs/tcpReady' }), prefix: 'ready.' }),
   resource: schema => ({ node: resolve(schema, { $ref: '#/$defs/resource' }), prefix: 'resources.<name>.' }),
+  shared: schema => ({ node: resolve(schema, { $ref: '#/$defs/shared' }), prefix: 'shared.<name>.' }),
   hooks: schema => ({ node: resolve(schema, { $ref: '#/$defs/hooks' }), prefix: 'hooks.' }),
   precondition: schema => ({ node: resolve(schema, { $ref: '#/$defs/precondition' }), prefix: 'preconditions[].' }),
   hygiene: schema => ({ node: resolve(schema, { $ref: '#/$defs/hygiene' }), prefix: 'hygiene.' }),

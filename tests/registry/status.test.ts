@@ -1,10 +1,18 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
+import type { SharedServiceConfig } from '../../src/project/config.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { describeStart } from '../../src/processes.ts';
-import type { ProcessState } from '../../src/registry/types.ts';
-import { world, type World } from '../support/world.ts';
+import { formatTime } from '../../src/registry/format.ts';
+import { databasePath } from '../../src/registry/paths.ts';
+import { SHARED_IDLE_MS, SHARED_STOP_RETRY_MS } from '../../src/registry/shared.ts';
+import type { LaneRef, ProcessState } from '../../src/registry/types.ts';
+import { sharedLog, startSharedForLane, stopUnneededShared } from '../../src/up/shared.ts';
+import { tempDir } from '../support/fakes.ts';
+import { parkNow, world, type World } from '../support/world.ts';
 
 const NO_DEVICE = { device: null } as const;
 
@@ -113,6 +121,234 @@ test('status lists every recorded process with one process listing', async () =>
     w.registry().status();
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.length, 5);
+  } finally {
+    w.close();
+  }
+});
+
+function sharedSpec(dir: string, over: Partial<SharedServiceConfig> = {}): SharedServiceConfig {
+  const up = path.join(dir, 'up');
+  return {
+    name: 'db',
+    start: `touch '${up}'`,
+    stop: `rm -f '${up}'`,
+    ready: `test -f '${up}'`,
+    cwd: dir,
+    timeoutMs: 5000,
+    ...over,
+  };
+}
+
+async function sharedLane(w: World, name: string): Promise<LaneRef> {
+  const request = w.request(w.procs.owner(), w.folder(name), { device: null, services: [], projectRoot: w.folder('lanski') });
+  const { lane } = await w.registry().claim(request);
+  return { id: lane.id, token: lane.token };
+}
+
+function sharedDeps(w: World) {
+  return { env: { PATH: process.env.PATH }, clock: w.clock };
+}
+
+function sharedBlock(stdout: string): string[] {
+  const lines = stdout.split('\n');
+  const start = lines.findIndex(l => l.startsWith('shared service '));
+  if (start < 0) return [];
+  const end = lines.findIndex((l, i) => i > start && l === '');
+  return lines.slice(start, end < 0 ? undefined : end);
+}
+
+test('status lists a shared service after the lanes: running, used by the two lanes that need it, with its repository', async () => {
+  const w = world();
+  const dir = tempDir('status-shared');
+  try {
+    const a = await sharedLane(w, 'a');
+    const b = await sharedLane(w, 'b');
+    const repo = w.folder('lanski');
+    const startedAt = w.clock.now();
+    await startSharedForLane(sharedDeps(w), w.registry(), a, [sharedSpec(dir)]);
+    await startSharedForLane(sharedDeps(w), w.registry(), b, [sharedSpec(dir)]);
+    const ids = [a.id, b.id].sort();
+    const stdout = await run(w, 'status');
+    assert.deepEqual(sharedBlock(stdout), [
+      `shared service db: running, used by 2 lanes (${ids.join(', ')})`,
+      `      repository   lanski  (${repo})   running since ${formatTime(startedAt)}`,
+    ]);
+    assert.ok(stdout.indexOf('lanes (2):') < stdout.indexOf('shared service db'), 'after the lanes');
+  } finally {
+    w.close();
+  }
+});
+
+test('status says when a running shared service nothing needs stops, then shows it stopped', async () => {
+  const w = world();
+  const dir = tempDir('status-shared');
+  try {
+    const a = await sharedLane(w, 'a');
+    await startSharedForLane(sharedDeps(w), w.registry(), a, [sharedSpec(dir)]);
+    assert.ok(parkNow(w.registry(), a));
+    const parkedAt = w.clock.now();
+    await w.clock.advance(60_000);
+    assert.equal(
+      sharedBlock(await run(w, 'status'))[0],
+      `shared service db: running, used by no lane; stops ${formatTime(parkedAt + SHARED_IDLE_MS)} (in 4m)`,
+    );
+    await w.clock.advance(SHARED_IDLE_MS);
+    assert.equal(sharedBlock(await run(w, 'status'))[0], 'shared service db: running, used by no lane; the next sweep stops it');
+    const stopped = await stopUnneededShared(sharedDeps(w), w.registry());
+    assert.deepEqual(
+      stopped.map(s => s.outcome),
+      ['stopped'],
+    );
+    const lines = sharedBlock(await run(w, 'status'));
+    assert.equal(lines[0], 'shared service db: stopped');
+    assert.match(lines[1] ?? '', new RegExp(` stopped since ${formatTime(w.clock.now())}$`));
+    assert.equal(lines.length, 2);
+  } finally {
+    w.close();
+  }
+});
+
+test('status shows a failed stop with its problem, its log and when the next sweep tries it again', async () => {
+  const w = world();
+  const dir = tempDir('status-shared');
+  try {
+    const a = await sharedLane(w, 'a');
+    const repo = w.folder('lanski');
+    const spec = sharedSpec(dir, { stop: 'echo docker is not running >&2; exit 3' });
+    await startSharedForLane(sharedDeps(w), w.registry(), a, [spec]);
+    assert.ok(parkNow(w.registry(), a));
+    await w.clock.advance(SHARED_IDLE_MS);
+    const failed = await stopUnneededShared(sharedDeps(w), w.registry());
+    assert.deepEqual(
+      failed.map(s => s.outcome),
+      ['failed'],
+    );
+    const failedAt = w.clock.now();
+    assert.deepEqual(sharedBlock(await run(w, 'status')), [
+      `shared service db: running, used by no lane; stops ${formatTime(failedAt + SHARED_STOP_RETRY_MS)} (in 1m)`,
+      `      repository   lanski  (${repo})   running since ${formatTime(failedAt)}`,
+      `      stop failed  1 time: stop exited 3: ${spec.stop}; the sweep tries it again then`,
+      `      log          ${sharedLog(w.dir, { repository: repo, name: 'db' })}`,
+    ]);
+  } finally {
+    w.close();
+  }
+});
+
+test('lanes --json carries each shared service under shared: its lane ids, state, times in ms and problem', async () => {
+  const w = world();
+  const dir = tempDir('status-shared');
+  try {
+    const a = await sharedLane(w, 'a');
+    const b = await sharedLane(w, 'b');
+    const repo = w.folder('lanski');
+    const startedAt = w.clock.now();
+    for (const ref of [a, b]) await startSharedForLane(sharedDeps(w), w.registry(), ref, [sharedSpec(dir)]);
+    assert.ok(parkNow(w.registry(), b));
+    const parkedAt = w.clock.now();
+    const report = JSON.parse(await run(w, 'lanes', ['--json'])) as { shared: Record<string, unknown>[] };
+    assert.equal(report.shared.length, 1);
+    const [db] = report.shared;
+    assert.deepEqual(
+      {
+        repository: db?.repository,
+        name: db?.name,
+        state: db?.state,
+        since: db?.since,
+        lanes: db?.lanes,
+        holding: db?.holding,
+        stopsAt: db?.stopsAt,
+        problem: db?.problem,
+        attempts: db?.attempts,
+      },
+      {
+        repository: repo,
+        name: 'db',
+        state: 'running',
+        since: startedAt,
+        lanes: [a.id],
+        holding: [],
+        stopsAt: null,
+        problem: null,
+        attempts: 0,
+      },
+    );
+    assert.ok(parkNow(w.registry(), a));
+    const idle = (JSON.parse(await run(w, 'lanes', ['--json'])) as { shared: Record<string, unknown>[] }).shared[0];
+    assert.deepEqual([idle?.lanes, idle?.unneededSince, idle?.stopsAt], [[], parkedAt, parkedAt + SHARED_IDLE_MS]);
+  } finally {
+    w.close();
+  }
+});
+
+test('status and lanes --json read a 0.5.x registry as it is: no shared services, and the file is not upgraded', async () => {
+  const w = world();
+  try {
+    fs.mkdirSync(w.dir, { recursive: true });
+    const old = new DatabaseSync(databasePath(w.dir));
+    old.exec(fs.readFileSync(path.join(import.meta.dirname, '..', 'fixtures', 'registry-0.5.1.sql'), 'utf8'));
+    old.exec('PRAGMA user_version = 1');
+    old.close();
+    const before = fs.readFileSync(databasePath(w.dir));
+
+    const stdout = await run(w, 'status');
+    assert.match(stdout, /^no lanes$/m);
+    assert.doesNotMatch(stdout, /shared service/);
+    const report = JSON.parse(await run(w, 'lanes', ['--json'])) as { lanes: unknown[]; shared: unknown[] };
+    assert.deepEqual([report.lanes, report.shared], [[], []]);
+
+    assert.deepEqual(fs.readFileSync(databasePath(w.dir)), before);
+    const db = new DatabaseSync(databasePath(w.dir));
+    try {
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map(r => String(r.name));
+      assert.ok(!tables.includes('shared_services') && !tables.includes('shared_needs'), tables.join(', '));
+      const columns = db
+        .prepare("SELECT name FROM pragma_table_info('resources')")
+        .all()
+        .map(r => String(r.name));
+      assert.ok(!columns.includes('repository') && !columns.includes('needs'), columns.join(', '));
+    } finally {
+      db.close();
+    }
+  } finally {
+    w.close();
+  }
+});
+
+test('status upgrades a registry older than 0.5.x, which lacks tables status reads, before reading it', async () => {
+  const w = world();
+  try {
+    fs.mkdirSync(w.dir, { recursive: true });
+    const old = new DatabaseSync(databasePath(w.dir));
+    old.exec(fs.readFileSync(path.join(import.meta.dirname, '..', 'fixtures', 'registry-0.5.1.sql'), 'utf8'));
+    old.exec('DROP TABLE holds; DROP TABLE owner_checks; DROP TABLE parks');
+    old.exec('PRAGMA user_version = 1');
+    old.close();
+
+    assert.match(await run(w, 'status'), /^no lanes$/m);
+    const db = new DatabaseSync(databasePath(w.dir));
+    try {
+      const tables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map(r => String(r.name));
+      for (const t of ['parks', 'holds', 'owner_checks', 'shared_services']) assert.ok(tables.includes(t), t);
+    } finally {
+      db.close();
+    }
+  } finally {
+    w.close();
+  }
+});
+
+test('status prints no shared service line when there are none', async () => {
+  const w = world();
+  try {
+    await sharedLane(w, 'a');
+    assert.doesNotMatch(await run(w, 'status'), /shared service/);
   } finally {
     w.close();
   }

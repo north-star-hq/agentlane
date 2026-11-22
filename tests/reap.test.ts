@@ -106,6 +106,7 @@ function makeResource(registry: Registry, lane: Lane, file: string): void {
     timeoutMs: 10_000,
     env: {},
     cleared: ['DATABASE_URL'],
+    needs: [],
   });
   registry.finishResource(lane.id, 'db', { DATABASE_URL: `postgres://db/${lane.id}` });
 }

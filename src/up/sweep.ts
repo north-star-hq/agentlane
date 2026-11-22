@@ -31,7 +31,9 @@ import { LANE_FILES_KEEP_MS, laneFolderIds, pruneEndedLaneFiles } from './lane-f
 import type { ParkDeps, ParkOutcome } from './park.ts';
 import { attemptId, deadHolder, PARK_RETRY_MS, parkLane } from './park.ts';
 import { tearDownLane } from './release.ts';
-import { tearDownEndedResources } from './resources.ts';
+import { FailedStarts, tearDownEndedResources } from './resources.ts';
+import type { SharedStopped } from './shared.ts';
+import { stopUnneededShared } from './shared.ts';
 
 export const SWEEP_COMMAND = 'sweep';
 
@@ -133,7 +135,8 @@ function reapDue(lane: SweptLane, now: number): boolean {
 /**
  * Whether the sweep has work: an owner no check or call has shown alive lately, a lane whose owner is gone to park or
  * end, a lane no hold keeps up to park, or one a park or wake left partway; a service leader not seen running lately;
- * a device recorder an ended lane left marked as running. One read of the registry, plus the lane-folder call record
+ * a device recorder an ended lane left marked as running; a shared service nothing has needed for SHARED_IDLE_MS, or
+ * whose failed stop is due again. One read of the registry, plus the lane-folder call record
  * of each lane the registry has as unused and the lane folders' list; no process starts. With `runningSince`, the start
  * of a sweep still running, only an owner check that fell due after that start counts, since that sweep covers the rest.
  */
@@ -159,6 +162,7 @@ export function sweepDue(site: SweepSite, runningSince?: number): boolean {
     if (lanes.some(l => (l.gone ? goneParkDue(l, now) || reapDue(l, now) : unseen(site.dir, l, now)))) return true;
     if (aliveRefreshDue(registry, readMark(site.dir), now)) return true;
     if (endedFolders(folders, lanes).some(id => strayDue(laneEvidence(site.dir, id), now))) return true;
+    if (registry.sharedStopCandidates().length > 0) return true;
     return registry
       .parkCandidates(idleSince, now - PARK_RETRY_MS)
       .some(c => c.hold === null && !gone.has(c.ref.id) && unused(site.dir, c, idleSince));
@@ -273,6 +277,8 @@ export interface SweepReport {
   alive: LeaderSeen[];
   /** The device recorders of ended lanes this sweep looked at: stopped, found gone, or left running unproven. */
   recorders: StrayRecorder[];
+  /** The shared services this sweep stopped, or tried to: nothing had needed them for SHARED_IDLE_MS. */
+  shared: SharedStopped[];
   /** The ended lanes whose files this sweep removed, LANE_FILES_KEEP_MS after they ended. */
   pruned: string[];
   /** What the sweep could not do, each line naming its lane. */
@@ -307,6 +313,7 @@ async function reapLane(
   registry: Registry,
   lane: SweptLane,
   dead: readonly ProcessIdentity[],
+  failedStarts: FailedStarts,
 ): Promise<ReapOutcome> {
   const { ref } = lane;
   const attempt = attemptId();
@@ -325,7 +332,7 @@ async function reapLane(
       ...(await stopEndedBrowsers(deps.browser ?? realBrowserTools, registry, deps.dir, deps.clock)).filter(
         t => t.lane === ref.id,
       ),
-      ...(await tearDownEndedResources(deps, registry, deps.dir, { lane: ref.id })),
+      ...(await tearDownEndedResources(deps, registry, deps.dir, { lane: ref.id }, failedStarts)),
     ];
     return {
       kind: 'ended',
@@ -345,7 +352,9 @@ async function reapLane(
  * The sweep's work, in the process that does it, for every lane on the Mac. It asks the process table once about the
  * owners no check or call has shown alive lately. A lane whose owner it finds gone is parked at once, and ended with
  * what a release does RETURN_WINDOW_MS after it was found gone, unless a process of its owner's session takes it back
- * first. It parks each lane whose owner left it unused for the park window and holds it no more.
+ * first. Its reaps tear down resources as one pass, so a shared service whose start fails is tried once however many
+ * reaped lanes need it. It parks each lane whose owner left it unused for the park window and holds it no more. It stops
+ * each shared service no active lane and no running teardown has needed for SHARED_IDLE_MS.
  */
 export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   const say = deps.log ?? (() => undefined);
@@ -357,6 +366,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
     reaps: [],
     alive: [],
     recorders: [],
+    shared: [],
     pruned: [],
     problems: [],
   };
@@ -446,6 +456,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
       }
     }
 
+    const failedStarts = new FailedStarts();
     for (const lane of goneIds.size > 0 ? registry.sweepList() : []) {
       const reaper = lane.gone?.reaper ?? null;
       if (!reapDue(lane, now)) continue;
@@ -454,7 +465,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
         ...[deadHolder(lane.park, deps.processes)].filter((p): p is ProcessIdentity => p !== null),
       ];
       try {
-        const outcome = await reapLane(deps, registry, lane, dead);
+        const outcome = await reapLane(deps, registry, lane, dead, failedStarts);
         report.reaps.push(outcome);
         if (outcome.kind === 'ended') {
           say(
@@ -465,6 +476,22 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
         } else say(`did not end lane ${outcome.lane} yet: ${outcome.reason}`);
       } catch (error) {
         problem(lane.ref.id, `ending it stopped partway: ${messageOf(error)}`);
+      }
+    }
+
+    try {
+      report.shared = await stopUnneededShared({ env: deps.env, clock: deps.clock }, registry);
+    } catch (error) {
+      report.problems.push(`shared services: stopping them stopped partway: ${messageOf(error)}`);
+      say(`shared services: PROBLEM: stopping them stopped partway: ${messageOf(error)}`);
+    }
+    for (const stop of report.shared) {
+      const which = `shared service ${stop.name} of ${stop.repository}`;
+      if (stop.outcome === 'stopped') {
+        say(`stopped ${which}: nothing has needed it since ${formatTime(stop.unneededSince)}`);
+      } else {
+        report.problems.push(`${which}: ${stop.problem ?? 'its stop failed'}`);
+        say(`${which}: PROBLEM: ${stop.problem ?? 'its stop failed'}`);
       }
     }
 

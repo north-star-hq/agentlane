@@ -99,8 +99,51 @@ CREATE TABLE IF NOT EXISTS owner_checks (
     AND (reaper_pid IS NULL) = (attempt IS NULL)),
   CHECK (reaper_pid IS NULL OR gone IS NOT NULL)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS shared_services (
+  repository TEXT NOT NULL,
+  name TEXT NOT NULL,
+  state TEXT NOT NULL,
+  since INTEGER NOT NULL,
+  start TEXT NOT NULL,
+  stop TEXT NOT NULL,
+  ready TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  timeout_ms INTEGER NOT NULL,
+  env TEXT NOT NULL,
+  unneeded_since INTEGER,
+  holder_pid INTEGER,
+  holder_start TEXT,
+  command_pid INTEGER,
+  command_start TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER,
+  problem TEXT,
+  PRIMARY KEY (repository, name),
+  CHECK (state IN ('stopped', 'starting', 'running', 'stopping')),
+  CHECK ((holder_pid IS NULL) = (state IN ('stopped', 'running')) AND (holder_pid IS NULL) = (holder_start IS NULL)),
+  CHECK ((command_pid IS NULL) = (command_start IS NULL) AND (command_pid IS NULL OR holder_pid IS NOT NULL))
+) STRICT;
+CREATE TABLE IF NOT EXISTS shared_needs (
+  claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  PRIMARY KEY (claim_id, name)
+) STRICT;
 `;
-const ADDED_TABLES = ['resources', 'browsers', 'process_alive', 'device_leases', 'parks', 'holds', 'owner_checks'];
+const ADDED_TABLES = [
+  'resources',
+  'browsers',
+  'process_alive',
+  'device_leases',
+  'parks',
+  'holds',
+  'owner_checks',
+  'shared_services',
+  'shared_needs',
+];
+const ADDED_COLUMNS: readonly { table: string; column: string; sql: string }[] = [
+  { table: 'resources', column: 'repository', sql: 'ALTER TABLE resources ADD COLUMN repository TEXT' },
+  { table: 'resources', column: 'needs', sql: "ALTER TABLE resources ADD COLUMN needs TEXT NOT NULL DEFAULT '[]'" },
+];
 
 const SCHEMA = `
 CREATE TABLE claims (
@@ -236,6 +279,13 @@ function untilFree<T>(deadline: number, action: () => T, onTimeout: () => Error)
   }
 }
 
+function newerFormat(dir: string, version: number): UsageError {
+  return new UsageError(
+    `${databasePath(dir)} is registry format ${String(version)}, newer than this ${TOOL} understands (${String(SCHEMA_VERSION)})`,
+    `upgrade ${TOOL} to the version every project on this Mac uses`,
+  );
+}
+
 export const UNIDENTIFIED = 'an unidentified caller';
 
 export class Store {
@@ -279,7 +329,7 @@ export class Store {
     );
     if (!added) {
       store.write(() => {
-        store.db.exec(FORMAT_1_ADDITIONS);
+        store.addToFormat1();
       });
     }
     return store;
@@ -288,6 +338,45 @@ export class Store {
   static openExisting(dir: string, lockWaitMs: number): Store | null {
     if (!fs.existsSync(databasePath(dir))) return null;
     return Store.open(dir, lockWaitMs);
+  }
+
+  /**
+   * Opens the registry for reading, without upgrading or writing it, or returns null when there is none yet. A
+   * registry an earlier 0.x wrote is read as it is; `lacking` names what it doesn't have.
+   */
+  static openToRead(dir: string, lockWaitMs: number): Store | null {
+    if (!fs.existsSync(databasePath(dir))) return null;
+    const db = new DatabaseSync(databasePath(dir), { readOnly: true, timeout: Math.min(1000, lockWaitMs) });
+    const store = new Store(dir, db, lockWaitMs);
+    let version: number;
+    try {
+      version = untilFree(
+        Date.now() + lockWaitMs,
+        () => store.version(),
+        () => store.busyRefusal(),
+      );
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+    if (version === SCHEMA_VERSION) return store;
+    store.close();
+    if (version > SCHEMA_VERSION) throw newerFormat(dir, version);
+    return null;
+  }
+
+  /** The tables and columns later versions added to format 1 that this registry lacks, as `table` or `table.column`. */
+  lacking(): string[] {
+    const tables = new Set(
+      this.db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map(row => text(row, 'name')),
+    );
+    return [
+      ...ADDED_TABLES.filter(t => !tables.has(t)),
+      ...ADDED_COLUMNS.filter(c => tables.has(c.table) && !this.hasColumn(c.table, c.column)).map(c => `${c.table}.${c.column}`),
+    ];
   }
 
   close(): void {
@@ -300,7 +389,17 @@ export class Store {
         `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN (${ADDED_TABLES.map(() => '?').join(', ')})`,
       )
       .get(...ADDED_TABLES);
-    return found !== undefined && int(found, 'n') === ADDED_TABLES.length;
+    if (found === undefined || int(found, 'n') !== ADDED_TABLES.length) return false;
+    return ADDED_COLUMNS.every(c => this.hasColumn(c.table, c.column));
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    return this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column) !== undefined;
+  }
+
+  private addToFormat1(): void {
+    this.db.exec(FORMAT_1_ADDITIONS);
+    for (const c of ADDED_COLUMNS) if (!this.hasColumn(c.table, c.column)) this.db.exec(c.sql);
   }
 
   private version(): number {
@@ -312,14 +411,9 @@ export class Store {
     this.write(() => {
       const version = this.version();
       if (version === SCHEMA_VERSION) return;
-      if (version > SCHEMA_VERSION) {
-        throw new UsageError(
-          `${databasePath(this.dir)} is registry format ${String(version)}, newer than this ${TOOL} understands (${String(SCHEMA_VERSION)})`,
-          `upgrade ${TOOL} to the version every project on this Mac uses`,
-        );
-      }
+      if (version > SCHEMA_VERSION) throw newerFormat(this.dir, version);
       this.db.exec(SCHEMA);
-      this.db.exec(FORMAT_1_ADDITIONS);
+      this.addToFormat1();
       this.db.exec(`PRAGMA user_version = ${String(SCHEMA_VERSION)}`);
     });
   }

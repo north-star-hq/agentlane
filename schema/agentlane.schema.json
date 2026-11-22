@@ -35,6 +35,16 @@
         "$ref": "#/$defs/resource"
       }
     },
+    "shared": {
+      "type": "object",
+      "description": "The servers the lanes of this repository use together, such as the database server each lane's database lives in, by name. There is one of each per repository, used by the lanes of all its worktrees. A lane needs a shared service when one of its resources or services names it in `needs`. agentlane starts a shared service when a lane needs it, and stops it 5 minutes after the last lane that needs it parks or ends; it never removes one. A shared service whose start failed may be partly up, so it counts as running and stops under the same rule. A stop runs the commands, with the PATH and the variables that choose a container tool's daemon and project, as they were at the shared service's last start, so a change to them counts from its next start.",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/shared"
+      }
+    },
     "hooks": {
       "$ref": "#/$defs/hooks"
     },
@@ -398,6 +408,52 @@
           "exclusiveMinimum": 0,
           "default": 120,
           "description": "How long teardown may run before it is stopped and counted as failed."
+        },
+        "needs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "uniqueItems": true,
+          "description": "The shared services this uses, by their names under `shared`."
+        }
+      }
+    },
+    "shared": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "stop",
+        "ready"
+      ],
+      "properties": {
+        "start": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that starts the server and exits, leaving it running. It must cope with running twice and with finding the server already running."
+        },
+        "stop": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that stops the server and keeps its data. It must cope with running twice and with finding the server already stopped, or only partly started."
+        },
+        "ready": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A shell command that exits 0 when the server answers. agentlane also runs it to tell whether the shared service is running."
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The directory start, stop and ready run in, relative to this file."
+        },
+        "timeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 180,
+          "description": "How long start may run, and then how long ready may take to pass, before the start counts as failed; and how long stop may run before it counts as failed."
         }
       }
     },
@@ -492,6 +548,15 @@
               "description": "The argument's value; {port} is the service's port."
             }
           }
+        },
+        "needs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "uniqueItems": true,
+          "description": "The shared services this uses, by their names under `shared`."
         }
       }
     },

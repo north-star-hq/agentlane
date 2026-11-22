@@ -4,6 +4,7 @@ import type { RegistryConfig } from './config.ts';
 import type { Owner, OwnerState, ProvenState } from './owner.ts';
 import type { LaneHold } from './holds.ts';
 import type { ParkRestarts, ParkState } from './parks.ts';
+import type { SharedServiceStatus } from './shared.ts';
 
 export interface ServiceRequest {
   name: string;
@@ -104,6 +105,8 @@ export interface ResourceSpec {
   env: ResourceValues;
   /** Every variable the config's resources export: unset for teardown unless it has a recorded value. */
   cleared: string[];
+  /** The shared services its create and teardown use, by name. */
+  needs: string[];
 }
 
 export type ResourceStart =
@@ -113,6 +116,8 @@ export type ResourceStart =
 export interface ResourceTeardown extends ResourceSpec {
   lane: string;
   worktree: string;
+  /** The repository its lane was in, which its shared services are kept under; null for a row an earlier version made. */
+  repository: string | null;
   exports: ResourceValues | null;
   createdAt: number;
   attempts: number;
@@ -250,4 +255,6 @@ export interface StatusReport {
   recent: EndedLane[];
   /** Resources of ended lanes whose teardown has not run, or failed and waits for the next try. */
   teardowns: PendingTeardown[];
+  /** The shared services agentlane has started, of every repository, and whether each runs, who needs it and when it stops. */
+  shared: SharedServiceStatus[];
 }

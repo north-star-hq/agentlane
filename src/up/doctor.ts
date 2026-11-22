@@ -12,7 +12,8 @@ import { readDialDefault } from '../devices/dial.ts';
 import { checkHygiene } from '../devices/hygiene.ts';
 import { MAESTRO_OVERRIDE_ENV, maestroBuild, type MaestroBuild } from '../driver/install.ts';
 import { metroUrl } from '../devices/launch.ts';
-import { LAUNCH_ARGS_ENV, webUrl } from '../hooks/env.ts';
+import { hookEnvironment, LAUNCH_ARGS_ENV, webUrl } from '../hooks/env.ts';
+import { runCheck } from '../hooks/run.ts';
 import type { SimTools } from '../devices/tools.ts';
 import {
   judgeAndroidVariant,
@@ -22,11 +23,13 @@ import {
   type VariantVerdict,
 } from '../devices/variant.ts';
 import { CLI } from '../name.ts';
-import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/config.ts';
+import type { MobileConfig, ProjectConfig, ProjectPlatform, SharedServiceConfig } from '../project/config.ts';
 import { asMobile } from '../project/config.ts';
 import type { OwnerState } from '../registry/owner.ts';
 import { AGENTS, describeOwner, describeState } from '../registry/owner.ts';
 import { formatTime } from '../registry/format.ts';
+import { readLaneNeeds } from '../registry/registry.ts';
+import { SHARED_READY_RUN_MAX_MS } from '../registry/shared.ts';
 import { describeRestarts } from '../registry/parks.ts';
 import type { LaneInfo, ParkStatus } from '../registry/types.ts';
 import { explainInspection, inspectService, listenersElsewhere } from '../services/services.ts';
@@ -324,6 +327,8 @@ export async function diagnose(deps: EnvDeps, input: DoctorInput): Promise<Docto
   }
   if (!config || !lane || mismatch) return finish(lane, checks);
   checks.push(...resourceChecks(config, lane));
+  checks.push(...(await sharedChecks(deps, config, lane)));
+  if (config.platform === null) return finish(lane, checks);
   const tools = deps.browser ?? realBrowserTools;
   if (hasBrowser(lane)) checks.push(...(await browserChecks(tools, stateDir(deps.env), lane, deps.env)));
   else if (!mobile && config.web) {
@@ -424,6 +429,44 @@ async function serviceChecks(deps: EnvDeps, config: ProjectConfig, lane: LaneInf
             ? `make services.${service.name}.start run this worktree's code (its cwd and the paths it starts), then ${CLI} restart ${service.name}`
             : `${UP} (it restarts the service)`,
     });
+  }
+  return checks;
+}
+
+async function sharedReady(deps: EnvDeps, spec: SharedServiceConfig): Promise<DoctorCheck> {
+  const name = `shared ${spec.name}`;
+  const fix = `${UP} (it starts ${spec.name})`;
+  const timeoutMs = Math.min(spec.timeoutMs, SHARED_READY_RUN_MAX_MS);
+  try {
+    const run = await runCheck(spec.ready, { cwd: spec.cwd, env: hookEnvironment(deps.env, {}), timeoutMs, ownGroup: true });
+    if (run.code === 0) return { name, ok: true, detail: `running: its ready passes (${spec.ready})`, fix: '' };
+    const how =
+      run.code !== null
+        ? `exited ${String(run.code)}`
+        : run.ms >= timeoutMs
+          ? `did not answer within ${String(timeoutMs / 1000)} s`
+          : `was killed by ${run.signal ?? 'a signal'}`;
+    const last = run.output.split('\n').at(-1) ?? '';
+    return { name, ok: false, detail: `its ready ${how} (${spec.ready}): ${last === '' ? '(no output)' : last}`, fix };
+  } catch (error) {
+    return { name, ok: false, detail: `its ready could not run in ${spec.cwd}: ${message(error)}`, fix };
+  }
+}
+
+async function sharedChecks(deps: EnvDeps, config: ProjectConfig, lane: LaneInfo): Promise<DoctorCheck[]> {
+  const checks: DoctorCheck[] = [];
+  for (const name of readLaneNeeds(stateDir(deps.env), lane.id)) {
+    const spec = config.shared.find(s => s.name === name);
+    checks.push(
+      spec
+        ? await sharedReady(deps, spec)
+        : {
+            name: `shared ${name}`,
+            ok: false,
+            detail: `lane ${lane.id} needs it, and ${config.file} declares no shared service ${name}`,
+            fix: `${UP} (it records what the lane needs now)`,
+          },
+    );
   }
   return checks;
 }

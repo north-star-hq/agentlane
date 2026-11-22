@@ -138,6 +138,23 @@ export function environmentOf(pid: number): string | undefined {
   return result.status === 0 ? result.stdout : undefined;
 }
 
+/** Sends `signal` to a process, or to a process group by its negated id, and throws as `process.kill` does. */
+export type Signaller = (pid: number, signal: NodeJS.Signals) => void;
+
+const systemSignaller: Signaller = (pid, signal) => {
+  process.kill(pid, signal);
+};
+
+/** Sends SIGKILL to every process of group `pgid`; false when none was left, or none could be signalled. */
+export function killGroup(pgid: number, signal: Signaller = systemSignaller): boolean {
+  try {
+    signal(-pgid, 'SIGKILL');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function identityOf(table: ProcessTable, pid: number): ProcessIdentity | undefined {
   const start = table.startTimes([pid])?.get(pid);
   return start === undefined ? undefined : { pid, start };

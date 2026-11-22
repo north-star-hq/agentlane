@@ -8,7 +8,7 @@ export default defineConfig(
     ['.gitignore', 'maestro/.gitignore'].map(file => path.join(import.meta.dirname, file)),
     { gitignoreResolution: true },
   ),
-  { ignores: ['examples/', 'private/', 'tests/fixtures/signin-site/playwright/'] },
+  { ignores: ['.claude/', 'examples/', 'private/', 'tests/fixtures/signin-site/playwright/'] },
   js.configs.recommended,
   tseslint.configs.strictTypeChecked,
   tseslint.configs.stylisticTypeChecked,

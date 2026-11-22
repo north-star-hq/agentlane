@@ -1,9 +1,9 @@
-import { CLI, TOOL } from '../name.ts';
+import { CLI, CONFIG_FILE, TOOL } from '../name.ts';
 import { formatAge, formatTime } from '../registry/format.ts';
 import { describeOwner, isProven } from '../registry/owner.ts';
 import type { LaneStatus } from '../registry/types.ts';
 import type { Aim, AimedCommand, BrowserDriver, DevicePlatform } from './aims.ts';
-import { aimsOf } from './aims.ts';
+import { aimsOf, ALLOW_CONTAINER_ENV } from './aims.ts';
 
 export interface GuardContext {
   self: string | null;
@@ -94,6 +94,8 @@ class Judge {
         return this.browsers.filter(c => (c.browser?.debugPort === aim.port || c.browser?.streamPort === aim.port) && theirs(c));
       case 'every-browser':
         return this.browsers.filter(c => c.browser?.driver === aim.driver && theirs(c));
+      case 'container':
+        return [];
     }
   }
 
@@ -116,6 +118,8 @@ class Judge {
         return own(this.browsers.filter(c => c.browser?.debugPort === aim.port || c.browser?.streamPort === aim.port));
       case 'every-browser':
         return own(this.browsers.filter(c => c.browser?.driver === aim.driver));
+      case 'container':
+        return [];
     }
   }
 
@@ -146,6 +150,8 @@ function summary(aimed: AimedCommand, holders: readonly LaneStatus[]): string {
       return `\`${quoted}\` attaches to port ${String(aimed.aim.port)}, another lane's browser`;
     case 'every-browser':
       return `\`${quoted}\` stops every Playwright browser on this Mac, and other lanes hold some`;
+    case 'container':
+      return `\`${quoted}\` starts a container that keeps running after the command ends, and no lane will stop it`;
   }
 }
 
@@ -191,6 +197,23 @@ function recovery(aimed: AimedCommand, holders: readonly LaneStatus[], judge: Ju
   return lines;
 }
 
+/**
+ * The denial of the first command among `aims` that starts a container which outlives it, such as `docker run -d` or
+ * `docker compose up -d`. It needs no lane to judge, so it can be given before the registry is read.
+ */
+export function containerBlock(aims: readonly AimedCommand[]): Verdict {
+  const aimed = aims.find(a => a.aim.kind === 'container');
+  if (!aimed) return { allow: true };
+  const lines = [
+    `${TOOL}: blocked: ${summary(aimed, [])}.`,
+    'to recover:',
+    `  declare the server under "shared" in ${CONFIG_FILE} (or its data as a resource), then ${CLI} up, or ${CLI} up --no-app for the data alone`,
+    `  ${CLI} exec -- <command>   (runs the work with that lane's servers and data)`,
+    `  ${ALLOW_CONTAINER_ENV}=1 ${aimed.command}   (only if the user has asked, in this conversation, for a container outside lanes; ${TOOL} won't track or stop it)`,
+  ];
+  return { allow: false, reason: lines.join('\n') };
+}
+
 /** The caller's own lanes a command the guard allows aims at: the command is a call on each of them. */
 export function aimedOwnLanes(script: string, env: NodeJS.ProcessEnv, ctx: GuardContext): LaneStatus[] {
   const judge = new Judge(ctx);
@@ -202,6 +225,8 @@ export function aimedOwnLanes(script: string, env: NodeJS.ProcessEnv, ctx: Guard
 export function guard(script: string, env: NodeJS.ProcessEnv, ctx: GuardContext): Verdict {
   const aims = aimsOf(script, env, ctx.cwd);
   if (aims.length === 0) return { allow: true };
+  const container = containerBlock(aims);
+  if (!container.allow) return container;
   const judge = new Judge(ctx);
   for (const aimed of aims) {
     const holders = judge.others(aimed);
