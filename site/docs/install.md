@@ -76,7 +76,7 @@ Every agent gets the same skills, the same MCP server and the same two hooks, in
 | Gemini CLI     | `.agents/skills/`                                       | `.gemini/settings.json`   | `.gemini/settings.json`                         |
 | Antigravity    | `.agents/skills/`                                       | `.agents/mcp_config.json` | `.agents/hooks.json` (the guard only)           |
 
-The MCP server entry also raises the agent's time limit on one call to 153 minutes, where the agent's own limit is shorter and a project can set it. [MCP server](mcp.md#where-init-registers-it) lists each agent's key.
+The MCP server entry also raises the agent's time limit on one call to 60 minutes, where the agent's own limit is shorter and a project can set it. That is enough for a call that wakes a parked lane, installs Maestro and runs the longest flow, and the agent stops a call that waits longer. [MCP server](mcp.md#where-init-registers-it) lists each agent's key.
 
 Each skill file is a short stub that runs `node_modules/.bin/agentlane skills get <name>`, so the agent reads the skill for the version the project has installed. [The skills](skills.md) explains why.
 
