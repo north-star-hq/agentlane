@@ -5,20 +5,31 @@ set -eu
 version="$1"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 changelog="${2:-$root/CHANGELOG.md}"
-section="${version%%-*}"
+stable="${version%%-*}"
 
-notes="$(awk -v heading="## $section" '
-  $0 == heading { found = 1; next }
-  found && /^## / { exit }
-  found { print }
-' "$changelog")"
-notes="$(printf '%s\n' "$notes" | sed '/./,$!d')"
+section() {
+  awk -v heading="## $1" '
+    fence == "" && $0 == heading { found = 1; next }
+    found && fence == "" && /^## / { exit }
+    /^```/ || /^~~~/ {
+      marker = substr($0, 1, 3)
+      if (fence == "") fence = marker
+      else if (marker == fence) fence = ""
+    }
+    found { print }
+  ' "$changelog" | sed '/./,$!d'
+}
+
+notes="$(section "$stable")"
+if [ -z "$notes" ] && [ "$stable" != "$version" ]; then
+  notes="$(section Unreleased)"
+fi
 
 if [ -z "$notes" ]; then
-  if [ "$section" = "$version" ]; then
+  if [ "$stable" = "$version" ]; then
     echo "$changelog has no section for $version" >&2
   else
-    echo "$changelog has no section for $section, which $version leads to" >&2
+    echo "$changelog has no section for $stable or Unreleased, which $version would take its notes from" >&2
   fi
   exit 1
 fi
