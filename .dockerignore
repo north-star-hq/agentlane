@@ -1,0 +1,11 @@
+*
+!package.json
+!pnpm-lock.yaml
+!tsconfig.json
+!tsconfig.build.json
+!src/
+!schema/
+!skills/
+!CHANGELOG.md
+!README.md
+!LICENSE

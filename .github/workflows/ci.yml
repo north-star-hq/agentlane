@@ -101,3 +101,6 @@ jobs:
           name: web-on-linux
           path: ${{ runner.temp }}/web-on-linux/
           if-no-files-found: ignore
+
+  docker:
+    uses: ./.github/workflows/docker.yml
