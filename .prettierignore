@@ -10,3 +10,4 @@ maestro/out/
 schema/
 tests/fixtures/init-0.2.1/
 private/
+/.claude/
