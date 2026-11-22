@@ -7,7 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import { JAVA_HOME_ENV } from '../hooks/env.ts';
 import { CLI, envName, TOOL } from '../name.ts';
 import { identityOf, systemProcesses, type ProcessTable } from '../processes.ts';
-import { DriverError } from './errors.ts';
+import { DriverError, messageOf } from './errors.ts';
 import { runCommand, tail } from './exec.ts';
 import { tryLock, unlock } from './lock.ts';
 import { MAESTRO_RELEASE, type MaestroRelease } from './release.ts';
@@ -217,21 +217,77 @@ export async function sha256Of(file: string): Promise<string> {
 const manualFix = (release: MaestroRelease) =>
   `download ${release.url} yourself and run '${CLI} driver install --from <that zip>'`;
 
-export const httpsDownload: Downloader = async (release, dir) => {
-  fs.mkdirSync(dir, { recursive: true });
-  const fetchTo = async (url: string, file: string) => {
-    const response = await fetch(url);
-    if (!response.ok || !response.body) {
-      throw new DriverError(`downloading ${url} failed: HTTP ${String(response.status)}`, `retry, or ${manualFix(release)}`);
+// Node's fetch rejects with TypeError('fetch failed') and puts undici's or the socket's error code in its cause.
+const CONNECT_ERRORS = new Set([
+  'UND_ERR_CONNECT_TIMEOUT',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+]);
+
+function causeOf(error: unknown): { code?: unknown; message?: unknown } | undefined {
+  const cause = error instanceof Error ? error.cause : undefined;
+  return typeof cause === 'object' && cause !== null ? cause : undefined;
+}
+
+function isConnectError(error: unknown): boolean {
+  const code = causeOf(error)?.code;
+  return typeof code === 'string' && CONNECT_ERRORS.has(code);
+}
+
+function reasonOf(error: unknown): string {
+  const cause = causeOf(error)?.message;
+  return typeof cause === 'string' && cause !== '' ? `${messageOf(error)}: ${cause}` : messageOf(error);
+}
+
+export interface DownloadOptions {
+  fetch?: (url: string) => Promise<Response>;
+  retryPauseMs?: number;
+}
+
+/** Downloads the release zip and its checksum file, trying a download once more when it couldn't connect. */
+export function httpsDownloader(options: DownloadOptions = {}): Downloader {
+  const get = options.fetch ?? ((url: string) => fetch(url));
+  const connect = async (url: string): Promise<Response> => {
+    try {
+      return await get(url);
+    } catch (error) {
+      if (!isConnectError(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, options.retryPauseMs ?? 2000));
+      return await get(url);
     }
-    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(file));
   };
-  const zip = path.join(dir, release.asset);
-  await fetchTo(release.url, zip);
-  const checksumFile = `${zip}.sha256`;
-  await fetchTo(`${release.url}.sha256`, checksumFile);
-  return { zip, checksumFile };
-};
+  return async (release, dir) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const fetchTo = async (what: string, url: string, file: string) => {
+      const failed = (reason: string) =>
+        new DriverError(`downloading ${what} from ${url} failed: ${reason}`, `retry, or ${manualFix(release)}`);
+      let response: Response;
+      try {
+        response = await connect(url);
+      } catch (error) {
+        throw failed(reasonOf(error));
+      }
+      if (!response.ok || !response.body) throw failed(`HTTP ${String(response.status)}`);
+      try {
+        await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(file));
+      } catch (error) {
+        throw failed(reasonOf(error));
+      }
+    };
+    const zip = path.join(dir, release.asset);
+    await fetchTo(`Maestro ${release.version}`, release.url, zip);
+    const checksumFile = `${zip}.sha256`;
+    await fetchTo(`the checksum of Maestro ${release.version}`, `${release.url}.sha256`, checksumFile);
+    return { zip, checksumFile };
+  };
+}
+
+export const httpsDownload: Downloader = httpsDownloader();
 
 async function verify(release: MaestroRelease, downloaded: Downloaded): Promise<void> {
   const refuse = (problem: string) =>
