@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { after, before, describe, test } from 'node:test';
+import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
 import { buildSite, pageMarkdown } from '../site/build/build.ts';
 import { checkSite } from '../site/build/check.ts';
 import { loadLanding, loadSections, SITE, type Landing } from '../site/build/content.ts';
@@ -361,13 +361,13 @@ describe('the docs site', () => {
   describe("a docs page's front matter", () => {
     let dir: string;
 
-    before(() => {
+    beforeEach(() => {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-docs-'));
       fs.cpSync(path.join(SITE, 'docs.yaml'), path.join(dir, 'docs.yaml'));
       fs.cpSync(path.join(SITE, 'docs'), path.join(dir, 'docs'), { recursive: true });
     });
 
-    after(() => {
+    afterEach(() => {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
@@ -375,6 +375,48 @@ describe('the docs site', () => {
       const file = path.join(dir, 'docs', 'services.md');
       fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^summary:/m, 'summray:'));
       assert.throws(() => loadSections(dir), /services\.md: front matter has summray, which the build doesn't read/);
+    });
+
+    test('ends at the first --- line, so the body can hold a rule', () => {
+      fs.writeFileSync(
+        path.join(dir, 'docs', 'faq.md'),
+        '---\ntitle: "FAQ"\nshort: "Short."\nsummary: "Summary."\n---\n\nAbove the rule.\n\n---\n\ntitle: below the rule\n',
+      );
+      const page = loadSections(dir)
+        .flatMap(section => section.pages)
+        .find(p => p.slug === 'faq');
+      assert.equal(page?.title, 'FAQ');
+      assert.equal(page.short, 'Short.');
+      assert.equal(page.summary, 'Summary.');
+      assert.equal(page.markdown, 'Above the rule.\n\n---\n\ntitle: below the rule\n');
+    });
+
+    test('names the file when the front matter is empty', () => {
+      const file = path.join(dir, 'docs', 'faq.md');
+      fs.writeFileSync(file, '---\n---\n\nA body.\n');
+      assert.throws(() => loadSections(dir), /faq\.md: front matter needs fields/);
+      fs.writeFileSync(file, '---\n---\n\nNote: the lane keeps its ports.\n\n---\n\nMore.\n');
+      assert.throws(() => loadSections(dir), /faq\.md: front matter needs fields/);
+    });
+
+    test('does not take fields from the body when the front matter is empty', () => {
+      fs.writeFileSync(
+        path.join(dir, 'docs', 'faq.md'),
+        '---\n---\n\ntitle: "FAQ"\nshort: "S."\nsummary: "S."\n\n---\n\nMore.\n',
+      );
+      assert.throws(() => loadSections(dir), /faq\.md: front matter needs fields/);
+    });
+
+    test('allows trailing spaces and tabs on the --- lines', () => {
+      fs.writeFileSync(
+        path.join(dir, 'docs', 'faq.md'),
+        '--- \t\ntitle: "FAQ"\nshort: "Short."\nsummary: "Summary."\n---\t \n\nAbove the rule.\n\n---\n\nMore.\n',
+      );
+      const page = loadSections(dir)
+        .flatMap(section => section.pages)
+        .find(p => p.slug === 'faq');
+      assert.equal(page?.title, 'FAQ');
+      assert.equal(page.markdown, 'Above the rule.\n\n---\n\nMore.\n');
     });
   });
 

@@ -75,7 +75,7 @@ export interface Landing {
 
 function frontMatter(file: string): { data: Record<string, unknown>; body: string } {
   const text = fs.readFileSync(file, 'utf8');
-  const match = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
+  const match = /^---[ \t]*\n(?:([\s\S]*?)\n)??---[ \t]*(?:\n|$)([\s\S]*)$/.exec(text);
   if (!match) throw new Error(`${path.relative(REPO, file)}: no front matter`);
   const data: unknown = parse(match[1] ?? '');
   if (typeof data !== 'object' || data === null || Array.isArray(data)) throw needs(file, 'fields');
