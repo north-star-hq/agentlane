@@ -313,6 +313,7 @@ function blindPs(system: ServiceSystem, blind: { on: boolean }): ServiceSystem {
   return {
     processes: system.processes,
     running: pids => (blind.on ? undefined : system.running(pids)),
+    runningWithParents: pids => (blind.on ? undefined : system.runningWithParents(pids)),
     exists: pid => system.exists(pid),
     spawnGroup: (command, options) => system.spawnGroup(command, options),
     listeners: port => system.listeners(port),

@@ -109,7 +109,7 @@ npx agentlane exec -- npx playwright test
 
 `exec` brings a [parked](lanes.md#parking) lane back before the command starts, and counts as a call on the lane once a minute while the command runs. The command reads what was piped to `exec`, and a Ctrl-C in the terminal reaches it. `exec` exits with the command's exit code.
 
-`exec` ends with the process that ran it. When that process exits while the command runs, as when an agent's shell is killed, `exec` sends SIGTERM to the command and every process under it, then SIGKILL to whatever still runs 5 seconds later, and exits 129. So a test run or server started under `exec` doesn't outlive the agent that started it. If the caller is already gone when the command would start, the command never runs.
+`exec` ends with the process that ran it, or with any process above it, such as the terminal or Claude Code. When one of them exits while the command runs, as when an agent's shell is killed, `exec` sends SIGTERM to the command and every process under it, then SIGKILL to whatever still runs 5 seconds later, and exits 129. So a test run or server started under `exec` doesn't outlive the agent that started it. If the caller is already gone when the command would start, the command never runs. Under Codex, its shared app-server daemon and the processes above it don't count, since that daemon outlives the Codex window that started it.
 
 `up --json` prints the result as JSON instead: the lane, the platform, the web app's URL, the variables, each step with its time, and the doctor report.
 

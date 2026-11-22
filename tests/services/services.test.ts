@@ -745,6 +745,10 @@ function fakeStop(processes: Record<number, FakeProcess>, faults: Faults = {}) {
   const fake: ServiceSystem = {
     processes: { startTimes: running, info: () => undefined, cwd: () => undefined },
     running,
+    runningWithParents: pids =>
+      new Map(
+        pids.flatMap(pid => (live.has(pid) ? [[pid, { ppid: live.get(pid)?.ppid ?? 0, start: FAKE_START }] as const] : [])),
+      ),
     exists: pid => live.has(pid),
     spawnGroup: () => {
       throw new Error('the fake starts nothing');

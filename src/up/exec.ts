@@ -11,9 +11,8 @@ import { laneEnvironment, webUrl } from '../hooks/env.ts';
 import { CLI, TOOL } from '../name.ts';
 import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/config.ts';
 import { asMobile, findProjectConfig, loadLaneConfig } from '../project/config.ts';
-import type { ProcessIdentity } from '../processes.ts';
-import { chainFrom } from '../processes.ts';
-import { describeOwner, isProven, judgeProcess, resolveOwner } from '../registry/owner.ts';
+import type { ProcessInfo, Standing } from '../processes.ts';
+import { describeOwner, resolveOwner, sessionChain } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
@@ -77,7 +76,7 @@ function callerOf(deps: EnvDeps): Caller {
   const { system, clock } = deps;
   const parentPid = deps.parentPid ?? (() => process.ppid);
   const pid = parentPid();
-  const above: ProcessIdentity[] = [...chainFrom(system.processes, pid)].map(p => ({ pid: p.pid, start: p.start }));
+  const above = sessionChain(system.processes, pid, deps.env).ancestors;
   let startsReadAt = clock.now();
   const startsDue = () => above.length > 0 && clock.now() - startsReadAt >= CALLER_START_CHECK_MS;
   return {
@@ -85,10 +84,14 @@ function callerOf(deps: EnvDeps): Caller {
       if (parentPid() !== pid || above.some(p => !system.exists(p.pid))) return true;
       if (!startsDue()) return false;
       startsReadAt = clock.now();
-      const starts = system.running(above.map(p => p.pid));
-      return above.some(p => isProven(judgeProcess(p, starts)));
+      const now = system.runningWithParents(above.map(p => p.pid));
+      return now !== undefined && above.some(p => endedOrReplaced(p, now.get(p.pid)));
     },
   };
+}
+
+function endedOrReplaced(recorded: ProcessInfo, now: Standing | undefined): boolean {
+  return now === undefined || (now.start !== recorded.start && now.ppid !== recorded.ppid);
 }
 
 type Ending = { kind: 'exited'; code: number } | { kind: 'caller-gone' };

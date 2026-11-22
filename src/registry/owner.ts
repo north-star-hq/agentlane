@@ -204,14 +204,20 @@ export function isCodexDaemon(info: ProcessInfo, home: string): boolean {
   return listensOnSocket || args.includes('--managed-daemon');
 }
 
-interface SessionChain {
+export interface SessionChain {
   ancestors: ProcessInfo[];
   underCodexDaemon: boolean;
 }
 
-function sessionAncestors(table: ProcessTable, selfPid: number, home: string): SessionChain {
+/**
+ * `pid` and the processes above it that belong to its session, nearest first. The walk stops before a Codex app-server
+ * daemon, since one daemon runs the commands of every Codex TUI and outlives the TUI that started it, so nothing above
+ * it belongs to the session.
+ */
+export function sessionChain(table: ProcessTable, pid: number, env: NodeJS.ProcessEnv): SessionChain {
+  const home = codexHome(env);
   const ancestors: ProcessInfo[] = [];
-  for (const info of chainFrom(table, table.info(selfPid)?.ppid ?? 0)) {
+  for (const info of chainFrom(table, pid)) {
     if (isCodexDaemon(info, home)) return { ancestors, underCodexDaemon: true };
     ancestors.push(info);
   }
@@ -307,7 +313,7 @@ export function resolveOwner(env: NodeJS.ProcessEnv, table: ProcessTable, selfPi
     return { kind: 'process', process: identity, sessionId: null, threadId: null };
   }
   const sessionId = present(env, 'CLAUDE_CODE_SESSION_ID');
-  const { ancestors: chain, underCodexDaemon } = sessionAncestors(table, selfPid, codexHome(env));
+  const { ancestors: chain, underCodexDaemon } = sessionChain(table, table.info(selfPid)?.ppid ?? 0, env);
   const identity = (info: ProcessInfo): ProcessIdentity => ({ pid: info.pid, start: info.start });
   const threadId = present(env, 'CODEX_THREAD_ID');
   const claudePid = present(env, 'CLAUDE_PID');

@@ -6,7 +6,7 @@ Newest first.
 
 ### Fixed
 
-- **`exec` ends its command when any process above it goes away, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid and start time of each process above it as it starts. Once a second it asks whether each still exists, which starts no process. Every 10 seconds it also compares their start times with one `ps`, which catches a pid the system has given to a new process.
+- **`exec` ends its command if the process that ran it, or any process above it, exits, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid, parent pid and start time of each process above it as it starts. Once a second it asks whether each still exists, which starts no process. Every 10 seconds it also reads their start times and parent pids with one `ps`. A process whose start time and parent pid have both changed counts as replaced, which catches a pid the system gave to a new process and lets a clock step pass. Under Codex, the shared app-server daemon and the processes above it don't count, since the daemon outlives the Codex window that started it.
 
 ## 0.6.1
 

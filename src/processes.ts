@@ -20,6 +20,7 @@ export interface ProcessTable {
 const LSTART = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}`;
 const START_LINE = new RegExp(String.raw`^\s*(\d+)\s+(${LSTART})\s*$`);
 const RUNNING_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\S+)\s+(${LSTART})\s*$`);
+const PARENTED_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(\S+)\s+(${LSTART})\s*$`);
 const INFO_LINE = new RegExp(String.raw`^\s*(\d+)\s+(\d+)\s+(${LSTART})\s?(.*)$`);
 const START_ONLY = new RegExp(`^${LSTART}$`);
 
@@ -83,6 +84,26 @@ export function runningStartTimes(pids: readonly number[]): ReadonlyMap<number, 
     const m = RUNNING_LINE.exec(line);
     if (!m?.[1] || !m[2] || !m[3]) return undefined;
     if (!m[2].startsWith('Z')) table.set(Number(m[1]), normalizeStart(m[3]));
+  }
+  return table;
+}
+
+export interface Standing {
+  ppid: number;
+  start: string;
+}
+
+/** The parent pids and start times of those of `pids` still running. A zombie has exited, though ps lists it until it is reaped. */
+export function runningWithParents(pids: readonly number[]): ReadonlyMap<number, Standing> | undefined {
+  const wanted = wantedPids(pids);
+  if (wanted.length === 0) return new Map();
+  const lines = ps('pid=,ppid=,stat=,lstart=', wanted);
+  if (!lines) return undefined;
+  const table = new Map<number, Standing>();
+  for (const line of lines) {
+    const m = PARENTED_LINE.exec(line);
+    if (!m?.[1] || !m[2] || !m[3] || !m[4]) return undefined;
+    if (!m[3].startsWith('Z')) table.set(Number(m[1]), { ppid: Number(m[2]), start: normalizeStart(m[4]) });
   }
   return table;
 }
