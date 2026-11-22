@@ -64,6 +64,7 @@ async function restoreDeviceNetwork(deps: EnvDeps, config: MobileConfig | null, 
 }
 
 export const CALLER_POLL_MS = 1000;
+export const CALLER_START_CHECK_MS = 10_000;
 export const STOP_GRACE_MS = 5000;
 const STOP_CHECK_MS = 100;
 const CALLER_GONE_EXIT = 128 + os.constants.signals.SIGHUP;
@@ -73,16 +74,21 @@ interface Caller {
 }
 
 function callerOf(deps: EnvDeps): Caller {
+  const { system, clock } = deps;
   const parentPid = deps.parentPid ?? (() => process.ppid);
   const pid = parentPid();
-  const above: ProcessIdentity[] = [...chainFrom(deps.system.processes, pid)].map(p => ({ pid: p.pid, start: p.start }));
-  return { gone: () => parentPid() !== pid || anyGone(deps.system, above) };
-}
-
-function anyGone(system: ServiceSystem, processes: readonly ProcessIdentity[]): boolean {
-  if (processes.length === 0) return false;
-  const starts = system.running(processes.map(p => p.pid));
-  return processes.some(p => isProven(judgeProcess(p, starts)));
+  const above: ProcessIdentity[] = [...chainFrom(system.processes, pid)].map(p => ({ pid: p.pid, start: p.start }));
+  let startsReadAt = clock.now();
+  const startsDue = () => above.length > 0 && clock.now() - startsReadAt >= CALLER_START_CHECK_MS;
+  return {
+    gone: () => {
+      if (parentPid() !== pid || above.some(p => !system.exists(p.pid))) return true;
+      if (!startsDue()) return false;
+      startsReadAt = clock.now();
+      const starts = system.running(above.map(p => p.pid));
+      return above.some(p => isProven(judgeProcess(p, starts)));
+    },
+  };
 }
 
 type Ending = { kind: 'exited'; code: number } | { kind: 'caller-gone' };

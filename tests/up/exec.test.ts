@@ -11,8 +11,8 @@ import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
 import { realServiceSystem, type ServiceSystem } from '../../src/services/system.ts';
 import type { EnvDeps } from '../../src/up/deps.ts';
-import { execInLane } from '../../src/up/exec.ts';
-import { FakeProcesses, tempDir } from '../support/fakes.ts';
+import { CALLER_START_CHECK_MS, execInLane } from '../../src/up/exec.ts';
+import { FakeClock, FakeProcesses, tempDir } from '../support/fakes.ts';
 import { alive, API, METRO, toolchain, until, WEB } from '../support/up-world.ts';
 
 const CLI = path.resolve(import.meta.dirname, '..', '..', 'src', 'cli.ts');
@@ -269,27 +269,44 @@ test(
 
 const WRITE_PID_THEN_SLEEP = ['/bin/sh', '-c', 'echo $$ > "$1"; exec sleep 30', 'sh'];
 
-test('a process above exec whose pid now belongs to a process started later counts as gone', LIMIT, async t => {
-  const lane = await heldLane();
-  const pidFile = path.join(lane.worktree, 'pid');
-  const table = new FakeProcesses();
-  const [runner, shell] = table.tree(['npm exec', 'zsh']);
-  assert.ok(runner && shell);
-  const system: ServiceSystem = { ...realServiceSystem, processes: table, running: pids => table.startTimes(pids) };
-  const running = execInLane(deps(lane, { system, parentPid: () => runner.pid, callerPollMs: 20 }), [
-    ...WRITE_PID_THEN_SLEEP,
-    pidFile,
-  ]);
-  killLeftovers(t, () => recordedPids(pidFile));
-  await until(() => recordedPids(pidFile).length === 1, 20_000);
-  const [pid = 0] = recordedPids(pidFile);
-  await sleep(200);
-  assert.ok(alive(pid), 'the command runs while every process above exec does');
+test(
+  'a process above exec whose pid now belongs to a process started later counts as gone at the next start-time check',
+  LIMIT,
+  async t => {
+    const lane = await heldLane();
+    const pidFile = path.join(lane.worktree, 'pid');
+    const table = new FakeProcesses();
+    const [runner, shell] = table.tree(['npm exec', 'zsh']);
+    assert.ok(runner && shell);
+    let listings = 0;
+    const system: ServiceSystem = {
+      ...realServiceSystem,
+      processes: table,
+      running: pids => {
+        listings++;
+        return table.startTimes(pids);
+      },
+      exists: pid => table.info(pid) !== undefined,
+    };
+    const clock = new FakeClock(Date.now());
+    const running = execInLane(deps(lane, { system, clock, parentPid: () => runner.pid, callerPollMs: 20 }), [
+      ...WRITE_PID_THEN_SLEEP,
+      pidFile,
+    ]);
+    killLeftovers(t, () => recordedPids(pidFile));
+    await until(() => recordedPids(pidFile).length === 1, 20_000);
+    const [pid = 0] = recordedPids(pidFile);
 
-  table.recycle(shell.pid);
-  assert.equal(await running, CALLER_GONE);
-  assert.equal(alive(pid), false);
-});
+    table.recycle(shell.pid);
+    await sleep(200);
+    assert.ok(alive(pid), 'a reused pid still names a process, so the checks between start-time reads pass');
+    assert.equal(listings, 0, 'the checks between start-time reads list no processes');
+
+    await clock.advance(CALLER_START_CHECK_MS);
+    assert.equal(await running, CALLER_GONE);
+    assert.equal(alive(pid), false);
+  },
+);
 
 test("when exec can't read the processes above it, it runs the command and watches its parent alone", LIMIT, async t => {
   const lane = await heldLane();
@@ -334,13 +351,14 @@ test('a caller gone before the command starts means the command never runs', LIM
 });
 
 test(
-  'while its caller lives, exec checks on it about once a second, with one process listing a check, and stops checking when the command ends',
+  'while its caller lives, exec checks on it about once a second without starting a process, and stops checking when the command ends',
   LIMIT,
   async () => {
     const lane = await heldLane();
     let reads = 0;
     let listings = 0;
     let listingsAtFirstCheck = 0;
+    let asked = 0;
     const system: ServiceSystem = {
       ...realServiceSystem,
       processes: {
@@ -353,6 +371,10 @@ test(
       running: pids => {
         listings++;
         return realServiceSystem.running(pids);
+      },
+      exists: pid => {
+        asked++;
+        return realServiceSystem.exists(pid);
       },
     };
     const startedAt = Date.now();
@@ -371,7 +393,11 @@ test(
     assert.equal(code, 0);
     assert.ok(reads >= 3 && reads <= seconds + 3, `${String(reads)} reads of the parent pid in ${seconds.toFixed(1)} s`);
     assert.ok(listingsAtFirstCheck > 0, 'exec read the processes above it at start');
-    assert.equal(listings - listingsAtFirstCheck, reads - 1, 'each check lists processes once');
+    assert.equal(listings, listingsAtFirstCheck, 'no check within 10 s of the start lists processes');
+    assert.ok(
+      asked >= reads - 1,
+      `each check asks after the processes above exec: ${String(asked)} asks in ${String(reads - 1)} checks`,
+    );
     const atEnd = reads;
     await sleep(1500);
     assert.equal(reads, atEnd, 'the checks stopped with the command');

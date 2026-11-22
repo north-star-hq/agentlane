@@ -6,7 +6,7 @@ Newest first.
 
 ### Fixed
 
-- **`exec` ends its command when any process above it goes away, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid and start time of each process above it as it starts, and checks them once a second with one `ps`.
+- **`exec` ends its command when any process above it goes away, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid and start time of each process above it as it starts. Once a second it asks whether each still exists, which starts no process. Every 10 seconds it also compares their start times with one `ps`, which catches a pid the system has given to a new process.
 
 ## 0.6.1
 
