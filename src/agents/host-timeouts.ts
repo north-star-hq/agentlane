@@ -1,7 +1,5 @@
-import { LONGEST_ENGINE_CALL_MS } from '../driver/client.ts';
 import { TOOL } from '../name.ts';
 import type { Agent } from '../registry/owner.ts';
-import { LONGEST_ENTRY_MS } from '../up/lane-waits.ts';
 import { AGENT_NAMES } from './detect.ts';
 
 export interface HostTimeout {
@@ -34,13 +32,8 @@ export function hostTimeout(agent: Agent): HostTimeout | undefined {
   return hosts[agent];
 }
 
-const MINUTE_MS = 60_000;
-
-/** The longest one MCP tool call waits on agentlane's bounded steps: entering its lane, then the engine. */
-export const LONGEST_TOOL_CALL_MS = LONGEST_ENTRY_MS + LONGEST_ENGINE_CALL_MS;
-
-/** agentlane's longest call with a minute to spare, rounded up to whole minutes. */
-export const CALL_LIMIT_SEC = (Math.ceil((LONGEST_TOOL_CALL_MS + MINUTE_MS) / MINUTE_MS) * MINUTE_MS) / 1000;
+/** The limit on one call agentlane writes for each host: long enough for a slow call that succeeds, short enough that a hung one gives the agent back. */
+export const CALL_LIMIT_SEC = 60 * 60;
 
 function inUnit(host: HostTimeout, sec: number): number {
   return host.unit === 'ms' ? sec * 1000 : sec;
@@ -59,7 +52,7 @@ function inEffect(host: HostTimeout, value: unknown): unknown {
   return value === undefined || (host.signed && value === 0) ? inUnit(host, host.callSec) : value;
 }
 
-/** Whether the host, with this value of its key (undefined when unset), lets agentlane's longest call finish. */
+/** Whether the host, with this value of its key (undefined when unset), lets a call run as long as agentlane needs. */
 export function coversCalls(host: HostTimeout, value: unknown): boolean {
   const limit = inEffect(host, value);
   if (typeof limit !== 'number' || !Number.isFinite(limit)) return false;
@@ -70,7 +63,7 @@ function duration(sec: number): string {
   return sec % 60 === 0 ? `${String(sec / 60)} min` : `${String(sec)} s`;
 }
 
-/** Why this host would stop agentlane's longest call, or null when it wouldn't. */
+/** Why this host would stop a call sooner than agentlane needs, or null when it wouldn't. */
 export function timeoutShortfall(agent: Agent, value: unknown): string | null {
   const host = hostTimeout(agent);
   if (!host || coversCalls(host, value)) return null;

@@ -77,9 +77,8 @@ const VERSION_TIMEOUT_MS = 120_000;
 /** The longest findJdk17 waits with the system's search: two JDKs' settings, java_home and brew. */
 export const JDK_LOOKUP_MS = 2 * JAVA_SETTINGS_TIMEOUT_MS + JAVA_HOME_TIMEOUT_MS + BREW_PREFIX_TIMEOUT_MS;
 
-/** The longest ensureMaestro waits on anything but the download and its checksum: the JDK, another install, and unpacking. */
-export const INSTALL_WAITS_MS =
-  JDK_LOOKUP_MS + INSTALL_LOCK_WAIT_MS + UNZIP_TIMEOUT_MS + QUARANTINE_TIMEOUT_MS + VERSION_TIMEOUT_MS;
+/** The longest ensureMaestro waits on anything but the download, its checksum and another process's install: the JDK, then unpacking. */
+export const INSTALL_WAITS_MS = JDK_LOOKUP_MS + UNZIP_TIMEOUT_MS + QUARANTINE_TIMEOUT_MS + VERSION_TIMEOUT_MS;
 
 export function dataDir(env: NodeJS.ProcessEnv): string {
   const xdg = env.XDG_DATA_HOME;

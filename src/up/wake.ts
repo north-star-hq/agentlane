@@ -11,8 +11,10 @@ import { NotClaimed, Refusal } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { wakeFolder } from './lane-files.ts';
-import { LANE_WAIT_MS } from './lane-waits.ts';
 import { attemptId, deadHolder } from './park.ts';
+
+/** How long a call waits on another call parking or waking its lane. */
+export const LANE_WAIT_MS = 30 * 60_000;
 
 export interface LaneEntry {
   stateDir: string;
