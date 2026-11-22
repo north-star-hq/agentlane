@@ -13,6 +13,7 @@ import { describeIdle, readDriverSettings, takeIdleStop, type IdleStop } from '.
 import { ensureMaestro, findJdk17, MAESTRO_OVERRIDE_ENV, type InstallOptions } from './install.ts';
 import { liveHolder, lockHolder, tryLock } from './lock.ts';
 import { enginePaths, ensurePrivateDir, type EnginePaths } from './paths.ts';
+import { longestCallMs, warmCallMs } from './supervisor.ts';
 
 export const ENGINE_MAIN = path.join(import.meta.dirname, `engine-main${path.extname(import.meta.filename)}`);
 
@@ -36,7 +37,15 @@ export interface EngineTarget {
   /** Engine timings; for tests. `idleMs` overrides the Mac's driver.json. */
   tuning?: Pick<
     EngineConfig,
-    'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'heartbeatMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'
+    | 'lanePollMs'
+    | 'ownerPollMs'
+    | 'touchEveryMs'
+    | 'heartbeatMs'
+    | 'runnerWatchMs'
+    | 'idleSampleMs'
+    | 'idleMs'
+    | 'callTimeouts'
+    | 'runnerStartupMs'
   >;
   /** For judging whether a release in progress still runs; the system's process table when absent. */
   processes?: ProcessTable;
@@ -44,13 +53,15 @@ export interface EngineTarget {
 
 const START_TIMEOUT_MS = 20_000;
 const STOP_WAIT_MS = 35_000;
+const MARGIN_MS = 60_000;
+const firstRead = longestCallMs('inspect_screen', { retry: true });
 const RESPONSE_TIMEOUT_MS: Record<EngineRequest['op'], number> = {
   ping: 10_000,
   status: 30_000,
   stop: 30_000,
-  look: 150_000,
-  screenshot: 150_000,
-  run: 900_000,
+  look: firstRead + warmCallMs('take_screenshot') + MARGIN_MS,
+  screenshot: longestCallMs('take_screenshot', { retry: true }) + warmCallMs('inspect_screen') + MARGIN_MS,
+  run: firstRead + warmCallMs('run') + warmCallMs('inspect_screen') + warmCallMs('take_screenshot') + MARGIN_MS,
   record: 30_000,
 };
 

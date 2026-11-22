@@ -1,0 +1,134 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { test } from 'node:test';
+import { maestroEnv, RUNNER_STARTUP_MS } from '../../src/driver/maestro-child.ts';
+import { SessionFailure, Supervisor, type SupervisorOptions } from '../../src/driver/supervisor.ts';
+import { tempDir } from '../support/fakes.ts';
+import { writeFakeToolchain, type FakeEvent } from '../support/driver-world.ts';
+
+interface Fixture {
+  supervisor: Supervisor;
+  spawns: () => FakeEvent[];
+}
+
+async function withSupervisor(
+  env: Record<string, string>,
+  options: Partial<SupervisorOptions>,
+  body: (fixture: Fixture) => Promise<void>,
+): Promise<void> {
+  const root = fs.realpathSync(tempDir('supervisor'));
+  const log = path.join(root, 'maestro-events.jsonl');
+  const toolchain = writeFakeToolchain(root);
+  const supervisor = new Supervisor({
+    platform: 'ios',
+    deviceId: 'SIM-1',
+    maestro: toolchain.maestro,
+    javaHome: toolchain.javaHome,
+    token: 'token',
+    workDir: path.join(root, 'work'),
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', FAKE_LOG: log, ...env },
+    logFd: 'ignore',
+    log: () => undefined,
+    rows: () => Promise.resolve([]),
+    ...options,
+  });
+  const spawns = () =>
+    fs.existsSync(log)
+      ? fs
+          .readFileSync(log, 'utf8')
+          .trim()
+          .split('\n')
+          .map(line => JSON.parse(line) as FakeEvent)
+          .filter(event => event.event === 'spawn')
+      : [];
+  try {
+    await body({ supervisor, spawns });
+  } finally {
+    await supervisor.stop({ clean: false });
+  }
+}
+
+const READ = { retry: true };
+
+async function failure(call: Promise<unknown>): Promise<SessionFailure> {
+  try {
+    await call;
+  } catch (error) {
+    if (error instanceof SessionFailure) return error;
+    throw error;
+  }
+  assert.fail('the call succeeded');
+}
+
+test("Maestro is told the same runner startup time the driver's first call allows for", () => {
+  const env = maestroEnv({ javaHome: '/jdk', env: { MAESTRO_DRIVER_STARTUP_TIMEOUT: '5' }, token: 't' }, '/stub', '/tmp');
+  assert.equal(env.MAESTRO_DRIVER_STARTUP_TIMEOUT, String(RUNNER_STARTUP_MS));
+});
+
+test("the first call on a fresh Maestro gets the runner's startup time, and the next call only its tool's limit", () =>
+  withSupervisor(
+    { FAKE_DELAYS: '[900, 900]' },
+    { timeouts: { inspect_screen: 400 }, runnerStartupMs: 1500 },
+    async ({ supervisor, spawns }) => {
+      const first = await supervisor.call('inspect_screen', {}, READ);
+      assert.equal(first.result.isError, false);
+      assert.equal(first.respawned, false);
+      const began = Date.now();
+      const second = await failure(supervisor.call('inspect_screen', {}, READ));
+      assert.ok(Date.now() - began < 1200, `the second call waited ${String(Date.now() - began)} ms`);
+      assert.equal(second.kind, 'timeout');
+      assert.equal(second.attempts.length, 1);
+      assert.equal(spawns().length, 1);
+    },
+  ));
+
+test('a first call that times out restarts Maestro and is answered by the fresh one', () =>
+  withSupervisor(
+    { FAKE_HANG_TOOL: 'take_screenshot' },
+    { timeouts: { take_screenshot: 300 }, runnerStartupMs: 300 },
+    async ({ supervisor, spawns }) => {
+      const { result, respawned } = await supervisor.call('take_screenshot', {}, READ);
+      assert.equal(result.isError, false);
+      assert.equal(result.content[0]?.type, 'image');
+      assert.equal(respawned, true);
+      assert.equal(spawns().length, 2);
+    },
+  ));
+
+test('a first call that times out on two fresh Maestros fails as a timeout with both attempts', () =>
+  withSupervisor(
+    { FAKE_DELAYS: '[5000]' },
+    { timeouts: { inspect_screen: 200 }, runnerStartupMs: 200 },
+    async ({ supervisor, spawns }) => {
+      const error = await failure(supervisor.call('inspect_screen', {}, READ));
+      assert.equal(error.kind, 'timeout');
+      assert.equal(error.attempts.length, 2);
+      for (const attempt of error.attempts) assert.match(attempt, /^Maestro didn't answer tools\/call within/);
+      assert.equal(spawns().length, 2);
+    },
+  ));
+
+test('a flow whose first call times out is not sent again', () =>
+  withSupervisor({ FAKE_DELAYS: '[5000]' }, { timeouts: { run: 200 }, runnerStartupMs: 200 }, async ({ supervisor, spawns }) => {
+    const error = await failure(supervisor.call('run', { yaml: '- back\n' }, { retry: false }));
+    assert.equal(error.kind, 'timeout');
+    assert.equal(error.attempts.length, 1);
+    assert.equal(spawns().length, 1);
+  }));
+
+test("Maestro's own runner startup timeout on a first call is retried once on a fresh Maestro", async () => {
+  await withSupervisor({ FAKE_NOT_READY_TIMES: '1' }, {}, async ({ supervisor, spawns }) => {
+    const { result, respawned } = await supervisor.call('inspect_screen', {}, READ);
+    assert.equal(result.isError, false);
+    assert.equal(respawned, true);
+    assert.equal(spawns().length, 2);
+  });
+  await withSupervisor({ FAKE_NOT_READY_TIMES: '2' }, {}, async ({ supervisor, spawns }) => {
+    const error = await failure(supervisor.call('inspect_screen', {}, READ));
+    assert.equal(error.kind, 'timeout');
+    assert.equal(error.attempts.length, 2);
+    for (const attempt of error.attempts) assert.match(attempt, /iOS driver not ready in time/);
+    assert.equal(spawns().length, 2);
+  });
+});

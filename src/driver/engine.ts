@@ -42,6 +42,9 @@ export interface EngineConfig {
   /** How long the engine waits, idle, before one more read that teaches it which numbers tick on their own. */
   idleSampleMs?: number;
   runnerWatchMs?: number;
+  /** Per-tool limits on a Maestro call, in place of the supervisor's. */
+  callTimeouts?: Record<string, number>;
+  runnerStartupMs?: number;
   /** How long without a tool call before the engine stops Maestro and exits, keeping the lane; 0 never. */
   idleMs?: number;
 }
@@ -122,6 +125,11 @@ const ACTIONS: Record<ToolOp, string> = {
   run: 'run',
   record: 'record',
 };
+
+function sessionFailureText(error: SessionFailure): string {
+  const again = error.attempts.length > 1 ? ' and failed again when the driver tried once more' : '';
+  return `Maestro's session failed (${error.kind})${again}: ${error.message}`;
+}
 
 /**
  * The long-lived driver engine of one lane. It owns the lane's `maestro mcp` session, answers tool calls on a Unix
@@ -215,6 +223,8 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
     logFd,
     log,
     ...(config.runnerWatchMs === undefined ? {} : { runnerWatchMs: config.runnerWatchMs }),
+    ...(config.callTimeouts === undefined ? {} : { timeouts: config.callTimeouts }),
+    ...(config.runnerStartupMs === undefined ? {} : { runnerStartupMs: config.runnerStartupMs }),
     ...(deps.rows ? { rows: deps.rows } : {}),
   });
   const session = new DriverSession(
@@ -386,7 +396,7 @@ export async function runEngine(config: EngineConfig, deps: EngineDeps = {}): Pr
             return {
               pid: process.pid,
               ok: false,
-              error: `Maestro's session failed (${error.kind}) and failed again after a restart: ${error.message}. The driver's log: ${paths.log}`,
+              error: `${sessionFailureText(error)}. The driver's log: ${paths.log}`,
               sessionFailure: { kind: error.kind, attempts: error.attempts },
             };
           }

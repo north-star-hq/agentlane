@@ -80,7 +80,36 @@ test('a Maestro that fails again after its restart surfaces a structured session
     assert.equal(response.ok, false);
     assert.equal(response.sessionFailure?.kind, 'unreachable');
     assert.equal(response.sessionFailure.attempts.length, 2);
-    assert.match(response.error ?? '', /failed again after a restart/);
+    assert.match(
+      response.error ?? '',
+      /^Maestro's session failed \(unreachable\) and failed again when the driver tried once more: /,
+    );
+    assert.equal(world.spawns().length, 2);
+  }));
+
+const QUICK_CALLS = { callTimeouts: { inspect_screen: 300, take_screenshot: 300 }, runnerStartupMs: 300 };
+
+test('a call that fails once, with no second try, is not described as failing again', () =>
+  withWorld({ tuning: QUICK_CALLS, env: { FAKE_DELAYS: '[0, 5000]' } }, async world => {
+    assert.equal((await callEngine(world.target(), { op: 'look', args: { interactiveOnly: true } })).ok, true);
+    const response = await callEngine(world.target(), { op: 'look', args: { interactiveOnly: true } });
+    assert.equal(response.ok, false);
+    assert.equal(response.sessionFailure?.kind, 'timeout');
+    assert.equal(response.sessionFailure.attempts.length, 1);
+    assert.match(response.error ?? '', /^Maestro's session failed \(timeout\): Maestro didn't answer tools\/call within /);
+    assert.doesNotMatch(response.error ?? '', /again/);
+  }));
+
+test('a first look that times out on two fresh Maestros says the driver tried once more', () =>
+  withWorld({ tuning: QUICK_CALLS, env: { FAKE_DELAYS: '[5000]' } }, async world => {
+    const response = await callEngine(world.target(), { op: 'look', args: {} });
+    assert.equal(response.ok, false);
+    assert.equal(response.sessionFailure?.kind, 'timeout');
+    assert.equal(response.sessionFailure.attempts.length, 2);
+    assert.match(
+      response.error ?? '',
+      /^Maestro's session failed \(timeout\) and failed again when the driver tried once more: /,
+    );
     assert.equal(world.spawns().length, 2);
   }));
 

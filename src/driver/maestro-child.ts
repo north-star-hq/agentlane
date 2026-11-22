@@ -65,6 +65,13 @@ export function imageOf(result: ToolResult): { data: string; mimeType: string } 
 export const RUNNER_TOKEN_ENV = 'MAESTRO_RUNNER_TOKEN';
 
 /**
+ * How long Maestro polls a fresh XCTest runner before it gives up, which Maestro reads from
+ * MAESTRO_DRIVER_STARTUP_TIMEOUT (milliseconds). 120 s is Maestro's own default (SERVER_LAUNCH_TIMEOUT_MS).
+ */
+export const RUNNER_STARTUP_MS = 120_000;
+export const INITIALIZE_TIMEOUT_MS = 60_000;
+
+/**
  * The environment Maestro runs in: JDK 17 first on PATH, the lane's runner token, and for a simulator an `adb` that
  * fails fast ahead of any real one; for an emulator, the SDK's own adb, emulator and avdmanager instead.
  */
@@ -88,6 +95,7 @@ export function maestroEnv(
     PATH: [...head, options.env.PATH ?? '/usr/bin:/bin'].join(path.delimiter),
     MAESTRO_CLI_NO_ANALYTICS: '1',
     MAESTRO_DISABLE_UPDATE_CHECK: 'true',
+    MAESTRO_DRIVER_STARTUP_TIMEOUT: String(RUNNER_STARTUP_MS),
     [RUNNER_TOKEN_ENV]: options.token,
     ...(sdk ? { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } : {}),
   };
@@ -157,7 +165,7 @@ export class MaestroChild {
     });
   }
 
-  static async start(options: MaestroChildOptions, timeoutMs = 60_000): Promise<MaestroChild> {
+  static async start(options: MaestroChildOptions, timeoutMs = INITIALIZE_TIMEOUT_MS): Promise<MaestroChild> {
     const child = new MaestroChild(options);
     try {
       await child.request(
