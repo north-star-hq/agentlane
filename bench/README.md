@@ -139,4 +139,4 @@ node ../../src/cli.ts bench --platform web                  # about a minute
 
 ## What a figure leaves out
 
-This bench calls a running MCP server, as an agent in Claude Code does, so the time of an MCP call includes no process start or module load. A browser click or flow is the exception, because it goes through `agentlane exec`. The cold-cold cell keeps the Maestro runner installed on the simulator, since the toolkit installs it once per simulator, on first use.
+This bench calls a running MCP server, as an agent in Claude Code does, so no call pays to start the server or load its modules. A browser click or flow is the exception, because it goes through `agentlane exec`. The cold-cold cell keeps the Maestro runner installed on the simulator, since the toolkit installs it once per simulator, on first use.
