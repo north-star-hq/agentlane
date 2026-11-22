@@ -165,7 +165,7 @@ const RUN_BOOLEAN_FLAGS = new Set([
   '--quiet-build',
 ]);
 const RUN_BOOLEAN_SHORTS = /^[ditTPq]*/;
-const UP_BOOLEAN_SHORTS = /^[dV]*/;
+const UP_BOOLEAN_SHORTS = /^[dVwy]*/;
 const TRUE = new Set(['1', 't', 'T', 'true', 'TRUE', 'True']);
 
 const ADB_READ_ONLY = new Set([
