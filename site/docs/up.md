@@ -76,7 +76,7 @@ npx agentlane exec -- pnpm test
 It runs the preflight with only the checks that need no device or browser, the preconditions that name no platform, setup, the `shared` step with the shared services the resources need, the resources, and doctor. It claims no device, browser or port, and builds, starts and launches nothing. The commands then run under `exec`, which gives them the resources' values.
 
 - A project that declares no resources is refused, since there is no data to bring up.
-- `--no-app` and `--platform` can't be used together.
+- `--no-app` can't be used with `--platform`, `--no-cache`, `--refresh-cache` or `--timeout`, since it builds nothing and waits for no simulator.
 - In a folder whose lane already has the app, `--no-app` is refused, and `exec` gives the command the resources' values there.
 - A plain `up` later in the same folder adds the app to the lane, with the same data.
 

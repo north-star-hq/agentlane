@@ -221,7 +221,7 @@ test('up --no-app runs preflight, setup, the shared service the resource needs a
   );
 });
 
-test('up --no-app prints the exports of the lane and its resource, and refuses --platform', async t => {
+test('up --no-app prints the exports of the lane and its resource, and refuses --platform and the build and queue flags', async t => {
   const w = world(t);
   const d = db(w);
   w.write(dataConfig(d));
@@ -242,9 +242,11 @@ test('up --no-app prints the exports of the lane and its resource, and refuses -
   );
   assert.match(w.lines.join('\n'), /^ready$/m);
 
-  w.lines.length = 0;
-  assert.equal(await runUpCommand('up', ['--no-app', '--platform', 'ios'], w.deps(), () => undefined), 2);
-  assert.match(w.lines.join('\n'), /--no-app and --platform are exclusive/);
+  for (const flags of [['--platform', 'ios'], ['--no-cache'], ['--refresh-cache'], ['--timeout', '600'], ['--timeout=5']]) {
+    w.lines.length = 0;
+    assert.equal(await runUpCommand('up', ['--no-app', ...flags], w.deps(), () => undefined), 2, flags.join(' '));
+    assert.match(w.lines.join('\n'), new RegExp(`--no-app and ${flags[0]?.split('=')[0] ?? ''} are exclusive`));
+  }
   holdsNothing(only(w));
 });
 
@@ -341,9 +343,17 @@ test('a data-only lane parks after the idle cutoff, its shared service stops 5 m
   );
   assert.deepEqual(d.lines(), ['start', `create ${id}`, 'stop']);
 
+  assert.deepEqual(only(w).park?.restarts, { device: null, services: [], shared: ['db'], browser: null, app: null });
+  const parkedLine = (await doctor(w)).checks.find(c => c.name === 'parked');
+  assert.match(parkedLine?.detail ?? '', /, and its next call brings back shared services db$/);
+  const status: string[] = [];
+  assert.equal(await runRegistryCommand('status', [], cli(w, status)), 0);
+  assert.match(status.join(''), /its next call brings back shared services db$/m);
+
   w.lines.length = 0;
   const later = ahead(since + SHARED_IDLE_MS + 1000 - Date.now());
   assert.equal(await execInLane(w.deps({ clock: later }), ['test', '-f', d.up]), 0, w.lines.join('\n'));
+  assert.match(w.lines.join('\n'), new RegExp(`lane ${id} was parked \\w+ ago; bringing back shared services db$`, 'm'));
   assert.deepEqual(d.lines(), ['start', `create ${id}`, 'stop', 'start']);
   assert.ok(
     w.lines.some(l => l.startsWith('agentlane up: shared: db started (')),

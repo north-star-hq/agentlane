@@ -99,7 +99,7 @@ All on an Apple M4 Max with 48 GB of memory.
 **Evidence and housekeeping**
 
 - [`evidence`](https://north-star-hq.github.io/agentlane/docs/evidence.html) keeps videos, Playwright traces, logs and screenshots in a folder that outlives the lane. A failed `run` or `exec` command keeps its own.
-- [A hook](https://north-star-hq.github.io/agentlane/docs/guard.html) denies `simctl`, `adb`, `emulator`, `avdmanager`, `playwright-cli` and `agent-browser` commands aimed at another lane's device or browser.
+- [A hook](https://north-star-hq.github.io/agentlane/docs/guard.html) denies `simctl`, `adb`, `emulator`, `avdmanager`, `playwright-cli` and `agent-browser` commands aimed at another lane's device or browser, and `docker` or `podman` commands that leave a container running after they end.
 - The next lane taken on the machine cleans up any lane whose session died, and `prune` deletes pool devices no lane holds.
 
 ## The skills

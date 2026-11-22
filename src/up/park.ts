@@ -63,7 +63,7 @@ function bootedNow(backend: DeviceBackend | undefined, id: string): boolean | nu
   }
 }
 
-function restartsOf(deps: ParkDeps, dir: string, lane: Lane): ParkRestarts {
+function restartsOf(deps: ParkDeps, registry: Registry, lane: Lane): ParkRestarts {
   const device = lane.device;
   const parked: ParkedDevice | null = device
     ? {
@@ -80,8 +80,9 @@ function restartsOf(deps: ParkDeps, dir: string, lane: Lane): ParkRestarts {
   return {
     device: parked,
     services: lane.processes.map(p => p.service),
+    shared: registry.needsOf(lane.id),
     browser: lane.browser?.driver ?? null,
-    app: readUpRecord(laneDir(dir, lane.id))?.bundleId ?? null,
+    app: readUpRecord(laneDir(registry.dir, lane.id))?.bundleId ?? null,
   };
 }
 
@@ -161,7 +162,8 @@ export async function parkLane(
     registry.abortPark(ref, attempt);
     return { kind: 'left', lane: ref.id, reason: 'it was used' };
   }
-  const restarts = mergeRestarts(candidate.park?.restarts ?? restartsOf(deps, dir, lane), restartsOf(deps, dir, lane));
+  const current = restartsOf(deps, registry, lane);
+  const restarts = mergeRestarts(candidate.park?.restarts ?? current, current);
   const notes: string[] = [];
   try {
     const problems = await stopEverything(deps, registry, dir, lane);

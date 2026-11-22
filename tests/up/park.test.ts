@@ -375,7 +375,7 @@ test('status and lanes --json show a parked lane, since when, and what its next 
   assert.equal(typeof lane.park.parkedAt, 'number');
   assert.equal(lane.park.by, null);
   const { device: gave, ...rest } = lane.park.restarts;
-  assert.deepEqual(rest, { services: [], browser: null, app: BUNDLE });
+  assert.deepEqual(rest, { services: [], shared: [], browser: null, app: BUNDLE });
   assert.deepEqual(gave && { ...gave, booted: undefined }, {
     platform: 'ios',
     name: device.name,
@@ -487,7 +487,7 @@ test("a browser lane's park stops its browser and its web service but keeps the 
   assert.deepEqual(resting.processes, []);
   assert.equal(alive(servicePid), false, 'the web service still runs');
   assert.ok(fs.existsSync(login), 'the park forgot the saved login');
-  assert.deepEqual(resting.park?.restarts, { device: null, services: ['site'], browser: 'playwright', app: null });
+  assert.deepEqual(resting.park?.restarts, { device: null, services: ['site'], shared: [], browser: 'playwright', app: null });
   assert.deepEqual(resting.ports, first.lane.ports);
   assert.equal(resting.browser?.session, session);
 
