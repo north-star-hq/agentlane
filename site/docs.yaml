@@ -1,5 +1,5 @@
 - title: Start
-  pages: [getting-started, install, requirements]
+  pages: [getting-started, install, requirements, docker]
 - title: How it works
   pages: [lanes, setup, parts, skills, speed]
 - title: Features
