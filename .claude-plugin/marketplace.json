@@ -6,7 +6,7 @@
     {
       "name": "agentlane",
       "source": "./plugin",
-      "description": "The device and browser tools, the guard and session-end hooks, and the setup, driving and run-loop skills."
+      "description": "Run several AI coding agents on one machine, each with its own ports, dev servers, database and simulator, emulator or browser. Works with Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity, on web, iOS and Android."
     }
   ]
 }

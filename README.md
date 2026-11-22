@@ -112,7 +112,7 @@ agentlane is the same idea as a git worktree, for the running app. A worktree gi
 
 ### agentlane and Paradev
 
-[Paradev](https://github.com/ParadevAI/Paradev), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. Setup and teardown scripts run as each workspace is created and deleted, to install its dependencies or start and stop its containers. A lane gives each agent an iOS simulator or Android emulator of its own as well.
+[Paradev](https://github.com/ParadevAI/Paradev), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. Setup and teardown scripts run as each workspace is created and deleted, to install its dependencies or to start its containers and remove them. A lane gives each agent an iOS simulator or Android emulator of its own as well.
 
 ### agentlane and your agent's own worktrees
 
