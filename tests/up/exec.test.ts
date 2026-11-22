@@ -198,7 +198,7 @@ test(
     await until(() => !alive(shell), graceMs - 500);
     assert.ok(alive(stubborn), 'the shell took SIGTERM and left the stubborn process behind');
     assert.equal(await running, CALLER_GONE);
-    assert.equal(alive(stubborn), false, 'SIGKILL reached the process the shell left behind');
+    await until(() => !alive(stubborn), 2000).catch(() => assert.fail('SIGKILL reached the process the shell left behind'));
   },
 );
 
