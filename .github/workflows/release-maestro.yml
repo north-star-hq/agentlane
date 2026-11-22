@@ -63,4 +63,5 @@ jobs:
           gh release create "$TAG" "$zip" "$zip.sha256" \
             --verify-tag \
             --title "Maestro $BUILD_VERSION" \
-            --notes-file "$RUNNER_TEMP/notes.md"
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest=false

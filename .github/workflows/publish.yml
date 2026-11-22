@@ -64,3 +64,33 @@ jobs:
     uses: ./.github/workflows/clean-install.yml
     with:
       version: ${{ needs.publish.outputs.version }}
+
+  release:
+    needs: publish
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "A Release for $GITHUB_REF_NAME already exists; leaving it as it is."
+            exit 0
+          fi
+          .github/scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
+          case "$VERSION" in
+            *-*) set -- --prerelease --latest=false ;;
+            *) set -- --latest ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "agentlane $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$@"
