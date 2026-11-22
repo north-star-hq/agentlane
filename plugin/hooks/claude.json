@@ -1,5 +1,5 @@
 {
-  "description": "Keep simctl, adb, emulator and avdmanager off devices other sessions hold, and playwright-cli and agent-browser off their browsers, and release this session's lanes when it ends.",
+  "description": "Keep simctl, adb, emulator and avdmanager off devices other sessions hold and playwright-cli and agent-browser off their browsers, deny docker and podman commands that leave a container running, and release this session's lanes when it ends.",
   "hooks": {
     "PreToolUse": [
       {
