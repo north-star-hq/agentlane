@@ -1,7 +1,7 @@
 ---
 title: "Install for your agent"
 short: "What init detects, installs and writes for each agent, and the Claude Code plugin."
-summary: "agentlane works the same from Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity. `npx agentlane init` finds the agents your project uses, adds agentlane as a dev dependency, and writes each agent's own files from one source: the skills, the MCP server and the hooks. In Claude Code, a plugin can bring the skills and the MCP server instead; the hooks always go in the project's settings."
+summary: "Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity can run side by side on one machine, each in a lane with its own simulator, ports and database. agentlane works the same from each. `npx agentlane init` finds the agents your project uses, adds agentlane as a dev dependency, and writes each agent's own files from one source: the skills, the MCP server and the hooks. In Claude Code, a plugin can bring the skills and the MCP server instead; the hooks always go in the project's settings."
 ---
 
 ## One command

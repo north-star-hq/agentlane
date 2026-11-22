@@ -47,16 +47,20 @@ export function landingMarkdown(landing: Landing, sections: Section[]): string {
     )
     .join('\n\n');
   const docs = sections
-    .map(s => `## ${s.title}\n\n${s.pages.map(p => `- [${p.title}](docs/${p.slug}.md): ${p.short}`).join('\n')}`)
+    .map(s => `## ${s.title}\n\n${s.pages.map(p => `- [${p.label}](docs/${p.slug}.md): ${p.short}`).join('\n')}`)
     .join('\n\n');
   return (
     [
       `# ${landing.title}: ${landing.headline}`,
-      landing.pitch,
+      landing.sentence,
+      landing.figure,
+      `${landing.badge.text}.`,
+      landing.buttons.map(b => `[${b.label}](${markdownHref(b.href)})`).join(' · '),
       `Works with ${landing.agents.join(', ')}.`,
       `## Start in your project\n\n${steps}`,
-      `## Why agentlane\n\n${landing.why.map(w => `- **${w.title}.** ${asMarkdownLinks(w.text)}`).join('\n')}`,
-      `## Fast where agents spend their time\n\n${landing.speed.map(st => `- **${st.value}** ${st.label}`).join('\n')}\n\n${asMarkdownLinks(landing.speedNote)}`,
+      `## What each agent gets\n\n${cardList(landing)}`,
+      `## ${landing.about.title}\n\n${landing.about.paragraphs.map(asMarkdownLinks).join('\n\n')}`,
+      `## Fast where agents spend their time\n\n${landing.speed.map(st => `- **${st.value}** ${st.label}`).join('\n')}\n\n[How we measured](docs/speed.md#how-these-were-measured)`,
       docs,
       '## Changelog\n\n[Every release](changelog.md)',
     ].join('\n\n') + '\n'
@@ -67,6 +71,14 @@ function asMarkdownLinks(text: string): string {
   return text.replace(/\.html(#[^)]*)?\)/g, '.md$1)');
 }
 
+function cardList(landing: Landing): string {
+  return landing.cards.map(c => `- **[${c.title}](${markdownHref(c.href)}).** ${c.text}`).join('\n');
+}
+
+function markdownHref(href: string): string {
+  return /^[a-z]+:/i.test(href) ? href : href.replace(/\.html(#.*)?$/, '.md$1');
+}
+
 export function llmsIndex(landing: Landing, sections: Section[]): string {
   const groups = sections.map(
     s => `## ${s.title}\n\n${s.pages.map(p => `- [${p.title}](docs/${p.slug}.md): ${plainText(p.short)}`).join('\n')}`,
@@ -75,6 +87,8 @@ export function llmsIndex(landing: Landing, sections: Section[]): string {
     [
       `# ${landing.title}`,
       `> ${landing.description}`,
+      `${landing.headline} ${landing.sentence}`,
+      cardList(landing),
       'Each link below is the Markdown copy of one page of the docs, in the order the site reads. llms-full.txt holds every page in one file.',
       ...groups,
       '## Optional\n\n- [Changelog](changelog.md): What changed in each release, newest first.',
@@ -119,7 +133,7 @@ export function buildSite(out: string = DEFAULT_OUT): string[] {
     'index.html',
     shell({
       root: '',
-      title: `${landing.title}: ${landing.headline}`,
+      title: `${landing.title}: ${landing.problem}`,
       description: landing.description,
       current: { kind: 'landing' },
       sections,
@@ -144,7 +158,7 @@ export function buildSite(out: string = DEFAULT_OUT): string[] {
       `docs/${page.slug}.html`,
       shell({
         root: '../',
-        title: `${page.title} | agentlane`,
+        title: `${page.title} | ${landing.title}: ${landing.problem}`,
         description: plainText(page.summary),
         current: { kind: 'doc', slug: page.slug },
         sections,
