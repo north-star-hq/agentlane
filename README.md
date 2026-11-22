@@ -19,7 +19,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="media/hero-dark.svg">
-  <img src="media/hero-light.svg" width="960" alt="Claude Code, Codex and Cursor, each shown with its mark, get their own ports, dev server, database and a browser, iOS simulator or Android emulator from agentlane up. Each types an item into its own copy of the Basket app, ticks items off and takes screenshots, then Codex finishes and its ports and device are released.">
+  <img src="media/hero-light.svg" width="960" alt="Claude Code, Codex and Cursor, each shown with its mark, run agentlane up and get their own ports, dev server, database and a browser, iOS simulator or Android emulator. Each types an item into its own copy of the Basket app, ticks items off and takes screenshots, then Codex finishes and its ports and device are released.">
 </picture>
 
 Whether you run several Claude Code sessions on one app, Codex and Cursor side by side, or agents testing iOS and Android at once, agentlane keeps them apart.
