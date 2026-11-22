@@ -2,6 +2,18 @@
 
 Newest first.
 
+## 0.6.1
+
+The first look or screenshot no longer fails when the XCTest runner takes over a minute to start, and a simctl timeout and a failed Maestro download now say what happened.
+
+### Fixed
+
+- **The first look or screenshot on a fresh iOS driver waits for the XCTest runner.** That call also waits for Maestro to start its runner on the simulator, which Maestro allows 120 s for, but the driver cut it at 60 s and gave up after one try. Where the start takes longer, as it can on GitHub's macOS runners, `look` and `screenshot` failed with `Maestro's session failed (timeout)`, and `up` reported `driver: not started`. On a simulator, the first call on each Maestro now gets 120 s on top of its own 60 s, and the driver sets `MAESTRO_DRIVER_STARTUP_TIMEOUT` so Maestro waits the same 120 s. Calls after the runner has answered keep 60 s. A first read or screenshot that still times out, or that Maestro answers with `iOS driver not ready in time`, restarts Maestro and is tried once more. That error no longer tells you to raise `MAESTRO_DRIVER_STARTUP_TIMEOUT`, which the driver sets itself. It now says the next call starts a fresh runner.
+- **The CLI and the MCP server wait longer on a simulator.** They wait up to 10 minutes for a look or a screenshot and 28 for a run, which covers a first call the driver tries twice. Emulators keep Maestro's own startup time and the earlier limits.
+- **A session failure says whether the driver tried again.** A call tried once read `failed again after a restart`. It now reads `Maestro's session failed (timeout): ...`, and a call tried twice reads `... and failed again when the driver tried once more: ...`.
+- **A simctl command that runs out of time says so.** `up`'s preflight read `simulator runtime: xcrun simctl list -j runtimes failed: ` with nothing after it, and told you to install a runtime that was installed. It now reads `xcrun simctl list -j runtimes didn't finish within 180 s`, with a fix that says to run the listing by hand. Listing the runtimes gets 180 s instead of 60. A simctl command that fails without writing to stderr now names its exit status or signal.
+- **A failed Maestro download is an error `up` reports.** When `up` downloaded Maestro for a sign-in hook and the download couldn't connect, it crashed with `TypeError: fetch failed` and a stack trace. A download that can't connect is now tried once more, and a failed one reads `downloading Maestro <version> from <url> failed: <reason>`, with a fix. In the sign-in step, `up` exits as it does for any failed step. In `up`'s driver step, as before, it prints `driver: not started (...)` and carries on.
+
 ## 0.6.0
 
 The server a project's lane databases live in can now be declared under `shared` in `agentlane.json`. It runs while a lane needs it and stops 5 minutes after the last one parks or ends, with its data kept. `up --no-app` gives tests a lane with the project's data and nothing else. The guard denies a `docker` or `podman` command that would leave a container running after the agent, and `exec` stops its command once the process that ran it is gone. This version runs beside 0.5.x on the same Mac; "Sharing a Mac with 0.5.x" lists what 0.5.x does differently.
@@ -40,7 +52,7 @@ The server a project's lane databases live in can now be declared under `shared`
 - **`restart` starts any shared service the lane needs that isn't running**, before it stops the service, so a failed shared start leaves the running service alone.
 - **The guard hooks start Node for commands that name `docker` or `podman`**, as they do for device and browser tools. `setsid` now passes through like `nohup`, so `setsid <device command>` gets the device check.
 - **`up`'s claim step** reads `claimed lane <id>: no device, browser or port` for a lane that holds none, and a lane with no ports no longer ends the line with a stray comma.
-- **The README, the docs home and the package description now open on the problem agentlane solves**, running several coding agents on one machine.
+- **The README, the docs home and the package description now open on the problem agentlane solves.**
 
 ### Fixed
 

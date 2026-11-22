@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { DeviceBackendError, DeviceRunningError } from '../src/devices/backend.ts';
-import { newestIphone, parseDeviceList, resolveSimSpec, simctlBackend } from '../src/devices/simctl.ts';
+import { newestIphone, parseDeviceList, resolveSimSpec, simctl, simctlBackend, SimctlTimeout } from '../src/devices/simctl.ts';
 import { UsageError } from '../src/registry/refusal.ts';
 import { fakeXcrun, xcrunsOn } from './support/fake-xcrun.ts';
 import { CATALOG, tempDir } from './support/fakes.ts';
@@ -137,6 +137,43 @@ test("a fake xcrun that can't run fails the call instead of reaching any other x
     });
     assert.deepEqual(xcrun.deleted(), []);
     assert.equal(fs.existsSync(path.join(root, 'xcrun', 'calls')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a simctl call that runs past its time limit names the command and the limit, and a silent failure keeps its reason', async () => {
+  const root = tempDir('simctl-slow');
+  try {
+    const bin = path.join(root, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(
+      path.join(bin, 'xcrun'),
+      '#!/bin/sh\nif [ "$2" = slow ]; then exec /bin/sleep 5; fi\nif [ "$2" = killed ]; then kill -TERM $$; fi\nexit 3\n',
+      {
+        mode: 0o755,
+      },
+    );
+    await withProcessEnv({ ...isolatedEnv(root), PATH: bin }, () => {
+      const began = Date.now();
+      assert.throws(
+        () => simctl(['slow', '-j', 'runtimes'], 1000),
+        (e: unknown) => e instanceof SimctlTimeout && e.message === "xcrun simctl slow -j runtimes didn't finish within 1 s",
+      );
+      assert.ok(Date.now() - began < 4000);
+      assert.throws(
+        () => simctl(['list', '-j', 'runtimes']),
+        (e: unknown) =>
+          e instanceof DeviceBackendError &&
+          !(e instanceof SimctlTimeout) &&
+          e.message === 'xcrun simctl list -j runtimes failed (exit status 3) with nothing on stderr',
+      );
+      assert.throws(
+        () => simctl(['killed']),
+        (e: unknown) =>
+          e instanceof DeviceBackendError && e.message === 'xcrun simctl killed failed (signal SIGTERM) with nothing on stderr',
+      );
+    });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

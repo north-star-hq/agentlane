@@ -5,6 +5,7 @@ import path from 'node:path';
 import { CLI } from '../name.ts';
 import { identityOf, systemProcesses, type ProcessIdentity, type ProcessTable } from '../processes.ts';
 import { NotClaimed } from '../registry/refusal.ts';
+import type { Platform } from '../devices/backend.ts';
 import type { Lane } from '../registry/types.ts';
 import type { EngineConfig, EngineRequest, EngineResponse } from './engine.ts';
 import { DriverError } from './errors.ts';
@@ -13,6 +14,7 @@ import { describeIdle, readDriverSettings, takeIdleStop, type IdleStop } from '.
 import { ensureMaestro, findJdk17, MAESTRO_OVERRIDE_ENV, type InstallOptions } from './install.ts';
 import { liveHolder, lockHolder, tryLock } from './lock.ts';
 import { enginePaths, ensurePrivateDir, type EnginePaths } from './paths.ts';
+import { longestIosCallMs, warmCallMs } from './supervisor.ts';
 
 export const ENGINE_MAIN = path.join(import.meta.dirname, `engine-main${path.extname(import.meta.filename)}`);
 
@@ -36,7 +38,15 @@ export interface EngineTarget {
   /** Engine timings; for tests. `idleMs` overrides the Mac's driver.json. */
   tuning?: Pick<
     EngineConfig,
-    'lanePollMs' | 'ownerPollMs' | 'touchEveryMs' | 'heartbeatMs' | 'runnerWatchMs' | 'idleSampleMs' | 'idleMs'
+    | 'lanePollMs'
+    | 'ownerPollMs'
+    | 'touchEveryMs'
+    | 'heartbeatMs'
+    | 'runnerWatchMs'
+    | 'idleSampleMs'
+    | 'idleMs'
+    | 'callTimeouts'
+    | 'runnerStartupMs'
   >;
   /** For judging whether a release in progress still runs; the system's process table when absent. */
   processes?: ProcessTable;
@@ -44,15 +54,40 @@ export interface EngineTarget {
 
 const START_TIMEOUT_MS = 20_000;
 const STOP_WAIT_MS = 35_000;
-const RESPONSE_TIMEOUT_MS: Record<EngineRequest['op'], number> = {
+const MARGIN_MS = 60_000;
+type DeviceOp = 'look' | 'screenshot' | 'run';
+const CONTROL_TIMEOUT_MS: Record<Exclude<EngineRequest['op'], DeviceOp>, number> = {
   ping: 10_000,
   status: 30_000,
   stop: 30_000,
-  look: 150_000,
-  screenshot: 150_000,
-  run: 900_000,
   record: 30_000,
 };
+const firstIosRead = longestIosCallMs('inspect_screen', { retry: true });
+const DEVICE_TIMEOUT_MS: Record<Platform, Record<DeviceOp, number>> = {
+  ios: {
+    look: firstIosRead + warmCallMs('take_screenshot') + MARGIN_MS,
+    screenshot: longestIosCallMs('take_screenshot', { retry: true }) + warmCallMs('inspect_screen') + MARGIN_MS,
+    run: firstIosRead + warmCallMs('run') + firstIosRead + warmCallMs('take_screenshot') + MARGIN_MS,
+  },
+  android: { look: 150_000, screenshot: 150_000, run: 900_000 },
+};
+
+/** How long a client waits for the engine to answer one request on a lane of this platform. */
+export function responseTimeoutMs(op: EngineRequest['op'], platform: Platform): number {
+  switch (op) {
+    case 'look':
+    case 'screenshot':
+    case 'run':
+      return DEVICE_TIMEOUT_MS[platform][op];
+    default:
+      return CONTROL_TIMEOUT_MS[op];
+  }
+}
+
+/** How long a client waits for the engine to answer one request on this lane. */
+export function laneTimeoutMs(lane: Pick<Lane, 'device'>, op: EngineRequest['op']): number {
+  return responseTimeoutMs(op, lane.device?.platform ?? 'ios');
+}
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -256,9 +291,10 @@ export async function callEngine(
 ): Promise<EngineResponse> {
   const paths = enginePaths(target.stateDir, target.lane.id);
   const full = { ...request, lane: refOf(target.lane) } as EngineRequest;
+  const timeoutMs = laneTimeoutMs(target.lane, full.op);
   for (let round = 0; round < 3; round++) {
     refuseWhileReleasing(target, paths);
-    let response = await send(paths, full, RESPONSE_TIMEOUT_MS[full.op]);
+    let response = await send(paths, full, timeoutMs);
     let coldStart: EngineResponse['coldStart'];
     if (!response) {
       const idleStop = takeIdleStop(paths.idle);
@@ -269,7 +305,7 @@ export async function callEngine(
         refuseWhileReleasing(target, paths);
         throw error;
       }
-      response = await send(paths, full, RESPONSE_TIMEOUT_MS[full.op]);
+      response = await send(paths, full, timeoutMs);
       if (response) {
         const ms = Date.now() - started;
         coldStart = { ms, ...(idleStop ? { idleStop: { stoppedAt: idleStop.stoppedAt, idleMs: idleStop.idleMs } } : {}) };
@@ -299,7 +335,7 @@ export async function prewarmEngine(target: EngineTarget): Promise<EngineRespons
 
 /** Asks a running engine about itself; undefined when none runs. */
 export async function engineStatus(stateDir: string, lane: Lane): Promise<EngineResponse | undefined> {
-  return send(enginePaths(stateDir, lane.id), { op: 'status', lane: refOf(lane) }, RESPONSE_TIMEOUT_MS.status);
+  return send(enginePaths(stateDir, lane.id), { op: 'status', lane: refOf(lane) }, CONTROL_TIMEOUT_MS.status);
 }
 
 function exited(engine: ProcessIdentity, processes: ProcessTable): boolean {
@@ -311,7 +347,7 @@ function exited(engine: ProcessIdentity, processes: ProcessTable): boolean {
 /** Stops a lane's engine and waits until its process has exited; false when none was running. */
 export async function stopEngine(stateDir: string, lane: Lane, waitMs = 30_000): Promise<boolean> {
   const paths = enginePaths(stateDir, lane.id);
-  const answer = await send(paths, { op: 'stop', lane: refOf(lane) }, RESPONSE_TIMEOUT_MS.stop).catch(() => undefined);
+  const answer = await send(paths, { op: 'stop', lane: refOf(lane) }, CONTROL_TIMEOUT_MS.stop).catch(() => undefined);
   if (!answer) return false;
   const engine = identityOf(systemProcesses, answer.pid);
   const deadline = Date.now() + waitMs;

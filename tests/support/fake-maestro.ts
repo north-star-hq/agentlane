@@ -46,6 +46,9 @@ process.stdout.write('kotlin-logging: initializing... (not JSON, like the real o
 const dieAfter = env.FAKE_DIE_AFTER === undefined ? Infinity : Number(env.FAKE_DIE_AFTER);
 const unreachableAfter = env.FAKE_UNREACHABLE_AFTER === undefined ? Infinity : Number(env.FAKE_UNREACHABLE_AFTER);
 const notConnectedOn = env.FAKE_NOT_CONNECTED_ON === undefined ? -1 : Number(env.FAKE_NOT_CONNECTED_ON);
+const delays = JSON.parse(env.FAKE_DELAYS ?? '[]') as number[];
+const notReadyTimes = Number(env.FAKE_NOT_READY_TIMES ?? '0');
+const errorOn = env.FAKE_ERROR_ON === undefined ? -1 : Number(env.FAKE_ERROR_ON);
 const JPEG =
   '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==';
 let calls = 0;
@@ -136,6 +139,24 @@ input.on('line', line => {
       return;
     }
     if (env.FAKE_DELAY_MS) await new Promise(resolve => setTimeout(resolve, Number(env.FAKE_DELAY_MS)));
+    const delay = delays[calls - 1];
+    if (delay !== undefined) await new Promise(resolve => setTimeout(resolve, delay));
+    const notReadyMark = `${env.FAKE_LOG ?? ''}.not-ready`;
+    const notReadySoFar = fs.existsSync(notReadyMark) ? fs.readFileSync(notReadyMark, 'utf8').length : 0;
+    if (calls === 1 && notReadySoFar < notReadyTimes) {
+      fs.appendFileSync(notReadyMark, '.');
+      const why =
+        'iOS driver not ready in time, consider increasing timeout by configuring MAESTRO_DRIVER_STARTUP_TIMEOUT env variable';
+      send({ id: message.id, result: text(`Failed to inspect screen: ${why}`, true) });
+      return;
+    }
+    if (calls === errorOn) {
+      send({
+        id: message.id,
+        result: text('Failed to inspect screen: xcodebuild exited with code 65 before the runner started', true),
+      });
+      return;
+    }
     if (name === 'inspect_screen') {
       reads += 1;
       const live = screenText(screen)

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { test } from 'node:test';
 import { resolveToolchain } from '../../src/driver/client.ts';
@@ -10,6 +12,7 @@ import {
   distributionVersion,
   ensureMaestro,
   findJdk17,
+  httpsDownloader,
   installedMaestro,
   JAVA_HOME_TOOL,
   MAESTRO_OVERRIDE_ENV,
@@ -135,6 +138,106 @@ async function refused(promise: Promise<unknown>, pattern: RegExp): Promise<void
     return true;
   });
 }
+
+async function httpServing(dir: string, status = 200): Promise<{ base: string; close: () => Promise<void> }> {
+  const server = http.createServer((request, response) => {
+    const file = path.join(dir, path.basename(request.url ?? ''));
+    if (status !== 200 || !fs.existsSync(file)) {
+      response.writeHead(status === 200 ? 404 : status).end();
+      return;
+    }
+    response.writeHead(200).end(fs.readFileSync(file));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    base: `http://127.0.0.1:${String(port)}`,
+    close: () =>
+      new Promise(resolve =>
+        server.close(() => {
+          resolve();
+        }),
+      ),
+  };
+}
+
+function countingFetch(first?: () => never): { fetch: (url: string) => Promise<Response>; urls: string[] } {
+  const urls: string[] = [];
+  return {
+    urls,
+    fetch: url => {
+      urls.push(url);
+      if (urls.length === 1 && first) first();
+      return fetch(url);
+    },
+  };
+}
+
+test('a Maestro download that cannot connect is tried once more, then fails naming the download and where it was from', async () => {
+  const { root, env } = world();
+  const { release } = build(root);
+  const closed = await httpServing(root);
+  await closed.close();
+  const url = `${closed.base}/${release.asset}`;
+  const counted = countingFetch();
+  await assert.rejects(
+    ensureMaestro({ env, release: { ...release, url }, download: httpsDownloader({ fetch: counted.fetch, retryPauseMs: 10 }) }),
+    (error: unknown) => {
+      assert.ok(error instanceof DriverError, String(error));
+      assert.equal(
+        error.message.split('\n')[0],
+        `downloading Maestro ${VERSION} from ${url} failed: fetch failed: connect ECONNREFUSED ${closed.base.slice('http://'.length)}`,
+      );
+      assert.match(error.fix, /^retry, or download .* yourself/);
+      return true;
+    },
+  );
+  assert.deepEqual(counted.urls, [url, url]);
+  assert.equal(installedMaestro(env, release), undefined);
+});
+
+test('a Maestro download whose first connection times out installs from the second', async () => {
+  const { root, env } = world();
+  const { release, dir } = build(root);
+  const served = await httpServing(dir);
+  try {
+    const url = `${served.base}/${release.asset}`;
+    const counted = countingFetch(() => {
+      throw new TypeError('fetch failed', {
+        cause: Object.assign(new Error('Connect Timeout Error'), { code: 'UND_ERR_CONNECT_TIMEOUT' }),
+      });
+    });
+    const installed = await ensureMaestro({
+      env,
+      release: { ...release, url },
+      download: httpsDownloader({ fetch: counted.fetch, retryPauseMs: 10 }),
+    });
+    assert.equal(installed.installedNow, true);
+    assert.deepEqual(counted.urls, [url, url, `${url}.sha256`]);
+  } finally {
+    await served.close();
+  }
+});
+
+test('a Maestro download the server refuses is not tried again, and its error names the download and the status', async () => {
+  const { root, env } = world();
+  const { release, dir } = build(root);
+  const served = await httpServing(dir, 503);
+  try {
+    const url = `${served.base}/${release.asset}`;
+    const counted = countingFetch();
+    await refused(
+      ensureMaestro({ env, release: { ...release, url }, download: httpsDownloader({ fetch: counted.fetch, retryPauseMs: 10 }) }),
+      new RegExp(
+        `^downloading Maestro ${VERSION.replaceAll('.', '\\.')} from ${url.replaceAll('.', '\\.')} failed: HTTP 503$`,
+        'm',
+      ),
+    );
+    assert.deepEqual(counted.urls, [url]);
+  } finally {
+    await served.close();
+  }
+});
 
 test('a corrupted download is refused and nothing is installed', async () => {
   const { root, env } = world();
