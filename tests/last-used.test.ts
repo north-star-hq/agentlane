@@ -18,7 +18,7 @@ import type { EnvDeps } from '../src/up/deps.ts';
 import { up } from '../src/up/up.ts';
 import { runUpCommand } from '../src/up-cli.ts';
 import { FakeAdb } from './devices/fake-adb.ts';
-import { FakeClock, FakeProbe, tempDir } from './support/fakes.ts';
+import { FakeClock, FakeProbe, tempDir, untilGate } from './support/fakes.ts';
 import { driverWorld, sleeper, until, type DriverWorld } from './support/driver-world.ts';
 import { CONFIG, failures, OPTIONS, toolchain, world, type World } from './support/up-world.ts';
 import { openRegistryReadOnly } from './support/registry-read.ts';
@@ -481,12 +481,7 @@ function lastCallOf(state: string, lane: LaneRef): number {
 /** Runs `exec` on a command that runs until `end` is called; `end` waits for exec to return, so the command never outlives the test. */
 function execUntilEnded(lane: OtherLane, flag: string, over: Partial<EnvDeps>) {
   let settled = false;
-  const running = runUpCommand(
-    'exec',
-    ['--', 'sh', '-c', 'while [ ! -e "$1" ]; do sleep 0.02; done', 'sh', flag],
-    execDeps(lane, over),
-    () => undefined,
-  ).finally(() => {
+  const running = runUpCommand('exec', ['--', 'sh', '-c', untilGate(flag)], execDeps(lane, over), () => undefined).finally(() => {
     settled = true;
   });
   return {
@@ -572,7 +567,7 @@ test('an up hook that runs past the park window counts as a call within one hear
     services: {},
     hooks: {
       ...CONFIG.hooks,
-      build: `while [ ! -e '${flag}' ]; do sleep 0.02; done; ${CONFIG.hooks.build}`,
+      build: `${untilGate(flag)}; ${CONFIG.hooks.build}`,
       launch: 'true',
     },
   });

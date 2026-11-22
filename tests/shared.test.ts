@@ -30,7 +30,7 @@ import {
   stopUnneededShared,
 } from '../src/up/shared.ts';
 import { runSweep, SWEEP_INTERVAL_MS, sweepDue, type SweepDeps } from '../src/up/sweep.ts';
-import { tempDir } from './support/fakes.ts';
+import { tempDir, untilGate } from './support/fakes.ts';
 import type { SharedHolderPlan } from './support/shared-holder.ts';
 import type { World } from './support/world.ts';
 import { parkNow, sawOwners, world } from './support/world.ts';
@@ -1192,11 +1192,6 @@ interface RealWorld {
   killMidway(plan: SharedHolderPlan['action'], aheadMs: number, marker: string): Promise<number>;
   /** Ends the recorded command's process group and every process still running that names this folder, then removes it. */
   close(): Promise<void>;
-}
-
-/** Shell that waits until `gate` exists, giving up after about a minute. */
-function untilGate(gate: string): string {
-  return `n=0; while [ ! -f '${gate}' ] && [ "$n" -lt 3000 ]; do n=$((n + 1)); sleep 0.02; done`;
 }
 
 interface Running {
