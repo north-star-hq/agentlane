@@ -11,7 +11,9 @@ import { laneEnvironment, webUrl } from '../hooks/env.ts';
 import { CLI, TOOL } from '../name.ts';
 import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/config.ts';
 import { asMobile, findProjectConfig, loadLaneConfig } from '../project/config.ts';
-import { describeOwner, resolveOwner } from '../registry/owner.ts';
+import type { ProcessIdentity } from '../processes.ts';
+import { chainFrom } from '../processes.ts';
+import { describeOwner, isProven, judgeProcess, resolveOwner } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
@@ -73,14 +75,22 @@ interface Caller {
 function callerOf(deps: EnvDeps): Caller {
   const parentPid = deps.parentPid ?? (() => process.ppid);
   const pid = parentPid();
-  return { gone: () => parentPid() !== pid };
+  const above: ProcessIdentity[] = [...chainFrom(deps.system.processes, pid)].map(p => ({ pid: p.pid, start: p.start }));
+  return { gone: () => parentPid() !== pid || anyGone(deps.system, above) };
+}
+
+function anyGone(system: ServiceSystem, processes: readonly ProcessIdentity[]): boolean {
+  if (processes.length === 0) return false;
+  const starts = system.running(processes.map(p => p.pid));
+  return processes.some(p => isProven(judgeProcess(p, starts)));
 }
 
 type Ending = { kind: 'exited'; code: number } | { kind: 'caller-gone' };
 
 /**
- * Runs a command with the lane's environment and returns its exit code. When the process that started exec goes away
- * while the command runs, exec ends the command and every process below it, and returns 129 as a hung-up command would.
+ * Runs a command with the lane's environment and returns its exit code. When the process that started exec, or any
+ * process above it, goes away while the command runs, exec ends the command and every process below it, and returns
+ * 129 as a hung-up command would.
  */
 export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv;

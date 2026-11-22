@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { envName } from '../name.ts';
 import type { ProcessIdentity, ProcessInfo, ProcessTable } from '../processes.ts';
-import { identityOf } from '../processes.ts';
+import { chainFrom, identityOf } from '../processes.ts';
 import { UsageError } from './refusal.ts';
 
 export type OwnerKind = 'claude' | 'codex' | 'process';
@@ -211,13 +211,9 @@ interface SessionChain {
 
 function sessionAncestors(table: ProcessTable, selfPid: number, home: string): SessionChain {
   const ancestors: ProcessInfo[] = [];
-  let pid = table.info(selfPid)?.ppid ?? 0;
-  while (pid > 1 && ancestors.length < 32) {
-    const info = table.info(pid);
-    if (!info) break;
+  for (const info of chainFrom(table, table.info(selfPid)?.ppid ?? 0)) {
     if (isCodexDaemon(info, home)) return { ancestors, underCodexDaemon: true };
     ancestors.push(info);
-    pid = info.ppid;
   }
   return { ancestors, underCodexDaemon: false };
 }

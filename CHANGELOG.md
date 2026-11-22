@@ -2,6 +2,12 @@
 
 Newest first.
 
+## Unreleased
+
+### Fixed
+
+- **`exec` ends its command when any process above it goes away, so `npx agentlane exec` ends with the agent's shell.** `exec` watched only its parent. Under `npx` that parent is npm, which keeps running when the shell above it is killed, so the command ran on. `exec` now records the pid and start time of each process above it as it starts, and checks them once a second with one `ps`.
+
 ## 0.6.1
 
 The first look or screenshot no longer fails when the XCTest runner takes over a minute to start, and a simctl timeout and a failed Maestro download now say what happened.

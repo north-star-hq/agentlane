@@ -9,10 +9,10 @@ import { systemProcesses } from '../../src/processes.ts';
 import { tcpProbe } from '../../src/registry/ports.ts';
 import { readRegistryStatus } from '../../src/registry/registry.ts';
 import { runRegistryCommand } from '../../src/registry-cli.ts';
-import { realServiceSystem } from '../../src/services/system.ts';
+import { realServiceSystem, type ServiceSystem } from '../../src/services/system.ts';
 import type { EnvDeps } from '../../src/up/deps.ts';
 import { execInLane } from '../../src/up/exec.ts';
-import { tempDir } from '../support/fakes.ts';
+import { FakeProcesses, tempDir } from '../support/fakes.ts';
 import { alive, API, METRO, toolchain, until, WEB } from '../support/up-world.ts';
 
 const CLI = path.resolve(import.meta.dirname, '..', '..', 'src', 'cli.ts');
@@ -144,6 +144,71 @@ test('killing the shell that ran exec ends exec, its command and every process b
   assert.doesNotMatch(told(), /exec exited/, 'the shell was killed before exec ended');
 });
 
+const RUNNER = `echo $$ > "$1"
+shift
+"$@"
+echo "exec exited $?"
+`;
+
+test(
+  'killing the shell above a runner that waits on exec, as npx does, ends exec and every process below it, and exec exits 129',
+  LIMIT,
+  async t => {
+    const lane = await heldLane();
+    const pids = path.join(lane.worktree, 'pids');
+    const runnerPid = path.join(lane.worktree, 'runner-pid');
+    const fixture = path.join(lane.worktree, 'tree.sh');
+    const runner = path.join(lane.worktree, 'runner.sh');
+    fs.writeFileSync(fixture, TREE);
+    fs.writeFileSync(runner, RUNNER);
+    const log = path.join(lane.worktree, 'exec.log');
+    const logFd = fs.openSync(log, 'a');
+    const shell = spawn(
+      '/bin/sh',
+      [
+        '-c',
+        '"$@"; echo "runner exited $?"',
+        'sh',
+        '/bin/sh',
+        runner,
+        runnerPid,
+        process.execPath,
+        CLI,
+        'exec',
+        '--',
+        '/bin/sh',
+        fixture,
+        pids,
+      ],
+      { cwd: lane.worktree, env: lane.env, detached: true, stdio: ['ignore', logFd, logFd] },
+    );
+    fs.closeSync(logFd);
+    const shellPid = shell.pid ?? 0;
+    killLeftovers(t, () => [-shellPid, ...recordedPids(runnerPid), ...recordedPids(pids)]);
+    const told = () => fs.readFileSync(log, 'utf8');
+
+    await until(() => recordedPids(pids).length === 5, 20_000).catch(() => assert.fail(`the tree never started:\n${told()}`));
+    const tree = recordedPids(pids);
+    const [middle = 0] = recordedPids(runnerPid);
+    const parentOf = (pid: number) => Number(spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' }).stdout);
+    assert.ok(
+      tree.some(pid => parentOf(pid) === middle),
+      `exec, in ${tree.join(' ')}, runs under the runner ${String(middle)}, not under the shell`,
+    );
+
+    process.kill(shellPid, 'SIGKILL');
+    const killedAt = Date.now();
+    await until(() => tree.every(pid => !alive(pid)), 10_000).catch(() =>
+      assert.fail(`still running: ${tree.filter(pid => alive(pid)).join(' ')} of ${tree.join(' ')}\n${told()}`),
+    );
+    const tookMs = Date.now() - killedAt;
+    assert.ok(tookMs < 5000, `the tree took ${String(tookMs)} ms to go`);
+    await until(() => told().includes('exec exited'), 5000).catch(() => assert.fail(`the runner never saw exec end:\n${told()}`));
+    assert.match(told(), /^exec exited 129$/m, 'the runner outlived the shell and saw exec exit 129');
+    assert.doesNotMatch(told(), /runner exited/, 'the shell was killed before the runner ended');
+  },
+);
+
 test('a command that ignores SIGTERM gets SIGKILL once the grace is over, and exec then exits 129', LIMIT, async t => {
   const lane = await heldLane();
   const pidFile = path.join(lane.worktree, 'pid');
@@ -202,6 +267,59 @@ test(
   },
 );
 
+const WRITE_PID_THEN_SLEEP = ['/bin/sh', '-c', 'echo $$ > "$1"; exec sleep 30', 'sh'];
+
+test('a process above exec whose pid now belongs to a process started later counts as gone', LIMIT, async t => {
+  const lane = await heldLane();
+  const pidFile = path.join(lane.worktree, 'pid');
+  const table = new FakeProcesses();
+  const [runner, shell] = table.tree(['npm exec', 'zsh']);
+  assert.ok(runner && shell);
+  const system: ServiceSystem = { ...realServiceSystem, processes: table, running: pids => table.startTimes(pids) };
+  const running = execInLane(deps(lane, { system, parentPid: () => runner.pid, callerPollMs: 20 }), [
+    ...WRITE_PID_THEN_SLEEP,
+    pidFile,
+  ]);
+  killLeftovers(t, () => recordedPids(pidFile));
+  await until(() => recordedPids(pidFile).length === 1, 20_000);
+  const [pid = 0] = recordedPids(pidFile);
+  await sleep(200);
+  assert.ok(alive(pid), 'the command runs while every process above exec does');
+
+  table.recycle(shell.pid);
+  assert.equal(await running, CALLER_GONE);
+  assert.equal(alive(pid), false);
+});
+
+test("when exec can't read the processes above it, it runs the command and watches its parent alone", LIMIT, async t => {
+  const lane = await heldLane();
+  const pidFile = path.join(lane.worktree, 'pid');
+  const listed: number[][] = [];
+  const system: ServiceSystem = {
+    ...realServiceSystem,
+    processes: { ...systemProcesses, info: () => undefined },
+    running: pids => {
+      listed.push([...pids]);
+      return realServiceSystem.running(pids);
+    },
+  };
+  let gone = false;
+  const running = execInLane(deps(lane, { system, parentPid: () => (gone ? 1 : process.ppid), callerPollMs: 20 }), [
+    ...WRITE_PID_THEN_SLEEP,
+    pidFile,
+  ]);
+  killLeftovers(t, () => recordedPids(pidFile));
+  await until(() => recordedPids(pidFile).length === 1, 20_000);
+  const [pid = 0] = recordedPids(pidFile);
+  await sleep(200);
+  assert.ok(alive(pid), 'the command runs');
+  assert.deepEqual(listed, [], 'with no processes above it recorded, a check lists none');
+
+  gone = true;
+  assert.equal(await running, CALLER_GONE);
+  assert.equal(alive(pid), false);
+});
+
 test('a caller gone before the command starts means the command never runs', LIMIT, async () => {
   const lane = await heldLane();
   const marker = path.join(lane.worktree, 'ran');
@@ -216,16 +334,34 @@ test('a caller gone before the command starts means the command never runs', LIM
 });
 
 test(
-  'while its caller lives, exec checks on it about once a second and stops checking when the command ends',
+  'while its caller lives, exec checks on it about once a second, with one process listing a check, and stops checking when the command ends',
   LIMIT,
   async () => {
     const lane = await heldLane();
     let reads = 0;
+    let listings = 0;
+    let listingsAtFirstCheck = 0;
+    const system: ServiceSystem = {
+      ...realServiceSystem,
+      processes: {
+        ...systemProcesses,
+        info: pid => {
+          listings++;
+          return systemProcesses.info(pid);
+        },
+      },
+      running: pids => {
+        listings++;
+        return realServiceSystem.running(pids);
+      },
+    };
     const startedAt = Date.now();
     const code = await execInLane(
       deps(lane, {
+        system,
         parentPid: () => {
           reads++;
+          if (reads === 2) listingsAtFirstCheck = listings;
           return process.ppid;
         },
       }),
@@ -234,6 +370,8 @@ test(
     const seconds = (Date.now() - startedAt) / 1000;
     assert.equal(code, 0);
     assert.ok(reads >= 3 && reads <= seconds + 3, `${String(reads)} reads of the parent pid in ${seconds.toFixed(1)} s`);
+    assert.ok(listingsAtFirstCheck > 0, 'exec read the processes above it at start');
+    assert.equal(listings - listingsAtFirstCheck, reads - 1, 'each check lists processes once');
     const atEnd = reads;
     await sleep(1500);
     assert.equal(reads, atEnd, 'the checks stopped with the command');

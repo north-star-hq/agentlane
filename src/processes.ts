@@ -155,6 +155,18 @@ export function killGroup(pgid: number, signal: Signaller = systemSignaller): bo
   }
 }
 
+const MAX_CHAIN = 32;
+
+/** `pid` and the processes above it, nearest first, as far as `table` can read them, stopping before pid 1. */
+export function* chainFrom(table: ProcessTable, pid: number): Generator<ProcessInfo> {
+  for (let at = pid, read = 0; at > 1 && read < MAX_CHAIN; read++) {
+    const info = table.info(at);
+    if (!info) return;
+    yield info;
+    at = info.ppid;
+  }
+}
+
 export function identityOf(table: ProcessTable, pid: number): ProcessIdentity | undefined {
   const start = table.startTimes([pid])?.get(pid);
   return start === undefined ? undefined : { pid, start };
