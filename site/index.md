@@ -32,9 +32,9 @@ agents:
   - Gemini CLI
   - Antigravity
 heroAlt: >-
-  Claude Code, Codex and Cursor, each shown with its mark, get their own ports, dev server, database and a browser,
-  iOS simulator or Android emulator from agentlane up. Each types an item into its own copy of the Basket app, ticks
-  items off and takes screenshots, then Codex finishes and its ports and device are released.
+  Claude Code, Codex and Cursor, each shown with its mark, run agentlane up and get their own ports, dev server,
+  database and a browser, iOS simulator or Android emulator. Each types an item into its own copy of the Basket app,
+  ticks items off and takes screenshots, then Codex finishes and its ports and device are released.
 cards:
   - icon: plug
     title: Its own ports
