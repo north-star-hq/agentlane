@@ -7,21 +7,12 @@ import { formatAge, formatTime } from '../registry/format.ts';
 import type { LanePark } from '../registry/parks.ts';
 import { describeRestarts } from '../registry/parks.ts';
 import { tcpProbe } from '../registry/ports.ts';
-import { PROJECT_PLATFORMS } from '../project/schema.ts';
 import { NotClaimed, Refusal } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
 import type { Lane, LaneRef } from '../registry/types.ts';
 import { wakeFolder } from './lane-files.ts';
+import { LANE_WAIT_MS } from './lane-waits.ts';
 import { attemptId, deadHolder } from './park.ts';
-
-/** How long a call waits on another call parking or waking its lane. */
-export const LANE_WAIT_MS = 30 * 60_000;
-
-/** How long waking a lane waits for a pool device, as `up` does by default, once for each platform it wakes. */
-export const WAKE_WAIT_MS = 600_000;
-
-/** The longest enterLane waits on its bounded steps: another call's park or wake, then each platform's wait for a device. */
-export const LONGEST_ENTRY_MS = LANE_WAIT_MS + PROJECT_PLATFORMS.length * WAKE_WAIT_MS;
 
 export interface LaneEntry {
   stateDir: string;

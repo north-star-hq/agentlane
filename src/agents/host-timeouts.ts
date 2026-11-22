@@ -1,7 +1,7 @@
 import { LONGEST_ENGINE_CALL_MS } from '../driver/client.ts';
 import { TOOL } from '../name.ts';
 import type { Agent } from '../registry/owner.ts';
-import { LONGEST_ENTRY_MS } from '../up/wake.ts';
+import { LONGEST_ENTRY_MS } from '../up/lane-waits.ts';
 import { AGENT_NAMES } from './detect.ts';
 
 export interface HostTimeout {

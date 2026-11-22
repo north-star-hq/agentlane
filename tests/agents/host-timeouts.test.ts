@@ -18,7 +18,7 @@ import { LONGEST_ANSWER_MS, LONGEST_ENGINE_CALL_MS, responseTimeoutMs } from '..
 import type { EngineRequest } from '../../src/driver/engine.ts';
 import { INSTALL_WAITS_MS, JDK_LOOKUP_MS } from '../../src/driver/install.ts';
 import { PROJECT_PLATFORMS } from '../../src/project/schema.ts';
-import { LANE_WAIT_MS, LONGEST_ENTRY_MS, WAKE_WAIT_MS } from '../../src/up/wake.ts';
+import { LANE_WAIT_MS, LONGEST_ENTRY_MS, WAKE_WAIT_MS } from '../../src/up/lane-waits.ts';
 import { tempDir } from '../support/fakes.ts';
 import { recordingInstaller } from '../support/installer.ts';
 
