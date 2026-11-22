@@ -147,9 +147,13 @@ test('a simctl call that runs past its time limit names the command and the limi
   try {
     const bin = path.join(root, 'bin');
     fs.mkdirSync(bin);
-    fs.writeFileSync(path.join(bin, 'xcrun'), '#!/bin/sh\nif [ "$2" = slow ]; then exec /bin/sleep 5; fi\nexit 3\n', {
-      mode: 0o755,
-    });
+    fs.writeFileSync(
+      path.join(bin, 'xcrun'),
+      '#!/bin/sh\nif [ "$2" = slow ]; then exec /bin/sleep 5; fi\nif [ "$2" = killed ]; then kill -TERM $$; fi\nexit 3\n',
+      {
+        mode: 0o755,
+      },
+    );
     await withProcessEnv({ ...isolatedEnv(root), PATH: bin }, () => {
       const began = Date.now();
       assert.throws(
@@ -162,7 +166,12 @@ test('a simctl call that runs past its time limit names the command and the limi
         (e: unknown) =>
           e instanceof DeviceBackendError &&
           !(e instanceof SimctlTimeout) &&
-          /^xcrun simctl list -j runtimes failed: Command failed: xcrun simctl list -j runtimes$/.test(e.message),
+          e.message === 'xcrun simctl list -j runtimes failed (exit status 3) with nothing on stderr',
+      );
+      assert.throws(
+        () => simctl(['killed']),
+        (e: unknown) =>
+          e instanceof DeviceBackendError && e.message === 'xcrun simctl killed failed (signal SIGTERM) with nothing on stderr',
       );
     });
   } finally {

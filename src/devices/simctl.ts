@@ -45,9 +45,15 @@ export class SimctlTimeout extends DeviceBackendError {
 
 function failure(args: readonly string[], error: unknown, timeoutMs: number, timedOut: boolean): DeviceBackendError {
   if (timedOut) return new SimctlTimeout(args, timeoutMs);
-  const e = error as Error & { stderr?: string };
+  const e = error as Error & { stderr?: string; status?: number | null; code?: unknown; signal?: string | null };
+  const command = `xcrun simctl ${args.join(' ')}`;
   const stderr = e.stderr?.trim() ?? '';
-  return new DeviceBackendError(`xcrun simctl ${args.join(' ')} failed: ${stderr === '' ? e.message.trim() : stderr}`);
+  if (stderr !== '') return new DeviceBackendError(`${command} failed: ${stderr}`);
+  const status = e.status ?? (typeof e.code === 'number' ? e.code : undefined);
+  const ending = e.signal ? `signal ${e.signal}` : status != null ? `exit status ${String(status)}` : undefined;
+  return new DeviceBackendError(
+    ending === undefined ? `${command} failed: ${e.message.trim()}` : `${command} failed (${ending}) with nothing on stderr`,
+  );
 }
 
 export function simctl(args: string[], timeoutMs = 60_000): string {
