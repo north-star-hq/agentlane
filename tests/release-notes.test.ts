@@ -100,6 +100,34 @@ test('a heading inside a fenced block does not end the section', () => {
   }
 });
 
+test('a fence closes only with its own character, at least as long, with nothing after it', () => {
+  const body = [
+    '````md\n```\n## inside\n```\n````\n',
+    '~~~~\n~~~ not a close\n## inside\n~~~~\n',
+    '  ```sh\n## inside\n   ```  \n',
+  ].join('\n');
+  const file = changelogFile(`## 0.6.1\n\n${body}\n- After the fences.\n\n## 0.6.0\n\n- Older.\n`);
+  const run = notes('0.6.1', file);
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout, `${body}\n- After the fences.\n`);
+});
+
+test('a code fence never closed fails the release, whichever section it is in', () => {
+  const older = '## 0.6.0\n\n- Older.\n';
+  for (const [version, text] of [
+    ['0.6.1', `## 0.6.1\n\n\`\`\`sh\n## x\n\n${older}`],
+    ['0.6.1', `## 0.6.1\n\n- Fine.\n\n${older}\n\`\`\`\nopen\n`],
+    ['0.6.1', `## Unreleased\n\n\`\`\`\nopen\n\n## 0.6.1\n\n- Wanted.\n`],
+    ['0.6.1', `## 0.6.1\n\n\`\`\`\`\n\`\`\`\n\n${older}`],
+  ] as const) {
+    const file = changelogFile(text);
+    const run = notes(version, file);
+    assert.equal(run.status, 1, text);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, `${file} has a code fence that is never closed\n`);
+  }
+});
+
 test('a stable version with no section fails naming the version', () => {
   const run = notes('9.9.9');
   assert.equal(run.status, 1);

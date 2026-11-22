@@ -9,20 +9,38 @@ stable="${version%%-*}"
 
 section() {
   awk -v heading="## $1" '
-    fence == "" && $0 == heading { found = 1; next }
-    found && fence == "" && /^## / { exit }
-    /^```/ || /^~~~/ {
-      marker = substr($0, 1, 3)
-      if (fence == "") fence = marker
-      else if (marker == fence) fence = ""
+    !done && fence == "" && $0 == heading { found = 1; next }
+    found && fence == "" && /^## / { found = 0; done = 1 }
+    {
+      indent = 0
+      while (substr($0, indent + 1, 1) == " ") indent++
+      rest = substr($0, indent + 1)
+      char = substr(rest, 1, 1)
+      run = 0
+      if (char == "`" || char == "~") while (substr(rest, run + 1, 1) == char) run++
+      after = substr(rest, run + 1)
+      if (indent <= 3 && run >= 3) {
+        if (fence == "") {
+          if (char == "~" || index(after, "`") == 0) { fence = char; fence_run = run }
+        } else if (char == fence && run >= fence_run && after ~ /^ *$/) {
+          fence = ""
+        }
+      }
     }
-    found { print }
-  ' "$changelog" | sed '/./,$!d'
+    found && $0 != "" { started = 1 }
+    found && started { print }
+    END { if (fence != "") exit 2 }
+  ' "$changelog"
 }
 
-notes="$(section "$stable")"
+unclosed() {
+  echo "$changelog has a code fence that is never closed" >&2
+  exit 1
+}
+
+notes="$(section "$stable")" || unclosed
 if [ -z "$notes" ] && [ "$stable" != "$version" ]; then
-  notes="$(section Unreleased)"
+  notes="$(section Unreleased)" || unclosed
 fi
 
 if [ -z "$notes" ]; then
