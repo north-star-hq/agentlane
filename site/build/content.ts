@@ -77,7 +77,9 @@ function frontMatter(file: string): { data: Record<string, unknown>; body: strin
   const text = fs.readFileSync(file, 'utf8');
   const match = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
   if (!match) throw new Error(`${path.relative(REPO, file)}: no front matter`);
-  return { data: parse(match[1] ?? '') as Record<string, unknown>, body: match[2] ?? '' };
+  const data: unknown = parse(match[1] ?? '');
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) throw needs(file, 'fields');
+  return { data: data as Fields, body: match[2] ?? '' };
 }
 
 type Fields = Record<string, unknown>;
@@ -167,7 +169,7 @@ export function loadLanding(file = path.join(SITE, 'index.md')): Landing {
   const marked = text(data.marked, file, 'marked');
   const sentence = headline.replace(/\.$/, '');
   const word = marked.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const at = sentence.search(new RegExp(`(?<![\\p{L}\\p{N}])${word}(?![\\p{L}\\p{N}])`, 'u'));
+  const at = sentence.search(new RegExp(`(?<![\\p{L}\\p{M}\\p{N}\\p{Pc}])${word}(?![\\p{L}\\p{M}\\p{N}\\p{Pc}])`, 'u'));
   if (at === -1) throw new Error(`${where}: marked is "${marked}", which the headline before its full stop doesn't contain`);
   const badge = only(fields(data.badge, file, 'badge'), file, 'badge.', ['text', 'href']);
   const buttons = list(data.buttons, file, 'buttons', (value, name): Link => {

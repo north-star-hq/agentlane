@@ -245,7 +245,7 @@ describe('the docs site', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     });
 
-    function load(edit: (text: string) => string): () => unknown {
+    function load(edit: (text: string) => string): () => Landing {
       const file = path.join(dir, 'index.md');
       fs.writeFileSync(file, edit(fs.readFileSync(path.join(SITE, 'index.md'), 'utf8')));
       return () => loadLanding(file);
@@ -259,7 +259,7 @@ describe('the docs site', () => {
     });
 
     test('marks a whole word of the headline', () => {
-      const landing = load(t => t.replace('marked: fighting', 'marked: coding'))() as Landing;
+      const landing = load(t => t.replace('marked: fighting', 'marked: coding'))();
       assert.deepEqual(landing.marked, {
         before: 'Stop your ',
         text: 'coding',
@@ -271,6 +271,29 @@ describe('the docs site', () => {
       assert.throws(
         load(t => t.replace('marked: fighting', 'marked: fight')),
         /marked is "fight", which the headline before its full stop doesn't contain/,
+      );
+      assert.throws(
+        load(t =>
+          t.replace('headline: Stop your coding', 'headline: Stop your cafe\u0301').replace('marked: fighting', 'marked: cafe'),
+        ),
+        /marked is "cafe", which the headline before its full stop doesn't contain/,
+      );
+      assert.throws(
+        load(t =>
+          t.replace('headline: Stop your coding', 'headline: Stop your foo_bar').replace('marked: fighting', 'marked: foo'),
+        ),
+        /marked is "foo", which the headline before its full stop doesn't contain/,
+      );
+    });
+
+    test('names the file when the front matter is not a set of fields', () => {
+      assert.throws(
+        load(t => t.replace(/^---\n[\s\S]*?\n---\n/, '---\nhello\n---\n')),
+        /index\.md: front matter needs fields/,
+      );
+      assert.throws(
+        load(t => t.replace(/^---\n[\s\S]*?\n---\n/, '---\n\n---\n')),
+        /index\.md: front matter needs fields/,
       );
     });
 
