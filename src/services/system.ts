@@ -1,8 +1,9 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { ProcessTable } from '../processes.ts';
-import { runningStartTimes, systemProcesses } from '../processes.ts';
+import { isAlive } from '../driver/exec.ts';
+import type { ProcessTable, Standing } from '../processes.ts';
+import { runningStartTimes, runningWithParents, systemProcesses } from '../processes.ts';
 
 export interface Descendant {
   pid: number;
@@ -13,6 +14,10 @@ export interface ServiceSystem {
   readonly processes: ProcessTable;
   /** The start times of those of `pids` still running, by pid; a zombie is not running. */
   running(pids: readonly number[]): ReadonlyMap<number, string> | undefined;
+  /** The parent pids and start times of those of `pids` still running, by pid, in one listing; a zombie is not running. */
+  runningWithParents(pids: readonly number[]): ReadonlyMap<number, Standing> | undefined;
+  /** Whether `pid` names a process, asked with signal 0, which starts no process; a zombie still names one. */
+  exists(pid: number): boolean;
   spawnGroup(command: string, options: { cwd: string; env: NodeJS.ProcessEnv; log: string }): number;
   listeners(port: number): number[] | undefined;
   groups(pids: readonly number[]): ReadonlyMap<number, number> | undefined;
@@ -114,6 +119,8 @@ function deliver(target: number, signal: NodeJS.Signals): boolean {
 export const realServiceSystem: ServiceSystem = {
   processes: systemProcesses,
   running: runningStartTimes,
+  runningWithParents,
+  exists: isAlive,
 
   spawnGroup(command, options) {
     fs.mkdirSync(path.dirname(options.log), { recursive: true });

@@ -71,8 +71,9 @@ export const UP_HELP: UsageGroup<(typeof UP_COMMANDS)[number]> = {
              With a driver block, 'maestro' there is the toolkit's build on this lane's device,
              with JDK 17 and the lane's runner token: ${TOOL} exec -- maestro test <flow.yaml>
              Without one, or with an invalid config or no running device, 'maestro' says why and
-             runs nothing. When the process that ran exec exits, exec stops the command and every
-             process under it (SIGTERM, then SIGKILL 5 s later) and exits 129.
+             runs nothing. If the process that ran exec, or any process above it, exits, exec
+             stops the command and every process under it (SIGTERM, then SIGKILL 5 s later) and
+             exits 129. Under Codex, its shared daemon and the processes above it don't count.
 `,
     doctor: `  doctor     Is this worktree's instance worth driving? Checks the lane, toolchain, device,
              app, launch, services and hygiene, read-only; exit 1 names each fix. A lane up --no-app

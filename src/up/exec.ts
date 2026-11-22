@@ -11,7 +11,8 @@ import { laneEnvironment, webUrl } from '../hooks/env.ts';
 import { CLI, TOOL } from '../name.ts';
 import type { MobileConfig, ProjectConfig, ProjectPlatform } from '../project/config.ts';
 import { asMobile, findProjectConfig, loadLaneConfig } from '../project/config.ts';
-import { describeOwner, resolveOwner } from '../registry/owner.ts';
+import type { ProcessInfo, Standing } from '../processes.ts';
+import { describeOwner, resolveOwner, sessionChain } from '../registry/owner.ts';
 import { stateDir } from '../registry/paths.ts';
 import { NotClaimed, Refusal, UsageError } from '../registry/refusal.ts';
 import { Registry } from '../registry/registry.ts';
@@ -62,6 +63,7 @@ async function restoreDeviceNetwork(deps: EnvDeps, config: MobileConfig | null, 
 }
 
 export const CALLER_POLL_MS = 1000;
+export const CALLER_START_CHECK_MS = 10_000;
 export const STOP_GRACE_MS = 5000;
 const STOP_CHECK_MS = 100;
 const CALLER_GONE_EXIT = 128 + os.constants.signals.SIGHUP;
@@ -71,16 +73,33 @@ interface Caller {
 }
 
 function callerOf(deps: EnvDeps): Caller {
+  const { system, clock } = deps;
   const parentPid = deps.parentPid ?? (() => process.ppid);
   const pid = parentPid();
-  return { gone: () => parentPid() !== pid };
+  const above = sessionChain(system.processes, pid, deps.env).ancestors;
+  let startsReadAt = clock.now();
+  const startsDue = () => above.length > 0 && clock.now() - startsReadAt >= CALLER_START_CHECK_MS;
+  return {
+    gone: () => {
+      if (parentPid() !== pid || above.some(p => !system.exists(p.pid))) return true;
+      if (!startsDue()) return false;
+      startsReadAt = clock.now();
+      const now = system.runningWithParents(above.map(p => p.pid));
+      return now !== undefined && above.some(p => endedOrReplaced(p, now.get(p.pid)));
+    },
+  };
+}
+
+function endedOrReplaced(recorded: ProcessInfo, now: Standing | undefined): boolean {
+  return now === undefined || (now.start !== recorded.start && now.ppid !== recorded.ppid);
 }
 
 type Ending = { kind: 'exited'; code: number } | { kind: 'caller-gone' };
 
 /**
- * Runs a command with the lane's environment and returns its exit code. When the process that started exec goes away
- * while the command runs, exec ends the command and every process below it, and returns 129 as a hung-up command would.
+ * Runs a command with the lane's environment and returns its exit code. When the process that started exec, or any
+ * process above it, goes away while the command runs, exec ends the command and every process below it, and returns
+ * 129 as a hung-up command would.
  */
 export async function execInLane(deps: EnvDeps, argv: readonly string[]): Promise<number> {
   const [command, ...args] = argv;
