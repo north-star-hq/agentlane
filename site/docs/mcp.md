@@ -34,14 +34,14 @@ The site builds the tool sections below from the server's own tool definitions.
 
 | Agent          | File                      | Time limit on one call                                 |
 | -------------- | ------------------------- | ------------------------------------------------------ |
-| Claude Code    | `.mcp.json`               | `"timeout": 1800000` only in place of a shorter one you set; Claude Code's own is about 28 hours |
-| Codex          | `.codex/config.toml`      | `tool_timeout_sec = 1800`                              |
+| Claude Code    | `.mcp.json`               | `"timeout": 9180000` only in place of a shorter one you set; Claude Code's own is about 28 hours |
+| Codex          | `.codex/config.toml`      | `tool_timeout_sec = 9180`                              |
 | Cursor         | `.cursor/mcp.json`        | none; Cursor has no setting for it                     |
-| GitHub Copilot | `.mcp.json`               | `"timeout": 1800000`                                   |
-| Gemini CLI     | `.gemini/settings.json`   | `"timeout": 1800000`                                   |
-| Antigravity    | `.agents/mcp_config.json` | `"timeoutSeconds": 1800`                               |
+| GitHub Copilot | `.mcp.json`               | `"timeout": 9180000`                                   |
+| Gemini CLI     | `.gemini/settings.json`   | `"timeout": 9180000`                                   |
+| Antigravity    | `.agents/mcp_config.json` | `"timeoutSeconds": 9180`                               |
 
-Each agent stops an MCP call that runs past its own limit: 60 seconds in Codex, 30 in GitHub Copilot, 3 minutes in Antigravity and 10 in Gemini CLI. A first `look` or `screenshot` on a fresh iOS simulator can take several minutes, and the server waits up to 28 minutes for a `run`, so `init` sets each of those limits to 30 minutes. It raises a shorter value, and keeps a longer one or Antigravity's `-1`, which turns its limits off. In GitHub Copilot, Gemini CLI and Antigravity the same value also limits how long the server has to start, and 30 minutes is longer than each one's default. Where Copilot is wired too, Claude Code reads the same 30 minutes from `.mcp.json`. `doctor` warns when an entry has no limit or a shorter one, and names the file, the key and the value it needs.
+Codex stops an MCP call after 60 seconds, GitHub Copilot after 30, Antigravity after 3 minutes and Gemini CLI after 10. One call on agentlane's server can take much longer. A first `look` on a fresh iOS simulator can take several minutes, the server waits up to 28 minutes for a `run`, and the same call may first wake a parked lane, install Maestro or restart the driver. So `init` sets each of those four limits to 153 minutes, the sum of every wait agentlane limits in one call, plus a minute. It raises a shorter value, and keeps a longer one or Antigravity's `-1`, which turns its limits off. In GitHub Copilot, Gemini CLI and Antigravity the same value also limits how long the server has to start, and 153 minutes is longer than each one's default. Claude Code gets the value only in place of a shorter one, since its own limit is longer. Where Copilot is wired too, Claude Code reads Copilot's 153 minutes from the same `.mcp.json`. `doctor` warns when an entry has no limit or a shorter one, and names the file, the key and the value it needs.
 
 The Cursor app documents no limit on an MCP call. Cursor's CLI and `agent acp` stop one after 60 seconds, and a project can't change that, so there a first call on a fresh iOS simulator can fail before the server answers.
 
