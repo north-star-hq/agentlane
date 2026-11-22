@@ -22,6 +22,7 @@ export function slug(text: string): string {
     text
       .toLowerCase()
       .replace(/<[^>]*>/g, '')
+      .replace(/&#39;|&rsquo;|['’]/g, '')
       .replace(/&[a-z]+;/g, '')
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-|-$/g, '') || 'section'

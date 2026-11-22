@@ -6,23 +6,23 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/npm/v/agentlane" alt="npm">
-  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
-  <img src="https://github.com/north-star-hq/agentlane/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <a href="https://www.npmjs.com/package/agentlane"><img src="https://img.shields.io/npm/v/agentlane" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+  <a href="https://github.com/north-star-hq/agentlane/actions/workflows/ci.yml"><img src="https://github.com/north-star-hq/agentlane/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 <h3 align="center">Stop your coding agents fighting over ports, simulators and databases.</h3>
 
 <p align="center">The fast, light way to run a copy of your app for every agent, with tools to see it and drive it, all at the same time.</p>
 
-<p align="center"><strong>Reads the screen 50x faster than stock Maestro on two simulators.</strong></p>
+<p align="center"><strong>Reads the screen 50x faster than stock Maestro.</strong></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="media/hero-dark.svg">
-  <img src="media/hero-light.svg" width="960" alt="Claude Code, Codex and Cursor, each shown with its mark, get their own lane from agentlane up: ports, dev server, database and a browser, iOS simulator or Android emulator. Each types an item into its own copy of the Basket app, ticks items off and takes screenshots, then Codex finishes and its lane is released.">
+  <img src="media/hero-light.svg" width="960" alt="Claude Code, Codex and Cursor, each shown with its mark, get their own ports, dev server, database and a browser, iOS simulator or Android emulator from agentlane up. Each types an item into its own copy of the Basket app, ticks items off and takes screenshots, then Codex finishes and its ports and device are released.">
 </picture>
 
-Whether you run three Claude Code sessions on one Expo app, Codex and Cursor on the same web app, or agents testing iOS and Android at once, agentlane keeps them apart.
+Whether you run several Claude Code sessions on one app, Codex and Cursor side by side, or agents testing iOS and Android at once, agentlane keeps them apart.
 
 agentlane calls each copy a **lane**. Every lane has:
 
@@ -55,13 +55,13 @@ Once setup reports ready, any agent in the project can take work like this:
 
 ## Speed
 
-An agent reads its screen in **0.12 s**, where stock Maestro takes 6.5 s with two simulators running.
+An agent reads its screen in **0.12 s**, where stock Maestro takes 6.5 s.
 
-|                                     | With agentlane               | Without                |
-| ----------------------------------- | ---------------------------- | ---------------------- |
-| Read the screen, two iOS simulators | 0.12 s                       | 6.5 s on stock Maestro |
-| iOS build in a fresh worktree       | 6.5 s from the shared cache  | 91.5 s                 |
-| Boot an Android emulator            | 1.6 to 1.8 s from Quick Boot | 14.6 s cold            |
+|                               | With agentlane              | Without                |
+| ----------------------------- | --------------------------- | ---------------------- |
+| Read the screen               | 0.12 s                      | 6.5 s on stock Maestro |
+| iOS build in a fresh worktree | 6.5 s from the shared cache | 91.5 s                 |
+| Boot an Android emulator      | Under 2 s from Quick Boot   | 14.6 s cold            |
 
 [How we measured, and what makes it fast](https://north-star-hq.github.io/agentlane/docs/speed.html)
 
@@ -104,15 +104,15 @@ agentlane is the same idea as a git worktree, for the running app. A worktree gi
 
 ### agentlane and Maestro
 
-[Maestro](https://github.com/mobile-dev-inc/Maestro) tests Android, iOS and web apps through YAML flows, and its MCP server lets coding agents drive a live device. agentlane drives every simulator and emulator with it. agentlane's patches give each iOS simulator's runner a port of its own, so a second simulator doesn't start cold on every call, and agentlane keeps a Maestro session warm between calls.
+[Maestro](https://github.com/mobile-dev-inc/Maestro) tests Android, iOS and web apps through YAML flows, and its MCP server lets coding agents drive a live device. agentlane drives every simulator and emulator with it and keeps a Maestro session warm between calls. Its patched Maestro gives each iOS simulator's runner a port of its own, so a second simulator doesn't start cold on every call.
 
 ### agentlane and Conductor
 
-[Conductor](https://www.conductor.build/) runs Claude Code, Codex, Cursor and OpenCode in parallel, each task in its own workspace and branch, on your Mac or in Conductor Cloud's sandboxes. Each workspace gets its own range of ports for the app's servers. On your Mac, a lane adds a database and a simulator, emulator or browser to each workspace.
+[Conductor](https://www.conductor.build/) runs Claude Code, Codex, Cursor and OpenCode in parallel, each task in its own workspace and branch, on your Mac or in Conductor Cloud's sandboxes. A setup script runs in each new workspace to install dependencies and prepare files, and each workspace gets its own range of ports for the app's servers. On your Mac, a lane adds a database and a simulator, emulator or browser to each workspace.
 
 ### agentlane and Paradev
 
-[Paradev](https://github.com/ParadevAI/Paradev), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. A lane gives each agent an iOS simulator or Android emulator of its own as well.
+[Paradev](https://github.com/ParadevAI/Paradev), formerly Superset, is an open-source desktop app for running CLI coding agents in parallel. Each task gets its own git worktree, branch and terminals, and a built-in browser previews each workspace's dev server. Setup and teardown scripts run as each workspace is created and deleted, to install its dependencies or to start its containers and remove them. A lane gives each agent an iOS simulator or Android emulator of its own as well.
 
 ### agentlane and your agent's own worktrees
 

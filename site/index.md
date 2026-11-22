@@ -11,7 +11,7 @@ badge:
 headline: Stop your coding agents fighting over ports, simulators and databases.
 marked: fighting
 sentence: The fast, light way to run a copy of your app for every agent, with tools to see it and drive it, all at the same time.
-figure: '**Reads the screen 50x faster** than stock Maestro on two simulators.'
+figure: '**Reads the screen 50x faster** than stock Maestro.'
 buttons:
   - label: Get started
     href: docs/getting-started.html
@@ -32,9 +32,9 @@ agents:
   - Gemini CLI
   - Antigravity
 heroAlt: >-
-  Claude Code, Codex and Cursor, each shown with its mark, get their own lane from agentlane up: ports, dev server,
-  database and a browser, iOS simulator or Android emulator. Each types an item into its own copy of the Basket app,
-  ticks items off and takes screenshots, then Codex finishes and its lane is released.
+  Claude Code, Codex and Cursor, each shown with its mark, get their own ports, dev server, database and a browser,
+  iOS simulator or Android emulator from agentlane up. Each types an item into its own copy of the Basket app, ticks
+  items off and takes screenshots, then Codex finishes and its ports and device are released.
 cards:
   - icon: plug
     title: Its own ports
@@ -73,7 +73,7 @@ about:
       takes you from one command to a ready lane.
 speed:
   - value: 0.15 s
-    label: to read an iOS screen on a warm lane
+    label: to read an iOS screen
   - value: 0.16 s
     label: to read a page in the lane's browser
   - value: 6.5 s
