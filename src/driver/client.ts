@@ -52,8 +52,10 @@ export interface EngineTarget {
   processes?: ProcessTable;
 }
 
-const START_TIMEOUT_MS = 20_000;
+export const START_TIMEOUT_MS = 20_000;
+export const PING_TIMEOUT_MS = 5000;
 const STOP_WAIT_MS = 35_000;
+const ROUNDS = 3;
 const MARGIN_MS = 60_000;
 type DeviceOp = 'look' | 'screenshot' | 'run';
 const CONTROL_TIMEOUT_MS: Record<Exclude<EngineRequest['op'], DeviceOp>, number> = {
@@ -71,6 +73,12 @@ const DEVICE_TIMEOUT_MS: Record<Platform, Record<DeviceOp, number>> = {
   },
   android: { look: 150_000, screenshot: 150_000, run: 900_000 },
 };
+
+/** The slowest answer a client waits for, on any platform. */
+export const LONGEST_ANSWER_MS = Math.max(
+  ...Object.values(CONTROL_TIMEOUT_MS),
+  ...Object.values(DEVICE_TIMEOUT_MS).flatMap(ops => Object.values(ops)),
+);
 
 /** How long a client waits for the engine to answer one request on a lane of this platform. */
 export function responseTimeoutMs(op: EngineRequest['op'], platform: Platform): number {
@@ -232,7 +240,7 @@ async function startEngine(target: EngineTarget, paths: EnginePaths): Promise<vo
   let respawned = false;
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const answer = await send(paths, { op: 'ping', lane: refOf(target.lane) }, 5000).catch(() => undefined);
+    const answer = await send(paths, { op: 'ping', lane: refOf(target.lane) }, PING_TIMEOUT_MS).catch(() => undefined);
     if (answer && answer.stopping === undefined) return;
     const exit = exited();
     if (exit !== undefined) {
@@ -292,7 +300,7 @@ export async function callEngine(
   const paths = enginePaths(target.stateDir, target.lane.id);
   const full = { ...request, lane: refOf(target.lane) } as EngineRequest;
   const timeoutMs = laneTimeoutMs(target.lane, full.op);
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < ROUNDS; round++) {
     refuseWhileReleasing(target, paths);
     let response = await send(paths, full, timeoutMs);
     let coldStart: EngineResponse['coldStart'];

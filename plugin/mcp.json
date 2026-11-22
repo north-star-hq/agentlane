@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "device": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=\"$PWD\"; while [ ! -x \"$d/node_modules/.bin/agentlane\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; if [ -x \"$d/node_modules/.bin/agentlane\" ]; then exec \"$d/node_modules/.bin/agentlane\" mcp; fi; echo \"agentlane: no node_modules/.bin/agentlane in $PWD or the folders above it; add the toolkit to this project\" >&2; exit 1"
+      ]
+    }
+  }
+}

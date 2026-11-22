@@ -79,6 +79,7 @@ A `warn` line doesn't fail `doctor`. It flags something to fix soon:
 
 - a project with no agent wired at all, with the `init` command that wires them;
 - wiring that has gone stale, such as stubs or hooks an older version wrote;
+- an MCP server entry whose time limit on one call is missing or too short, with the key and value to set;
 - Claude Code's skills or MCP server wired twice, by the plugin and by the project's own files;
 - a project that enables the Claude Code plugin when Claude Code hasn't installed it on this machine;
 - `parked`: the lane is parked, with what its next call brings back. `doctor` skips the device and service checks then, and any call on the lane, such as `look`, `exec` or `up`, brings it back first.

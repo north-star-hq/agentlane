@@ -76,6 +76,8 @@ Every agent gets the same skills, the same MCP server and the same two hooks, in
 | Gemini CLI     | `.agents/skills/`                                       | `.gemini/settings.json`   | `.gemini/settings.json`                         |
 | Antigravity    | `.agents/skills/`                                       | `.agents/mcp_config.json` | `.agents/hooks.json` (the guard only)           |
 
+The MCP server entry also raises the agent's time limit on one call to 60 minutes, where the agent's own limit is shorter and a project can set it. That is enough for a call that wakes a parked lane, installs Maestro and runs the longest flow, and the agent stops a call that waits longer. [MCP server](mcp.md#where-init-registers-it) lists each agent's key.
+
 Each skill file is a short stub that runs `node_modules/.bin/agentlane skills get <name>`, so the agent reads the skill for the version the project has installed. [The skills](skills.md) explains why.
 
 `init` edits a file it shares with you, such as `.claude/settings.json`, in place: it adds or replaces only its own entries. Running it again changes nothing. A file it changes is backed up first, and a file it can't parse is refused, with nothing written.
@@ -94,7 +96,7 @@ Codex reads `.codex/` only in a trusted project. It runs each hook only after yo
 
 ### Cursor
 
-Cursor runs `.cursor/hooks.json` in the app. Its CLI runs hooks unreliably. The release at session end waits for the Cursor process to exit.
+Cursor runs `.cursor/hooks.json` in the app. Its CLI runs hooks unreliably. The release at session end waits for the Cursor process to exit. Cursor's CLI also stops an MCP call after 60 seconds, a limit a project can't change, so a first call on a fresh iOS simulator can fail there.
 
 ### GitHub Copilot
 
@@ -127,7 +129,7 @@ Start setup with `/agentlane:setup`. Wherever Claude Code loads the plugin (the 
 
 `init` still writes the hooks into `.claude/settings.json`. Claude Code runs them there whether or not the plugin is installed on the machine, and gives the session-end hook its declared 10 seconds, where a plugin's session-end hook gets 1.5. Where the plugin's hooks run too, both guards give the same answer, and the session's lanes are released once. `agentlane doctor` warns when a project wires Claude Code's skills or MCP server twice, and when the project enables the plugin but Claude Code hasn't installed it on this machine.
 
-The same plugin folder holds manifests for Codex (`.codex-plugin/plugin.json`), Cursor (`.cursor-plugin/plugin.json`) and Gemini CLI (`gemini-extension.json`). They bring the skills and the MCP server. The hooks still come from `init`, because hooks don't carry over between agents.
+The same plugin folder holds manifests for Codex (`.codex-plugin/plugin.json`), Cursor (`.cursor-plugin/plugin.json`) and Gemini CLI (`gemini-extension.json`). They bring the skills and the MCP server, with the same time limit on one call that `init` writes for Codex and Gemini CLI. The hooks still come from `init`, because hooks don't carry over between agents.
 
 ## Checking the wiring
 
