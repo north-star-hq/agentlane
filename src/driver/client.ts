@@ -84,6 +84,11 @@ export function responseTimeoutMs(op: EngineRequest['op'], platform: Platform): 
   }
 }
 
+/** How long a client waits for the engine to answer one request on this lane. */
+export function laneTimeoutMs(lane: Pick<Lane, 'device'>, op: EngineRequest['op']): number {
+  return responseTimeoutMs(op, lane.device?.platform ?? 'ios');
+}
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 function logTail(file: string): string {
@@ -286,7 +291,7 @@ export async function callEngine(
 ): Promise<EngineResponse> {
   const paths = enginePaths(target.stateDir, target.lane.id);
   const full = { ...request, lane: refOf(target.lane) } as EngineRequest;
-  const timeoutMs = responseTimeoutMs(full.op, target.lane.device?.platform ?? 'ios');
+  const timeoutMs = laneTimeoutMs(target.lane, full.op);
   for (let round = 0; round < 3; round++) {
     refuseWhileReleasing(target, paths);
     let response = await send(paths, full, timeoutMs);

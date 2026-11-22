@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { maestroEnv, RUNNER_STARTUP_MS } from '../../src/driver/maestro-child.ts';
+import { RUNNER_EXECUTABLE } from '../../src/driver/runner.ts';
 import { SessionFailure, Supervisor, type SupervisorOptions } from '../../src/driver/supervisor.ts';
 import { tempDir } from '../support/fakes.ts';
 import { writeFakeToolchain, type FakeEvent } from '../support/driver-world.ts';
@@ -113,6 +115,32 @@ test('once the XCTest runner has answered, an error result leaves the next call 
       assert.equal(third.attempts.length, 1);
     },
   ));
+
+test('a first call that gets an error back once its XCTest runner is known leaves the next call only its tool limit', async () => {
+  const runner = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  const pid = runner.pid ?? assert.fail('sleep did not start');
+  const row = {
+    pid,
+    ppid: 1,
+    pgid: pid,
+    rssKb: 1,
+    command: `/fake/Library/Developer/CoreSimulator/Devices/SIM-1/data/Containers/Bundle/Application/F/${RUNNER_EXECUTABLE}.app/${RUNNER_EXECUTABLE}`,
+  };
+  try {
+    await withSupervisor(
+      { FAKE_ERROR_ON: '1', FAKE_DELAYS: '[0, 900]' },
+      { timeouts: { inspect_screen: 400 }, runnerStartupMs: 1500, rows: () => Promise.resolve([row]) },
+      async ({ supervisor }) => {
+        assert.equal((await supervisor.call('inspect_screen', {}, READ)).result.isError, true);
+        const second = await failure(supervisor.call('inspect_screen', {}, READ));
+        assert.equal(second.kind, 'timeout');
+        assert.equal(second.attempts.length, 1);
+      },
+    );
+  } finally {
+    runner.kill('SIGKILL');
+  }
+});
 
 test("the first call on a fresh Maestro gets the runner's startup time, and the next call only its tool's limit", () =>
   withSupervisor(

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { responseTimeoutMs } from '../../src/driver/client.ts';
+import { laneTimeoutMs, responseTimeoutMs } from '../../src/driver/client.ts';
+import type { ClaimedDevice } from '../../src/registry/types.ts';
 import { longestIosCallMs, warmCallMs } from '../../src/driver/supervisor.ts';
 
 test("an emulator lane keeps the client's limits from before the runner's startup time", () => {
@@ -21,4 +22,20 @@ test('a simulator look and screenshot cover a first call retried on a fresh Maes
   const screenshot = longestIosCallMs('take_screenshot', { retry: true }) + warmCallMs('inspect_screen');
   assert.ok(responseTimeoutMs('look', 'ios') > look);
   assert.ok(responseTimeoutMs('screenshot', 'ios') > screenshot);
+});
+
+test("a lane's client waits for a look as long as its device's platform allows", () => {
+  const device = (platform: ClaimedDevice['platform']): ClaimedDevice => ({
+    platform,
+    id: 'D1',
+    name: 'Device',
+    deviceType: 'type',
+    deviceTypeName: 'Type',
+    runtime: 'runtime',
+    runtimeName: 'Runtime',
+    serial: platform === 'android' ? 'emulator-5554' : null,
+  });
+  assert.equal(laneTimeoutMs({ device: device('android') }, 'look'), 150_000);
+  assert.equal(laneTimeoutMs({ device: device('ios') }, 'look'), responseTimeoutMs('look', 'ios'));
+  assert.notEqual(responseTimeoutMs('look', 'ios'), 150_000);
 });
