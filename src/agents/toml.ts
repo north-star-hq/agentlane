@@ -18,6 +18,10 @@ export interface TomlKey {
   path: string[];
   table: string[];
   line: number;
+  /** The line its value ends on. */
+  end: number;
+  /** Its value as written. */
+  value: string;
 }
 
 export interface TomlOutline {
@@ -235,8 +239,9 @@ class Scanner {
       if (this.peek() !== '=') this.fail("a key needs '=' and a value");
       this.advance();
       this.spaces();
+      const start = this.pos;
       this.value();
-      keys.push({ path: [...table, ...key], table, line });
+      keys.push({ path: [...table, ...key], table, line, end: this.line, value: this.text.slice(start, this.pos) });
       this.endOfLine();
     }
   }
@@ -260,18 +265,18 @@ function bare(part: string): string {
   return /^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part);
 }
 
-function lines(block: string): string[] {
-  return block
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line !== '' && !line.startsWith('#'));
+export interface TomlEntry {
+  key: string;
+  value: string;
+  /** Leaves the value the table already has when this holds for it. */
+  keeps?: (current: string) => boolean;
 }
 
 /**
- * Sets one table, `[a.b]` with `body` under it, and leaves every other line of the file as it was. The table's own
- * sub-tables (`[a.b.env]`) stay.
+ * Sets each entry's key in one table, `[a.b]`, adding the table when the file lacks it, and leaves every other line of
+ * the file as it was, the table's other keys and its sub-tables (`[a.b.env]`) included.
  */
-export function upsertTable(text: string, table: readonly string[], body: string): TableEdit {
+export function upsertTable(text: string, table: readonly string[], entries: readonly TomlEntry[]): TableEdit {
   let outline: TomlOutline;
   try {
     outline = outlineToml(text);
@@ -282,21 +287,38 @@ export function upsertTable(text: string, table: readonly string[], body: string
   const ours = outline.headers.filter(h => same(h.path, table));
   if (ours.length > 1 || ours.some(h => h.array)) return { kind: 'refused', reason: `it declares [${name}] more than once` };
   const own = ours[0];
-  const next = own ? outline.headers.find(h => h.line > own.line) : undefined;
   const foreign = outline.keys.find(k => (startsWith(k.path, table) || startsWith(table, k.path)) && !startsWith(k.table, table));
   if (foreign)
     return { kind: 'refused', reason: `line ${String(foreign.line)} sets ${foreign.path.join('.')} outside [${name}]` };
-  const all = text.split('\n');
-  const block = `[${name}]\n${body}`;
+  const set = (entry: TomlEntry) => `${bare(entry.key)} = ${entry.value}`;
   if (!own) {
     const head = text === '' ? '' : text.endsWith('\n') ? `${text}\n` : `${text}\n\n`;
-    return { kind: 'changed', text: `${head}${block}\n` };
+    return { kind: 'changed', text: `${head}${[`[${name}]`, ...entries.map(set)].join('\n')}\n` };
   }
-  let end = next ? next.line - 1 : all.length;
-  while (end > own.line && /^\s*(#.*)?$/.test(all[end - 1] ?? '')) end--;
-  const current = all.slice(own.line - 1, end).join('\n');
-  if (lines(current).join('\n') === lines(block).join('\n')) return { kind: 'unchanged' };
-  return { kind: 'changed', text: [...all.slice(0, own.line - 1), ...block.split('\n'), ...all.slice(end)].join('\n') };
+  const keys = outline.keys.filter(k => same(k.table, table));
+  const replaced = new Map<number, string>();
+  const dropped = new Set<number>();
+  const added: string[] = [];
+  for (const entry of entries) {
+    const found = keys.filter(k => k.path[table.length] === entry.key);
+    const [first] = found;
+    if (!first) {
+      added.push(set(entry));
+      continue;
+    }
+    const whole = found.length === 1 && first.path.length === table.length + 1;
+    if (whole && (first.value === entry.value || entry.keeps?.(first.value) === true)) continue;
+    for (const key of found) for (let line = key.line; line <= key.end; line++) dropped.add(line);
+    replaced.set(first.line, set(entry));
+  }
+  if (replaced.size === 0 && added.length === 0) return { kind: 'unchanged' };
+  const after = Math.max(own.line, ...keys.map(k => k.end));
+  const next = text.split('\n').flatMap((line, i) => {
+    const at = i + 1;
+    const kept = replaced.get(at) ?? (dropped.has(at) ? null : line);
+    return [...(kept === null ? [] : [kept]), ...(at === after ? added : [])];
+  });
+  return { kind: 'changed', text: next.join('\n') };
 }
 
 /** Removes one table, `[a.b]`, with its own sub-tables, and leaves every other line of the file as it was. */

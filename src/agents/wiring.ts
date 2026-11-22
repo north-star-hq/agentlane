@@ -1,9 +1,12 @@
 import { FORMER, TOOL } from '../name.ts';
 import type { Agent } from '../registry/owner.ts';
 import { CLAUDE_SETTINGS } from './claude-plugin.ts';
+import { coversCalls, HOST_TIMEOUTS, hostTimeout, timeoutShortfall, timeoutValue } from './host-timeouts.ts';
 import { hookCommand, isToolkitHook, mcpLaunch } from './launcher.ts';
 import type { Skill } from './skills.ts';
 import { stubOf } from './skills.ts';
+import type { TomlEntry, TomlOutline } from './toml.ts';
+import { outlineToml } from './toml.ts';
 
 export type Json = Record<string, unknown>;
 export type Part = 'skills' | 'MCP server' | 'guard hook' | 'release hook' | 'plugin' | 'skill the plugin brings';
@@ -21,8 +24,14 @@ export type Edit =
       present: (doc: Json) => boolean;
       emptied?: (doc: Json) => boolean;
       cleanup?: true;
+      shortfall?: (doc: Json) => string | null;
     })
-  | (Base & { kind: 'toml'; table: string[]; body: string | null })
+  | (Base & {
+      kind: 'toml';
+      table: string[];
+      entries: TomlEntry[] | null;
+      shortfall?: (text: string) => string | null;
+    })
   | (Base & { kind: 'stub'; skill: string; content: string })
   | (Base & { kind: 'link'; skill: string; target: string; source: string })
   | (Base & { kind: 'unlink'; skill: string; target: string });
@@ -54,6 +63,7 @@ export function formerServerIn(servers: unknown): boolean {
 
 function mcpEdit(file: string, agent: Agent): Edit {
   const ours = mcpLaunch();
+  const host = hostTimeout(agent);
   return {
     kind: 'json',
     file,
@@ -66,14 +76,33 @@ function mcpEdit(file: string, agent: Agent): Edit {
       const current = servers[TOOL] ?? former;
       const kept = isObject(current) ? current : {};
       if (former !== undefined) Reflect.deleteProperty(servers, FORMER.tool);
-      servers[TOOL] = { ...kept, ...ours };
+      const entry: Json = { ...kept, ...ours };
+      if (host && !coversCalls(host, entry[host.key])) entry[host.key] = timeoutValue(host);
+      servers[TOOL] = entry;
       return null;
     },
     present: doc => {
       const servers = doc.mcpServers;
       return (isObject(servers) && TOOL in servers) || formerServerIn(servers);
     },
+    shortfall: doc => {
+      const entry = isObject(doc.mcpServers) ? doc.mcpServers[TOOL] : undefined;
+      return host && isObject(entry) ? timeoutShortfall(agent, entry[host.key]) : null;
+    },
   };
+}
+
+function tomlOutline(text: string): TomlOutline | null {
+  try {
+    return outlineToml(text);
+  } catch {
+    return null;
+  }
+}
+
+function tomlNumber(value: string): number | string {
+  const number = Number(value.replaceAll('_', ''));
+  return value.trim() !== '' && Number.isFinite(number) ? number : value;
 }
 
 function hasToolkitHook(entry: unknown): boolean {
@@ -217,6 +246,8 @@ function renameFormerPlugin(doc: Json): void {
 
 function codexEdits(): Edit[] {
   const { command: launcher, args } = mcpLaunch();
+  const host = HOST_TIMEOUTS.codex;
+  const table = ['mcp_servers', TOOL];
   return [
     {
       kind: 'toml',
@@ -224,15 +255,25 @@ function codexEdits(): Edit[] {
       agent: 'codex',
       part: 'MCP server',
       table: ['mcp_servers', FORMER.tool],
-      body: null,
+      entries: null,
     },
     {
       kind: 'toml',
       file: '.codex/config.toml',
       agent: 'codex',
       part: 'MCP server',
-      table: ['mcp_servers', TOOL],
-      body: `command = ${JSON.stringify(launcher)}\nargs = [${args.map(a => JSON.stringify(a)).join(', ')}]`,
+      table,
+      entries: [
+        { key: 'command', value: JSON.stringify(launcher) },
+        { key: 'args', value: `[${args.map(a => JSON.stringify(a)).join(', ')}]` },
+        { key: host.key, value: String(timeoutValue(host)), keeps: value => coversCalls(host, tomlNumber(value)) },
+      ],
+      shortfall: text => {
+        const outline = tomlOutline(text);
+        if (!outline?.headers.some(h => h.path.join('.') === table.join('.'))) return null;
+        const value = outline.keys.find(k => k.path.join('.') === [...table, host.key].join('.'))?.value;
+        return timeoutShortfall('codex', value === undefined ? undefined : tomlNumber(value));
+      },
     },
     hookEdit('.codex/hooks.json', 'codex', 'guard hook', 'PreToolUse', {
       matcher: 'Bash',

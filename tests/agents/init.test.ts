@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { INIT_BACKUPS_KEPT, runAgentCommand } from '../../src/agents/cli.ts';
 import { backupProject } from '../../src/disk-limits.ts';
+import { HOST_TIMEOUTS, timeoutValue } from '../../src/agents/host-timeouts.ts';
 import { hookCommand, mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills, stubOf } from '../../src/agents/skills.ts';
 import { tempDir } from '../support/fakes.ts';
@@ -110,11 +111,19 @@ test('init --all on a copy of the example app writes every agent’s files, and 
     for (const skill of listSkills())
       assert.equal(fs.readFileSync(path.join(dir, '.agents/skills', skill.name, 'SKILL.md'), 'utf8'), stubOf(skill));
     const launcher = mcpLaunch();
-    for (const file of ['.mcp.json', '.cursor/mcp.json', '.gemini/settings.json', '.agents/mcp_config.json'])
-      assert.deepEqual((json(dir, file).mcpServers as Record<string, unknown>).agentlane, launcher, file);
+    const servers: [string, Record<string, unknown>][] = [
+      ['.mcp.json', { timeout: timeoutValue(HOST_TIMEOUTS.copilot) }],
+      ['.cursor/mcp.json', {}],
+      ['.gemini/settings.json', { timeout: timeoutValue(HOST_TIMEOUTS.gemini) }],
+      ['.agents/mcp_config.json', { timeoutSeconds: timeoutValue(HOST_TIMEOUTS.antigravity) }],
+    ];
+    for (const [file, timeout] of servers)
+      assert.deepEqual((json(dir, file).mcpServers as Record<string, unknown>).agentlane, { ...launcher, ...timeout }, file);
     assert.match(
       fs.readFileSync(path.join(dir, '.codex/config.toml'), 'utf8'),
-      /^\[mcp_servers\.agentlane\]\ncommand = "sh"\nargs = \["-c", /,
+      new RegExp(
+        `^\\[mcp_servers\\.agentlane\\]\\ncommand = "sh"\\nargs = \\["-c", .*\\]\\ntool_timeout_sec = ${String(timeoutValue(HOST_TIMEOUTS.codex))}\\n`,
+      ),
     );
     assert.match(
       JSON.stringify(json(dir, '.codex/hooks.json')),

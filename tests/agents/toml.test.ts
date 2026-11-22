@@ -77,19 +77,41 @@ test('broken TOML is an error that names its line', () => {
 });
 
 test('upsertTable adds the table, then leaves the file alone, and replaces only its own lines when they change', () => {
-  const body = 'command = "sh"\nargs = ["-c", "x"]';
-  const added = upsertTable('model = "o3"\n', ['mcp_servers', 'agentlane'], body);
+  const entries = [
+    { key: 'command', value: '"sh"' },
+    { key: 'args', value: '["-c", "x"]' },
+  ];
+  const a1 = [{ key: 'a', value: '1' }];
+  const added = upsertTable('model = "o3"\n', ['mcp_servers', 'agentlane'], entries);
   assert.deepEqual(added, {
     kind: 'changed',
     text: 'model = "o3"\n\n[mcp_servers.agentlane]\ncommand = "sh"\nargs = ["-c", "x"]\n',
   });
-  assert.deepEqual(upsertTable(added.text, ['mcp_servers', 'agentlane'], body), { kind: 'unchanged' });
-  assert.deepEqual(upsertTable('', ['t'], 'a = 1'), { kind: 'changed', text: '[t]\na = 1\n' });
-  assert.deepEqual(upsertTable('x = 1', ['t'], 'a = 1'), { kind: 'changed', text: 'x = 1\n\n[t]\na = 1\n' });
+  assert.deepEqual(upsertTable(added.text, ['mcp_servers', 'agentlane'], entries), { kind: 'unchanged' });
+  assert.deepEqual(upsertTable('', ['t'], a1), { kind: 'changed', text: '[t]\na = 1\n' });
+  assert.deepEqual(upsertTable('x = 1', ['t'], a1), { kind: 'changed', text: 'x = 1\n\n[t]\na = 1\n' });
 
   const stale = '[t]\na = 0\n\n# about u\n[u]\nb = 1\n';
-  assert.deepEqual(upsertTable(stale, ['t'], 'a = 1'), { kind: 'changed', text: '[t]\na = 1\n\n# about u\n[u]\nb = 1\n' });
-  assert.deepEqual(upsertTable('[t]\n[t]\n', ['t'], 'a = 1').kind, 'refused');
-  assert.match(JSON.stringify(upsertTable('t.a = 1\n', ['t'], 'a = 1')), /line 1 sets t\.a outside \[t\]/);
-  assert.match(JSON.stringify(upsertTable('[t.sub]\nx = 1\n', ['t'], 'a = 1')), /changed/);
+  assert.deepEqual(upsertTable(stale, ['t'], a1), { kind: 'changed', text: '[t]\na = 1\n\n# about u\n[u]\nb = 1\n' });
+  assert.deepEqual(upsertTable('[t]\n[t]\n', ['t'], a1).kind, 'refused');
+  assert.match(JSON.stringify(upsertTable('t.a = 1\n', ['t'], a1)), /line 1 sets t\.a outside \[t\]/);
+  assert.match(JSON.stringify(upsertTable('[t.sub]\nx = 1\n', ['t'], a1)), /changed/);
+});
+
+test('upsertTable keeps the table’s other keys, adds a missing one after them, and keeps a value its test accepts', () => {
+  const entries = [
+    { key: 'a', value: '1' },
+    { key: 'limit', value: '30', keeps: (current: string) => Number(current) >= 30 },
+  ];
+  const own = '[t]\nenabled = false\na = [\n  0,\n]\nenv = { LOG = "1" }\n\n[u]\nb = 1\n';
+  assert.deepEqual(upsertTable(own, ['t'], entries), {
+    kind: 'changed',
+    text: '[t]\nenabled = false\na = 1\nenv = { LOG = "1" }\nlimit = 30\n\n[u]\nb = 1\n',
+  });
+  assert.deepEqual(upsertTable('[t]\na = 1\nlimit = 90\n', ['t'], entries), { kind: 'unchanged' });
+  assert.deepEqual(upsertTable('[t]\nlimit = 10 # too short\na = 1\n', ['t'], entries), {
+    kind: 'changed',
+    text: '[t]\nlimit = 30\na = 1\n',
+  });
+  assert.deepEqual(upsertTable('[t]\n', ['t'], entries), { kind: 'changed', text: '[t]\na = 1\nlimit = 30\n' });
 });

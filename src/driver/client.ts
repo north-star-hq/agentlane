@@ -72,6 +72,11 @@ const DEVICE_TIMEOUT_MS: Record<Platform, Record<DeviceOp, number>> = {
   android: { look: 150_000, screenshot: 150_000, run: 900_000 },
 };
 
+/** The longest one tool call waits on the engine: starting it, then its slowest answer on any platform. */
+export const LONGEST_CALL_MS =
+  START_TIMEOUT_MS +
+  Math.max(...Object.values(CONTROL_TIMEOUT_MS), ...Object.values(DEVICE_TIMEOUT_MS).flatMap(ops => Object.values(ops)));
+
 /** How long a client waits for the engine to answer one request on a lane of this platform. */
 export function responseTimeoutMs(op: EngineRequest['op'], platform: Platform): number {
   switch (op) {

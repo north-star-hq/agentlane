@@ -67,6 +67,11 @@ function refused(file: string, edits: Edit[], reason: string): FilePlan {
   };
 }
 
+function shortfalls(found: (string | null | undefined)[]): string | null {
+  const named = [...new Set(found.filter(reason => typeof reason === 'string'))];
+  return named.length > 0 ? named.join('; ') : null;
+}
+
 function planJson(root: string, file: string, edits: Edit[]): FilePlan {
   const text = readText(path.join(root, file));
   const doc = readJson(text);
@@ -87,7 +92,7 @@ function planJson(root: string, file: string, edits: Edit[]): FilePlan {
   return {
     file,
     status: text === null ? 'create' : 'update',
-    reason: null,
+    reason: text === null ? null : shortfalls(edits.map(edit => (edit.kind === 'json' ? edit.shortfall?.(doc) : null))),
     desired: { kind: 'text', text: `${JSON.stringify(next, null, text === null ? 2 : indentOf(text))}\n` },
     edits,
   };
@@ -99,7 +104,7 @@ function planToml(root: string, file: string, edits: Edit[]): FilePlan {
   let changed = text === null;
   for (const edit of edits) {
     if (edit.kind !== 'toml') continue;
-    const result = edit.body === null ? removeTable(next, edit.table) : upsertTable(next, edit.table, edit.body);
+    const result = edit.entries === null ? removeTable(next, edit.table) : upsertTable(next, edit.table, edit.entries);
     if (result.kind === 'refused') return refused(file, edits, result.reason);
     if (result.kind === 'changed') {
       next = result.text;
@@ -107,7 +112,13 @@ function planToml(root: string, file: string, edits: Edit[]): FilePlan {
     }
   }
   if (!changed) return { file, status: 'unchanged', reason: null, desired: null, edits };
-  return { file, status: text === null ? 'create' : 'update', reason: null, desired: { kind: 'text', text: next }, edits };
+  return {
+    file,
+    status: text === null ? 'create' : 'update',
+    reason: text === null ? null : shortfalls(edits.map(edit => (edit.kind === 'toml' ? edit.shortfall?.(text) : null))),
+    desired: { kind: 'text', text: next },
+    edits,
+  };
 }
 
 function planStub(root: string, edit: Edit & { kind: 'stub' }): FilePlan {

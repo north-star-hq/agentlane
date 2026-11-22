@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
+import { HOST_TIMEOUTS, timeoutValue } from '../../src/agents/host-timeouts.ts';
 import { mcpLaunch } from '../../src/agents/launcher.ts';
 import { listSkills } from '../../src/agents/skills.ts';
 
@@ -30,9 +31,11 @@ test('Claude Code’s hooks live outside hooks/hooks.json, so Codex, Cursor and 
   assert.equal(read('.cursor-plugin/plugin.json').hooks, undefined);
 });
 
-test('the Codex, Cursor and Gemini manifests serve the same skills and the same MCP server as init writes', () => {
+test('the Codex, Cursor and Gemini manifests serve the same skills and the same MCP server, with the same timeouts, as init writes', () => {
   const launcher = mcpLaunch();
-  assert.deepEqual(read('.mcp.json'), { mcpServers: { device: launcher } });
+  assert.deepEqual(read('.mcp.json'), {
+    mcpServers: { device: { ...launcher, tool_timeout_sec: timeoutValue(HOST_TIMEOUTS.codex) } },
+  });
   for (const manifest of ['.codex-plugin/plugin.json', '.cursor-plugin/plugin.json']) {
     const fields = read(manifest);
     assert.equal(fields.name, 'agentlane', manifest);
@@ -42,7 +45,9 @@ test('the Codex, Cursor and Gemini manifests serve the same skills and the same 
   const gemini = read('gemini-extension.json');
   assert.equal(gemini.name, 'agentlane');
   assert.equal(gemini.version, PACKAGE_VERSION);
-  assert.deepEqual(gemini.mcpServers, { device: { ...launcher, cwd: '${workspacePath}' } });
+  assert.deepEqual(gemini.mcpServers, {
+    device: { ...launcher, cwd: '${workspacePath}', timeout: timeoutValue(HOST_TIMEOUTS.gemini) },
+  });
   assert.deepEqual(
     fs.readdirSync(path.join(PLUGIN, 'skills')).sort(),
     listSkills().map(s => s.name),

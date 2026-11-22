@@ -51,7 +51,7 @@ function problem(file: FilePlan): string {
     case 'create':
       return `missing ${file.file} (${parts})`;
     case 'update':
-      return `stale ${file.file} (${parts})`;
+      return `stale ${file.file} (${parts})${file.reason === null ? '' : `: ${file.reason}`}`;
     case 'remove':
       return `duplicate ${file.file} (${parts})`;
     case 'refused':
