@@ -325,7 +325,38 @@ main {
   font-size: clamp(2.5rem, 1.6rem + 2.4vw, 3.75rem);
   line-height: 1.04;
   letter-spacing: -0.025em;
-  max-width: 15ch;
+  max-width: 19ch;
+}
+
+.intro h1 mark {
+  padding: 0 0.12em;
+  border-radius: 4px;
+  background: var(--al-accent);
+  color: var(--al-on-accent);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 22px;
+  padding: 5px 14px 4px;
+  border: 1px solid var(--al-border);
+  border-radius: 999px;
+  background: var(--al-surface);
+  color: var(--al-text);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--al-accent);
 }
 
 .pitch {
@@ -334,6 +365,47 @@ main {
   color: var(--al-muted);
   font-size: 1.1875rem;
   line-height: 1.6;
+}
+
+.figure-line {
+  margin-top: 14px;
+  color: var(--al-muted);
+  font-size: 1.0625rem;
+}
+
+.figure-line strong {
+  color: var(--al-text);
+}
+
+.ctas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 20px 10px;
+  border: 1px solid var(--al-border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--al-text);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.btn-primary {
+  border-color: var(--al-accent);
+  background: var(--al-accent);
+  color: var(--al-on-accent);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--al-accent-text);
+  outline-offset: 2px;
 }
 
 .works-with {
@@ -439,48 +511,81 @@ main {
   height: 100%;
 }
 
-.why,
-.speed-strip {
-  padding: 72px var(--gutter) 0;
+.cards {
+  padding: 16px var(--gutter) 0;
 }
 
-.why-grid {
+.card-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
   margin: 0;
   padding: 0;
   list-style: none;
-  border-top: 1px solid var(--al-border);
 }
 
-.why-grid li {
-  padding: 24px 0 26px;
-  border-bottom: 1px solid var(--al-border);
+.card-grid a {
+  display: grid;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 100%;
+  padding: 22px;
+  border: 1px solid var(--al-border);
+  border-radius: 12px;
+  background: var(--al-surface);
+  color: var(--al-text);
+  text-decoration: none;
 }
 
-.why-grid li:nth-child(odd) {
-  padding-right: 32px;
-  border-right: 1px solid var(--al-border);
+.card-grid a:hover {
+  border-color: var(--al-muted);
 }
 
-.why-grid li:nth-child(even) {
-  padding-left: 32px;
+.card-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 1px solid var(--al-border);
+  border-radius: 10px;
+  background: var(--al-bg);
 }
 
-.why-grid h3 {
+.card-icon svg {
+  fill: none;
+  stroke: var(--al-text);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.card-title {
+  margin-top: 6px;
+  font-family: var(--al-font-heading);
   font-size: 1.125rem;
+  font-weight: 800;
 }
 
-.why-grid p {
-  margin-top: 8px;
+.card-text {
   color: var(--al-muted);
 }
 
-.why-grid a {
-  color: var(--al-text);
-  text-decoration-color: var(--al-accent);
-  text-decoration-thickness: 2px;
-  text-underline-offset: 3px;
+.about {
+  max-width: 46em;
+  padding: 72px var(--gutter) 0;
+}
+
+.about h2 {
+  font-size: 1.5rem;
+}
+
+.about p {
+  margin-top: 12px;
+  line-height: 1.65;
+}
+
+.speed-strip {
+  padding: 72px var(--gutter) 0;
 }
 
 .stats {
@@ -518,16 +623,6 @@ main {
 .stats dd {
   margin: 12px 0 0;
   color: var(--al-muted);
-}
-
-.stats-note {
-  margin-top: 14px;
-  color: var(--al-muted);
-  font-size: 0.875rem;
-}
-
-.stats-note a {
-  color: var(--al-text);
 }
 
 .path,
@@ -869,8 +964,7 @@ main {
 
 .prose :not(pre) > code,
 .lead code,
-.pitch code,
-.why-grid code {
+.pitch code {
   padding: 0.05em 0.3em;
   border-radius: 4px;
   background: var(--al-bg);
@@ -1154,18 +1248,12 @@ main {
   .hero {
     padding: 0 0 40px;
   }
-  .why-grid,
   .stats {
     grid-template-columns: minmax(0, 1fr);
   }
-  .why-grid li:nth-child(odd) {
-    padding-right: 0;
-    border-right: 0;
+  .card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .why-grid li:nth-child(even) {
-    padding-left: 0;
-  }
-  .why,
   .speed-strip {
     padding-top: 56px;
   }
@@ -1201,6 +1289,12 @@ main {
 
 .doc-md:hover {
   color: var(--al-text);
+}
+
+@media (max-width: 560px) {
+  .card-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* Tables of three or more columns read as one card per row on phones. */

@@ -137,6 +137,6 @@ A click and a flow are timed from spawning `agentlane exec` to its exit, because
 node ../../src/cli.ts bench --platform web                  # about a minute
 ```
 
-## Comparing with other tools
+## What a figure leaves out
 
-callstack's `agent-device` publishes a similar matrix (cold-cold, cold, warm, relaunch, first interaction) for its snapshot command. Its harness spawns a fresh CLI process per sample; this bench calls a running MCP server, which is how an agent in Claude Code uses the toolkit, so its figures include a Node process start and module load per call that these don't. Its cold-cold also clears the runner's derived data, which forces a runner rebuild; this bench's cold-cold keeps the Maestro runner installed on the simulator, and the toolkit installs it once per simulator on first use.
+This bench calls a running MCP server, as an agent in Claude Code does, so no call pays to start the server or load its modules. A browser click or flow is the exception, because it goes through `agentlane exec`. The cold-cold cell keeps the Maestro runner installed on the simulator, since the toolkit installs it once per simulator, on first use.

@@ -5,4 +5,4 @@
 - title: Features
   pages: [up, services, devices, browsers, resources, shared, drive, evidence, doctor, build-cache, guard]
 - title: Reference
-  pages: [cli, mcp, config, environment, troubleshooting, faq, acknowledgements]
+  pages: [cli, mcp, config, environment, troubleshooting, faq, neighbours, acknowledgements]

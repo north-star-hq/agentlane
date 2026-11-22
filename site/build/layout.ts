@@ -1,4 +1,5 @@
 import type { DocPage, Landing, Release, Section } from './content.ts';
+import { ICONS } from './icons.ts';
 import { escapeHtml, renderInline } from './markdown.ts';
 
 export const REPO_URL = 'https://github.com/north-star-hq/agentlane';
@@ -91,7 +92,7 @@ function navList(root: string, current: Current, sections: Section[]): string {
       const items = section.pages
         .map(
           page =>
-            `<li><a href="${docHref(root, page.slug)}"${here(current.kind === 'doc' && current.slug === page.slug)}><span class="nav-num">${page.number}</span>${escapeHtml(page.title)}</a></li>`,
+            `<li><a href="${docHref(root, page.slug)}"${here(current.kind === 'doc' && current.slug === page.slug)}><span class="nav-num">${page.number}</span>${escapeHtml(page.label)}</a></li>`,
         )
         .join('');
       return `<li class="nav-section"><p class="nav-title"><span class="nav-num">${section.number}</span>${escapeHtml(section.title)}</p><ol>${items}</ol></li>`;
@@ -152,6 +153,10 @@ ${page.body}
 `;
 }
 
+function headline({ marked }: Landing): string {
+  return `${escapeHtml(marked.before)}<mark>${escapeHtml(marked.text)}</mark>${escapeHtml(marked.after)}`;
+}
+
 export function landingBody(root: string, landing: Landing, sections: Section[], releases: Release[]): string {
   const steps = landing.install
     .map((step, i) => {
@@ -162,14 +167,26 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
     })
     .join('');
   const agents = landing.agents.map(a => `<li>${escapeHtml(a)}</li>`).join('');
-  const why = landing.why.map(w => `<li><h3>${escapeHtml(w.title)}</h3><p>${renderInline(w.text)}</p></li>`).join('');
+  const buttons = landing.buttons
+    .map(
+      b =>
+        `<a class="btn${b.primary ? ' btn-primary' : ''}" href="${attr(b.href)}">${b.icon ? (ICONS[b.icon] ?? '') : ''}${escapeHtml(b.label)}</a>`,
+    )
+    .join('');
+  const cards = landing.cards
+    .map(
+      c =>
+        `<li><a href="${attr(c.href)}"><span class="card-icon">${ICONS[c.icon] ?? ''}</span><span class="card-title">${escapeHtml(c.title)}</span><span class="card-text">${renderInline(c.text)}</span></a></li>`,
+    )
+    .join('');
+  const about = landing.about.paragraphs.map(p => `<p>${renderInline(p)}</p>`).join('');
   const stats = landing.speed.map(s => `<div><dt>${escapeHtml(s.value)}</dt><dd>${escapeHtml(s.label)}</dd></div>`).join('');
   const path = sections
     .map(section => {
       const pages = section.pages
         .map(
           page =>
-            `<li><a href="${docHref(root, page.slug)}"><span class="path-page-num">${page.number}</span><span class="path-page-title">${escapeHtml(page.title)}</span><span class="path-page-short">${renderInline(page.short)}</span></a></li>`,
+            `<li><a href="${docHref(root, page.slug)}"><span class="path-page-num">${page.number}</span><span class="path-page-title">${escapeHtml(page.label)}</span><span class="path-page-short">${renderInline(page.short)}</span></a></li>`,
         )
         .join('');
       return `<li class="path-section"><h3><span class="path-num">${section.number}</span>${escapeHtml(section.title)}</h3><ol>${pages}</ol></li>`;
@@ -185,11 +202,7 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
     .join('');
   return `<div class="landing">
 <section class="intro" aria-labelledby="headline">
-  <div class="intro-text">
-    <h1 id="headline">${escapeHtml(landing.headline)}</h1>
-    <p class="pitch">${renderInline(landing.pitch)}</p>
-    <div class="works-with"><p>Works with</p><ul>${agents}</ul></div>
-  </div>
+  <div class="intro-text"><a class="pill" href="${attr(landing.badge.href)}"><span class="pill-dot"></span>${escapeHtml(landing.badge.text)}</a><h1 id="headline">${headline(landing)}</h1><p class="pitch">${renderInline(landing.sentence)}</p><p class="figure-line">${renderInline(landing.figure)}</p><div class="ctas">${buttons}</div><div class="works-with"><p>Works with</p><ul>${agents}</ul></div></div>
   <section class="install" aria-labelledby="install-title">
     <h2 id="install-title">Start in your project</h2>
     <ol class="steps">${steps}</ol>
@@ -199,14 +212,10 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
 <figure class="hero">
   <div class="hero-stage">${hero(root, landing.heroAlt)}</div>
 </figure>
-<section class="why" aria-labelledby="why-title">
-  <div class="path-head"><h2 id="why-title">Why agentlane</h2></div>
-  <ul class="why-grid">${why}</ul>
-</section>
+<section class="cards" aria-label="What each agent gets"><ul class="card-grid">${cards}</ul></section><section class="about" aria-labelledby="about-title"><h2 id="about-title">${escapeHtml(landing.about.title)}</h2>${about}</section>
 <section class="speed-strip" aria-labelledby="speed-title">
-  <div class="path-head"><h2 id="speed-title">Fast where agents spend their time</h2><p><a href="${docHref(root, 'speed')}">What makes it fast</a></p></div>
+  <div class="path-head"><h2 id="speed-title">Fast where agents spend their time</h2><p><a href="${docHref(root, 'speed')}#how-these-were-measured">How we measured</a></p></div>
   <dl class="stats">${stats}</dl>
-  <p class="stats-note">${renderInline(landing.speedNote)}</p>
 </section>
 <section class="path" aria-labelledby="path-title">
   <div class="path-head"><h2 id="path-title">The docs, in order</h2><p>From the first command to the full reference.</p></div>
@@ -222,7 +231,7 @@ export function landingBody(root: string, landing: Landing, sections: Section[],
 function pager(root: string, previous: DocPage | undefined, next: DocPage | undefined): string {
   const card = (page: DocPage | undefined, label: string, cls: string) =>
     page
-      ? `<a class="pager-${cls}" href="${docHref(root, page.slug)}"><span class="pager-label">${label}</span><span class="pager-title">${page.number} ${escapeHtml(page.title)}</span></a>`
+      ? `<a class="pager-${cls}" href="${docHref(root, page.slug)}"><span class="pager-label">${label}</span><span class="pager-title">${page.number} ${escapeHtml(page.label)}</span></a>`
       : '<span></span>';
   return `<nav class="pager" aria-label="Previous and next page">${card(previous, 'Previous', 'prev')}${card(next, 'Next', 'next')}</nav>`;
 }

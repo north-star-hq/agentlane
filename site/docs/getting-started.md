@@ -1,7 +1,7 @@
 ---
 title: Getting started
 short: One command in your project, then one sentence to your agent.
-summary: Run `npx agentlane init` in your project, then ask your agent to set the project up with agentlane. Setup reads how your project runs, writes `agentlane.json` and a run skill, and brings each app up in a lane until `agentlane doctor` reports ready.
+summary: agentlane lets you run several AI coding agents on one machine, each with its own simulator, ports and database. To start, run `npx agentlane init` in your project, then ask your agent to set the project up with agentlane. Setup reads how your project runs, writes `agentlane.json` and a run skill, and brings each app up in a lane until `agentlane doctor` reports ready.
 ---
 
 ## What you need

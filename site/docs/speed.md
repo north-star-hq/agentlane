@@ -1,10 +1,18 @@
 ---
 title: "What makes it fast"
 short: "A warm driver, a patched Maestro, a shared build cache and a reused device pool."
-summary: "An agent reads and acts on the app many times per task, so each call has to be short. agentlane keeps a Maestro session warm per lane, ships Maestro with patches for speed and parallel use, shares one build cache across worktrees, reuses pool devices that boot from Quick Boot, and runs lanes side by side instead of in a queue for one simulator."
+summary: "An agent reads and acts on the app many times per task, so each call has to be short, and when several AI coding agents share one machine, none should wait for another's simulator. agentlane keeps a Maestro session warm per lane, ships Maestro with patches for speed and parallel use, shares one build cache across worktrees, reuses pool devices that boot from Quick Boot, and runs lanes side by side instead of in a queue for one simulator."
 ---
 
 ## The numbers
+
+|                                     | With agentlane               | Without                |
+| ----------------------------------- | ---------------------------- | ---------------------- |
+| Read the screen, two iOS simulators | 0.12 s                       | 6.5 s on stock Maestro |
+| iOS build in a fresh worktree       | 6.5 s from the shared cache  | 91.5 s                 |
+| Boot an Android emulator            | 1.6 to 1.8 s from Quick Boot | 14.6 s cold            |
+
+Once a lane is up, the calls an agent makes most often each take under a second:
 
 | On a warm lane, median of 16 calls | iOS simulator | Browser |
 | ---------------------------------- | ------------- | ------- |
@@ -51,10 +59,11 @@ Speed for one agent matters less than not waiting for another. Each agent's lane
 
 All on an Apple M4 Max with 48 GB of memory.
 
-- iOS column: `agentlane bench` on the example app in the agentlane repository, two iPhone 17 simulators alternating, release 0.1.3 with the Maestro build agentlane installs (`2.11.0-agentenv.3`). The Mac was under memory pressure, so these are upper bounds.
-- Browser column: the same bench on the example's web app, Playwright 1.64.0 with Chrome for Testing, a 0.2.0 development build.
-- Port comparison: 16 reads per simulator on another app, stock Maestro 2.8.0 against an early build with the port patch.
-- Build cache: single runs of 0.2.0 on the example app. Boot times: two boots each of a Pixel 8 emulator on Android 36.
+- Reading the screen with two iOS simulators, 0.12 s against 6.5 s: 16 reads per simulator on another app, stock Maestro 2.8.0 against an early build with the port patch.
+- The iOS build in a fresh worktree, 6.5 s from the cache against 91.5 s to build: single runs of 0.2.0 on the example app.
+- Booting an Android emulator, Quick Boot against a cold boot: two boots each of a Pixel 8 emulator on Android 36.
+- The warm lane's iOS simulator column: `agentlane bench` on the example app in the agentlane repository, two iPhone 17 simulators alternating, release 0.1.3 with the Maestro build agentlane installs (`2.11.0-agentenv.3`). The Mac was under memory pressure, so these are upper bounds.
+- The warm lane's Browser column: the same bench on the example's web app, Playwright 1.64.0 with Chrome for Testing, a 0.2.0 development build.
 
 `bench/README.md` in the agentlane repository has the method, and `agentlane bench` runs it on your machine:
 
