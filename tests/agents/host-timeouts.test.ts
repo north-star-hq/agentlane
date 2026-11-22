@@ -4,12 +4,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { runAgentCommand } from '../../src/agents/cli.ts';
-import { CALL_LIMIT_SEC, coversCalls, HOST_TIMEOUTS, timeoutValue } from '../../src/agents/host-timeouts.ts';
+import {
+  CALL_LIMIT_SEC,
+  coversCalls,
+  HOST_TIMEOUTS,
+  LONGEST_TOOL_CALL_MS,
+  timeoutValue,
+} from '../../src/agents/host-timeouts.ts';
 import { mcpLaunch } from '../../src/agents/launcher.ts';
 import { agentWiringChecks } from '../../src/agents/wiring-check.ts';
 import type { Platform } from '../../src/devices/backend.ts';
-import { LONGEST_CALL_MS, responseTimeoutMs } from '../../src/driver/client.ts';
+import { LONGEST_ANSWER_MS, LONGEST_ENGINE_CALL_MS, responseTimeoutMs } from '../../src/driver/client.ts';
 import type { EngineRequest } from '../../src/driver/engine.ts';
+import { INSTALL_WAITS_MS, JDK_LOOKUP_MS } from '../../src/driver/install.ts';
+import { PROJECT_PLATFORMS } from '../../src/project/schema.ts';
+import { LANE_WAIT_MS, LONGEST_ENTRY_MS, WAKE_WAIT_MS } from '../../src/up/wake.ts';
 import { tempDir } from '../support/fakes.ts';
 import { recordingInstaller } from '../support/installer.ts';
 
@@ -63,11 +72,11 @@ function codexTable(dir: string): string {
 
 test('the timeout written for each host outlasts every call agentlane’s client waits on, and each host’s connect default', () => {
   for (const platform of PLATFORMS)
-    for (const op of OPS) assert.ok(LONGEST_CALL_MS >= responseTimeoutMs(op, platform), `${op} on ${platform}`);
-  assert.ok(CALL_LIMIT_SEC * 1000 > LONGEST_CALL_MS);
+    for (const op of OPS) assert.ok(LONGEST_ANSWER_MS >= responseTimeoutMs(op, platform), `${op} on ${platform}`);
+  assert.ok(CALL_LIMIT_SEC * 1000 > LONGEST_TOOL_CALL_MS);
   for (const [agent, host] of Object.entries(HOST_TIMEOUTS)) {
     const sec = host.unit === 'ms' ? timeoutValue(host) / 1000 : timeoutValue(host);
-    assert.ok(sec * 1000 > LONGEST_CALL_MS, agent);
+    assert.ok(sec * 1000 > LONGEST_TOOL_CALL_MS, agent);
     assert.ok(sec >= (host.connectSec ?? 0), `${agent} keeps its connect default`);
     assert.ok(coversCalls(host, timeoutValue(host)), agent);
     assert.ok(!coversCalls(host, timeoutValue(host) - 1), agent);
@@ -78,6 +87,21 @@ test('the timeout written for each host outlasts every call agentlane’s client
   assert.equal(coversCalls(HOST_TIMEOUTS.antigravity, -1), true, 'a negative timeoutSeconds turns Antigravity’s limits off');
   assert.equal(coversCalls(HOST_TIMEOUTS.antigravity, 0), false, 'zero keeps Antigravity’s 180 s');
   assert.equal(coversCalls(HOST_TIMEOUTS.gemini, -1), false);
+});
+
+test('the timeout also covers a call’s waits outside the answer: a parked lane, the Maestro install, driver restarts and a resent request', () => {
+  assert.ok(LONGEST_ENTRY_MS >= LANE_WAIT_MS + PROJECT_PLATFORMS.length * WAKE_WAIT_MS, 'waking a parked lane');
+  assert.ok(INSTALL_WAITS_MS >= JDK_LOOKUP_MS + 10 * 60_000, 'finding the JDK and unzipping Maestro');
+  const stopWaits = 2 * 35_000;
+  assert.ok(
+    LONGEST_ENGINE_CALL_MS >= INSTALL_WAITS_MS + JDK_LOOKUP_MS + stopWaits + 2 * LONGEST_ANSWER_MS,
+    'two stopping drivers, and a reset followed by a second full answer',
+  );
+  assert.ok(CALL_LIMIT_SEC * 1000 > LONGEST_ENTRY_MS + LONGEST_ENGINE_CALL_MS);
+  for (const [agent, host] of Object.entries(HOST_TIMEOUTS)) {
+    const ms = host.unit === 'ms' ? timeoutValue(host) : timeoutValue(host) * 1000;
+    assert.ok(ms > LONGEST_ENTRY_MS + LONGEST_ENGINE_CALL_MS, agent);
+  }
 });
 
 test('a fresh init writes each host’s timeout under its own key and unit, and none for Cursor or Claude Code alone', async () => {
@@ -135,13 +159,20 @@ test('init on existing entries keeps the user’s fields and a longer timeout, a
 
     const longer = { ...server(dir, '.mcp.json'), timeout: ms * 2 };
     write(dir, '.mcp.json', JSON.stringify({ mcpServers: { agentlane: longer } }));
-    write(dir, '.agents/mcp_config.json', JSON.stringify({ mcpServers: { agentlane: { ...launcher, timeoutSeconds: 3600 } } }));
+    const longerSec = CALL_LIMIT_SEC * 2;
+    write(
+      dir,
+      '.agents/mcp_config.json',
+      JSON.stringify({ mcpServers: { agentlane: { ...launcher, timeoutSeconds: longerSec } } }),
+    );
     const toml = path.join(dir, '.codex/config.toml');
-    fs.writeFileSync(toml, fs.readFileSync(toml, 'utf8').replace(/tool_timeout_sec = \d+/, 'tool_timeout_sec = 7_200.5'));
+    const tomlLonger = `${String(longerSec).replace(/(\d)(?=(\d{3})+$)/g, '$1_')}.5`;
+    fs.writeFileSync(toml, fs.readFileSync(toml, 'utf8').replace(/tool_timeout_sec = \d+/, `tool_timeout_sec = ${tomlLonger}`));
     await init(dir, env, 'codex,copilot,antigravity');
     assert.deepEqual(server(dir, '.mcp.json'), longer);
-    assert.equal(server(dir, '.agents/mcp_config.json').timeoutSeconds, 3600);
-    assert.match(codexTable(dir), /\ntool_timeout_sec = 7_200\.5\n/);
+    assert.equal(server(dir, '.agents/mcp_config.json').timeoutSeconds, longerSec);
+    assert.ok(codexTable(dir).includes(`\ntool_timeout_sec = ${tomlLonger}\n`), tomlLonger);
+    assert.match(tomlLonger, /^\d+_\d{3}\.5$/);
   } finally {
     cleanup();
   }

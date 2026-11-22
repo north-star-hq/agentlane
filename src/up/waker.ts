@@ -3,10 +3,7 @@ import { Registry } from '../registry/registry.ts';
 import type { EnvDeps } from './deps.ts';
 import { laneDir, readUpRecord, upPlatforms, wakeFolder } from './lane-files.ts';
 import { up, type UpOptions } from './up.ts';
-import type { LaneWaker } from './wake.ts';
-
-/** How long waking a lane waits for a pool device, as `up` does by default. */
-export const WAKE_WAIT_MS = 600_000;
+import { WAKE_WAIT_MS, type LaneWaker } from './wake.ts';
 
 /**
  * Wakes a lane through the steps `up` takes, minus setup and resource creation, for each platform `up` brought it up

@@ -11,7 +11,14 @@ import type { EngineConfig, EngineRequest, EngineResponse } from './engine.ts';
 import { DriverError } from './errors.ts';
 import { isAlive, tail } from './exec.ts';
 import { describeIdle, readDriverSettings, takeIdleStop, type IdleStop } from './idle.ts';
-import { ensureMaestro, findJdk17, MAESTRO_OVERRIDE_ENV, type InstallOptions } from './install.ts';
+import {
+  ensureMaestro,
+  findJdk17,
+  INSTALL_WAITS_MS,
+  JDK_LOOKUP_MS,
+  MAESTRO_OVERRIDE_ENV,
+  type InstallOptions,
+} from './install.ts';
 import { liveHolder, lockHolder, tryLock } from './lock.ts';
 import { enginePaths, ensurePrivateDir, type EnginePaths } from './paths.ts';
 import { longestIosCallMs, warmCallMs } from './supervisor.ts';
@@ -53,7 +60,9 @@ export interface EngineTarget {
 }
 
 const START_TIMEOUT_MS = 20_000;
+const PING_TIMEOUT_MS = 5000;
 const STOP_WAIT_MS = 35_000;
+const ROUNDS = 3;
 const MARGIN_MS = 60_000;
 type DeviceOp = 'look' | 'screenshot' | 'run';
 const CONTROL_TIMEOUT_MS: Record<Exclude<EngineRequest['op'], DeviceOp>, number> = {
@@ -72,10 +81,22 @@ const DEVICE_TIMEOUT_MS: Record<Platform, Record<DeviceOp, number>> = {
   android: { look: 150_000, screenshot: 150_000, run: 900_000 },
 };
 
-/** The longest one tool call waits on the engine: starting it, then its slowest answer on any platform. */
-export const LONGEST_CALL_MS =
-  START_TIMEOUT_MS +
-  Math.max(...Object.values(CONTROL_TIMEOUT_MS), ...Object.values(DEVICE_TIMEOUT_MS).flatMap(ops => Object.values(ops)));
+/** The slowest answer a client waits for, on any platform. */
+export const LONGEST_ANSWER_MS = Math.max(
+  ...Object.values(CONTROL_TIMEOUT_MS),
+  ...Object.values(DEVICE_TIMEOUT_MS).flatMap(ops => Object.values(ops)),
+);
+
+/**
+ * The longest callEngine waits on its bounded steps: the first Maestro install; in each round, finding the JDK and
+ * starting the engine; a stopping driver between rounds; and two of the slowest answers, the first lost to a reset.
+ * The Maestro download and its checksum have no limit.
+ */
+export const LONGEST_ENGINE_CALL_MS =
+  INSTALL_WAITS_MS +
+  ROUNDS * (JDK_LOOKUP_MS + START_TIMEOUT_MS + PING_TIMEOUT_MS) +
+  (ROUNDS - 1) * STOP_WAIT_MS +
+  2 * LONGEST_ANSWER_MS;
 
 /** How long a client waits for the engine to answer one request on a lane of this platform. */
 export function responseTimeoutMs(op: EngineRequest['op'], platform: Platform): number {
@@ -237,7 +258,7 @@ async function startEngine(target: EngineTarget, paths: EnginePaths): Promise<vo
   let respawned = false;
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const answer = await send(paths, { op: 'ping', lane: refOf(target.lane) }, 5000).catch(() => undefined);
+    const answer = await send(paths, { op: 'ping', lane: refOf(target.lane) }, PING_TIMEOUT_MS).catch(() => undefined);
     if (answer && answer.stopping === undefined) return;
     const exit = exited();
     if (exit !== undefined) {
@@ -297,7 +318,7 @@ export async function callEngine(
   const paths = enginePaths(target.stateDir, target.lane.id);
   const full = { ...request, lane: refOf(target.lane) } as EngineRequest;
   const timeoutMs = laneTimeoutMs(target.lane, full.op);
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < ROUNDS; round++) {
     refuseWhileReleasing(target, paths);
     let response = await send(paths, full, timeoutMs);
     let coldStart: EngineResponse['coldStart'];

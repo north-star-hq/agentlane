@@ -1,6 +1,7 @@
-import { LONGEST_CALL_MS } from '../driver/client.ts';
+import { LONGEST_ENGINE_CALL_MS } from '../driver/client.ts';
 import { TOOL } from '../name.ts';
 import type { Agent } from '../registry/owner.ts';
+import { LONGEST_ENTRY_MS } from '../up/wake.ts';
 import { AGENT_NAMES } from './detect.ts';
 
 export interface HostTimeout {
@@ -35,8 +36,11 @@ export function hostTimeout(agent: Agent): HostTimeout | undefined {
 
 const MINUTE_MS = 60_000;
 
+/** The longest one MCP tool call waits on agentlane's bounded steps: entering its lane, then the engine. */
+export const LONGEST_TOOL_CALL_MS = LONGEST_ENTRY_MS + LONGEST_ENGINE_CALL_MS;
+
 /** agentlane's longest call with a minute to spare, rounded up to whole minutes. */
-export const CALL_LIMIT_SEC = (Math.ceil((LONGEST_CALL_MS + MINUTE_MS) / MINUTE_MS) * MINUTE_MS) / 1000;
+export const CALL_LIMIT_SEC = (Math.ceil((LONGEST_TOOL_CALL_MS + MINUTE_MS) / MINUTE_MS) * MINUTE_MS) / 1000;
 
 function inUnit(host: HostTimeout, sec: number): number {
   return host.unit === 'ms' ? sec * 1000 : sec;

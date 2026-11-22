@@ -67,6 +67,19 @@ export const MAESTRO_OVERRIDE_ENV = envName('MAESTRO');
 
 const JDK_FIX = `install JDK 17 ('brew install openjdk@17'), or set ${JAVA_HOME_ENV} to a JDK 17 home`;
 const INSTALL_LOCK_WAIT_MS = 15 * 60_000;
+const JAVA_SETTINGS_TIMEOUT_MS = 30_000;
+const JAVA_HOME_TIMEOUT_MS = 10_000;
+const BREW_PREFIX_TIMEOUT_MS = 10_000;
+const UNZIP_TIMEOUT_MS = 10 * 60_000;
+const QUARANTINE_TIMEOUT_MS = 60_000;
+const VERSION_TIMEOUT_MS = 120_000;
+
+/** The longest findJdk17 waits with the system's search: two JDKs' settings, java_home and brew. */
+export const JDK_LOOKUP_MS = 2 * JAVA_SETTINGS_TIMEOUT_MS + JAVA_HOME_TIMEOUT_MS + BREW_PREFIX_TIMEOUT_MS;
+
+/** The longest ensureMaestro waits on anything but the download and its checksum: the JDK, another install, and unpacking. */
+export const INSTALL_WAITS_MS =
+  JDK_LOOKUP_MS + INSTALL_LOCK_WAIT_MS + UNZIP_TIMEOUT_MS + QUARANTINE_TIMEOUT_MS + VERSION_TIMEOUT_MS;
 
 export function dataDir(env: NodeJS.ProcessEnv): string {
   const xdg = env.XDG_DATA_HOME;
@@ -135,7 +148,7 @@ export function installedMaestro(env: NodeJS.ProcessEnv, release: MaestroRelease
 async function javaSettings(home: string): Promise<{ spec: string | undefined; javaHome: string | undefined }> {
   const java = path.join(home, 'bin', 'java');
   if (!isExecutable(java)) return { spec: undefined, javaHome: undefined };
-  const ran = await runCommand(java, ['-XshowSettings:properties', '-version'], { timeoutMs: 30_000 });
+  const ran = await runCommand(java, ['-XshowSettings:properties', '-version'], { timeoutMs: JAVA_SETTINGS_TIMEOUT_MS });
   const text = `${ran.stdout}\n${ran.stderr}`;
   return {
     spec: /^\s*java\.specification\.version = (\S+)/m.exec(text)?.[1],
@@ -155,7 +168,7 @@ export const JAVA_HOME_TOOL = '/usr/libexec/java_home';
 
 /** The JDK 17 macOS has registered. Without -F, java_home prints the default JDK when none matches. */
 export async function registeredJdk17(tool = JAVA_HOME_TOOL): Promise<string | undefined> {
-  const found = await runCommand(tool, ['-F', '-v', '17'], { timeoutMs: 10_000 });
+  const found = await runCommand(tool, ['-F', '-v', '17'], { timeoutMs: JAVA_HOME_TIMEOUT_MS });
   return found.code === 0 && found.stdout.trim() ? found.stdout.trim() : undefined;
 }
 
@@ -165,7 +178,7 @@ export const systemJdk17: JdkSearch = async () => {
   if (registered !== undefined) return { home: registered, origin: `${JAVA_HOME_TOOL} -F -v 17` };
   const prefixes = ['/opt/homebrew/opt/openjdk@17', '/usr/local/opt/openjdk@17'];
   if (!prefixes.some(prefix => isExecutable(path.join(prefix, 'bin', 'java')))) {
-    const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: 10_000 });
+    const brew = await runCommand('brew', ['--prefix', 'openjdk@17'], { timeoutMs: BREW_PREFIX_TIMEOUT_MS });
     if (brew.code === 0 && brew.stdout.trim()) prefixes.unshift(brew.stdout.trim());
   }
   const home = prefixes.find(prefix => isExecutable(path.join(prefix, 'bin', 'java')));
@@ -318,7 +331,7 @@ async function verify(release: MaestroRelease, downloaded: Downloaded): Promise<
 
 /** macOS's unzip copies a quarantined zip's com.apple.quarantine to every file it unpacks, and Gatekeeper can block those files. */
 async function clearQuarantine(dir: string): Promise<void> {
-  const cleared = await runCommand('xattr', ['-dr', 'com.apple.quarantine', dir], { timeoutMs: 60_000 });
+  const cleared = await runCommand('xattr', ['-dr', 'com.apple.quarantine', dir], { timeoutMs: QUARANTINE_TIMEOUT_MS });
   if (cleared.code !== 0) {
     throw new DriverError(
       `clearing macOS's quarantine from the unpacked Maestro failed (${cleared.error ?? `exit ${String(cleared.code)}`}): ${tail(cleared.stderr, 5)}`,
@@ -328,7 +341,7 @@ async function clearQuarantine(dir: string): Promise<void> {
 }
 
 async function unpack(release: MaestroRelease, zip: string, into: string, jdk: Jdk): Promise<void> {
-  const unzipped = await runCommand('unzip', ['-q', zip, '-d', into], { timeoutMs: 10 * 60_000 });
+  const unzipped = await runCommand('unzip', ['-q', zip, '-d', into], { timeoutMs: UNZIP_TIMEOUT_MS });
   if (unzipped.code !== 0) {
     throw new DriverError(
       `unzip of ${path.basename(zip)} failed (${unzipped.error ?? `exit ${String(unzipped.code)}`}): ${tail(unzipped.stderr, 5)}`,
@@ -342,7 +355,7 @@ async function unpack(release: MaestroRelease, zip: string, into: string, jdk: J
   }
   const version = await runCommand(binary, ['--version'], {
     env: { ...process.env, JAVA_HOME: jdk.javaHome, MAESTRO_CLI_NO_ANALYTICS: '1', MAESTRO_DISABLE_UPDATE_CHECK: 'true' },
-    timeoutMs: 120_000,
+    timeoutMs: VERSION_TIMEOUT_MS,
   });
   const printed = version.stdout.trim().split('\n').at(-1)?.trim();
   if (version.code !== 0 || printed !== release.version) {
