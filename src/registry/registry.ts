@@ -2504,7 +2504,10 @@ export class Registry {
     });
   }
 
-  /** Records on each of the lane's resources the shared services it needs now, and the lane's repository, for its teardown to start. */
+  /**
+   * Records on each of the lane's resources the shared services it needs now, besides those it recorded before, and the
+   * lane's repository, for its teardown to start.
+   */
   followResourceNeeds(ref: LaneRef, resources: readonly Pick<ResourceSpec, 'name' | 'needs'>[]): void {
     this.store.write(() => {
       const row = this.requireLane(ref);

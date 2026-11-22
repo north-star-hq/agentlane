@@ -14,10 +14,12 @@ import { RETURN_WINDOW_MS } from '../src/registry/owner-checks.ts';
 import { NOTHING_TO_RESTART } from '../src/registry/parks.ts';
 import { databasePath } from '../src/registry/paths.ts';
 import { Registry } from '../src/registry/registry.ts';
+import { TEARDOWN_RETRY_MS } from '../src/registry/resources.ts';
 import { SHARED_IDLE_MS, SHARED_READY_RUN_MAX_MS, SHARED_STOP_RETRY_MS, sharedHoldMs } from '../src/registry/shared.ts';
 import { Store } from '../src/registry/store.ts';
 import type { Lane } from '../src/registry/types.ts';
 import { realServiceSystem } from '../src/services/system.ts';
+import { tearDownEndedResources } from '../src/up/resources.ts';
 import type { SharedRunDeps } from '../src/up/shared.ts';
 import {
   SHARED_WAIT_POLL_MS,
@@ -545,6 +547,81 @@ test('a teardown whose shared service was stopped starts it again with the recor
     const unknown = await startSharedForTeardown(deps(w), reaper, { ...teardown, needs: ['cache'] }).catch((e: unknown) => e);
     assert.ok(unknown instanceof SharedServiceFailed);
     assert.match(unknown.message, /^shared service cache: no start of it is recorded for /);
+  } finally {
+    w.close();
+  }
+});
+
+test('one sweep reaping three lanes whose teardowns need a shared service that does not start tries its start once, and a later pass tries again', async () => {
+  const w = world();
+  const f = fixture();
+  try {
+    const repo = w.folder('repo');
+    const attempts = path.join(f.dir, 'attempts');
+    const broken = path.join(f.dir, 'broken');
+    const tries = () => (fs.existsSync(attempts) ? fs.readFileSync(attempts, 'utf8').trim().split('\n').length : 0);
+    const spec = f.spec({
+      start: `echo attempt >> '${attempts}'; if [ -f '${broken}' ]; then echo "cannot reach the docker daemon" >&2; exit 3; fi; touch '${f.up}'`,
+    });
+    const ids: string[] = [];
+    for (const name of ['a', 'b', 'c']) {
+      const owner = w.procs.owner();
+      const made = (await w.registry().claim(w.request(owner, w.folder(name), { device: null, services: [], projectRoot: repo })))
+        .lane;
+      const maker = w.registry();
+      maker.startResource(refOf(made), {
+        name: 'appdb',
+        cwd: made.worktree,
+        teardown: 'true',
+        timeoutMs: 1000,
+        env: {},
+        cleared: [],
+        needs: ['db'],
+      });
+      maker.finishResource(made.id, 'appdb', {});
+      await startSharedForLane(deps(w), w.registry(), refOf(made), [spec]);
+      w.procs.kill(owner.process?.pid ?? 0);
+      ids.push(made.id);
+    }
+    ids.sort();
+    await w.clock.advance(3 * MINUTE_MS);
+    assert.deepEqual(
+      (await runSweep(sweepDeps(w))).outcomes.map(o => [o.kind, o.lane]).sort(),
+      ids.map(id => ['parked', id]),
+    );
+    fs.rmSync(f.up);
+    fs.writeFileSync(broken, '');
+    const before = tries();
+
+    await w.clock.advance(RETURN_WINDOW_MS);
+    const report = await runSweep(sweepDeps(w));
+    assert.deepEqual(
+      report.reaps.map(r => [r.kind, r.lane]).sort(),
+      ids.map(id => ['ended', id]),
+    );
+    assert.equal(tries() - before, 1, 'the sweep started the failing shared service once for each lane it reaped');
+    assert.deepEqual(
+      report.reaps.map(r => (r.kind === 'ended' ? r.problems.map(p => p.replace(/: start exited 3: [^]*$/, '')) : [])),
+      ids.map(() => ['resource appdb: teardown did not run, since shared service db did not start (attempt 1)']),
+    );
+    assert.deepEqual(
+      w
+        .registry()
+        .pendingTeardowns()
+        .map(t => [t.lane, t.attempts])
+        .sort(),
+      ids.map(id => [id, 1]),
+    );
+
+    fs.rmSync(broken);
+    await w.clock.advance(TEARDOWN_RETRY_MS);
+    const later = await tearDownEndedResources(deps(w), w.registry(), w.dir);
+    assert.deepEqual(
+      later.flatMap(t => t.problems),
+      [],
+    );
+    assert.equal(tries() - before, 2);
+    assert.deepEqual(w.registry().pendingTeardowns(), []);
   } finally {
     w.close();
   }

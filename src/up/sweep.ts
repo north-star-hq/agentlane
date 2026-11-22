@@ -31,7 +31,7 @@ import { LANE_FILES_KEEP_MS, laneFolderIds, pruneEndedLaneFiles } from './lane-f
 import type { ParkDeps, ParkOutcome } from './park.ts';
 import { attemptId, deadHolder, PARK_RETRY_MS, parkLane } from './park.ts';
 import { tearDownLane } from './release.ts';
-import { tearDownEndedResources } from './resources.ts';
+import { FailedStarts, tearDownEndedResources } from './resources.ts';
 import type { SharedStopped } from './shared.ts';
 import { stopUnneededShared } from './shared.ts';
 
@@ -313,6 +313,7 @@ async function reapLane(
   registry: Registry,
   lane: SweptLane,
   dead: readonly ProcessIdentity[],
+  failedStarts: FailedStarts,
 ): Promise<ReapOutcome> {
   const { ref } = lane;
   const attempt = attemptId();
@@ -331,7 +332,7 @@ async function reapLane(
       ...(await stopEndedBrowsers(deps.browser ?? realBrowserTools, registry, deps.dir, deps.clock)).filter(
         t => t.lane === ref.id,
       ),
-      ...(await tearDownEndedResources(deps, registry, deps.dir, { lane: ref.id })),
+      ...(await tearDownEndedResources(deps, registry, deps.dir, { lane: ref.id }, failedStarts)),
     ];
     return {
       kind: 'ended',
@@ -351,8 +352,9 @@ async function reapLane(
  * The sweep's work, in the process that does it, for every lane on the Mac. It asks the process table once about the
  * owners no check or call has shown alive lately. A lane whose owner it finds gone is parked at once, and ended with
  * what a release does RETURN_WINDOW_MS after it was found gone, unless a process of its owner's session takes it back
- * first. It parks each lane whose owner left it unused for the park window and holds it no more. It stops each shared
- * service no active lane and no running teardown has needed for SHARED_IDLE_MS.
+ * first. Its reaps tear down resources as one pass, so a shared service whose start fails is tried once however many
+ * reaped lanes need it. It parks each lane whose owner left it unused for the park window and holds it no more. It stops
+ * each shared service no active lane and no running teardown has needed for SHARED_IDLE_MS.
  */
 export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
   const say = deps.log ?? (() => undefined);
@@ -454,6 +456,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
       }
     }
 
+    const failedStarts = new FailedStarts();
     for (const lane of goneIds.size > 0 ? registry.sweepList() : []) {
       const reaper = lane.gone?.reaper ?? null;
       if (!reapDue(lane, now)) continue;
@@ -462,7 +465,7 @@ export async function runSweep(deps: SweepDeps): Promise<SweepReport> {
         ...[deadHolder(lane.park, deps.processes)].filter((p): p is ProcessIdentity => p !== null),
       ];
       try {
-        const outcome = await reapLane(deps, registry, lane, dead);
+        const outcome = await reapLane(deps, registry, lane, dead, failedStarts);
         report.reaps.push(outcome);
         if (outcome.kind === 'ended') {
           say(

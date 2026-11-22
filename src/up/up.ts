@@ -833,7 +833,7 @@ export async function up(given: EnvDeps, options: UpOptions): Promise<UpResult> 
     }
     const booting = bootingWithSetup ?? (target ? startBoot(target) : null);
     try {
-      if (options.waking) registry.followResourceNeeds(ctx.ref, config.resources);
+      registry.followResourceNeeds(ctx.ref, config.resources);
       await sharedStep(ctx, run, platforms);
       if (config.resources.length > 0 && !options.waking) {
         const made = await run.step('resources', () => createResources(ctx, ctx.lane), describeResources);
