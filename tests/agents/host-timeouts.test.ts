@@ -194,7 +194,7 @@ test('doctor warns about a missing or short timeout, naming the file, the key an
       ],
       [
         'antigravity',
-        `stale .agents/mcp_config.json (MCP server): it has no timeoutSeconds, so Antigravity stops a call after 3 min; ${needs('timeoutSeconds', CALL_LIMIT_SEC, 'seconds')}`,
+        `stale .agents/mcp_config.json (MCP server): its timeoutSeconds is 0, which keeps the default, so Antigravity stops a call after 3 min; ${needs('timeoutSeconds', CALL_LIMIT_SEC, 'seconds')}`,
         'antigravity',
       ],
     ];
@@ -207,6 +207,52 @@ test('doctor warns about a missing or short timeout, naming the file, the key an
 
     await init(dir, env, 'codex,copilot,gemini,antigravity');
     assert.ok(agentWiringChecks(dir, env).every(c => !c.warning));
+  } finally {
+    cleanup();
+  }
+});
+
+test('in a .mcp.json shared by Claude Code and Copilot, a missing timeout warns only on the line whose init adds it', async () => {
+  const { dir, env, cleanup } = project();
+  try {
+    await init(dir, env, 'claude,copilot');
+    const file = path.join(dir, '.mcp.json');
+    const setMcpTimeout = (value?: number) => {
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8')) as { mcpServers: Record<string, Record<string, unknown>> };
+      const entry = doc.mcpServers.agentlane ?? {};
+      if (value === undefined) Reflect.deleteProperty(entry, 'timeout');
+      else entry.timeout = value;
+      fs.writeFileSync(file, JSON.stringify(doc));
+    };
+
+    setMcpTimeout(60_000);
+    assert.deepEqual(
+      agentWiringChecks(dir, env)
+        .filter(c => c.warning)
+        .map(c => c.name),
+      ['wiring claude', 'wiring copilot'],
+    );
+    await init(dir, env, 'claude');
+    assert.deepEqual(
+      agentWiringChecks(dir, env).filter(c => c.warning),
+      [],
+      'a short timeout is raised by either agent',
+    );
+
+    setMcpTimeout();
+    const warned = agentWiringChecks(dir, env).filter(c => c.warning);
+    assert.deepEqual(
+      warned.map(c => [c.name, c.fix]),
+      [['wiring copilot', 'node_modules/.bin/agentlane init --agents copilot']],
+    );
+    assert.match(warned[0]?.detail ?? '', /^stale \.mcp\.json \(MCP server\): it has no timeout, so GitHub Copilot stops/);
+
+    for (const check of warned) await init(dir, env, check.fix.replace(/^.* --agents /, ''));
+    assert.equal(server(dir, '.mcp.json').timeout, CALL_LIMIT_SEC * 1000);
+    assert.deepEqual(
+      agentWiringChecks(dir, env).filter(c => c.warning),
+      [],
+    );
   } finally {
     cleanup();
   }

@@ -6,7 +6,7 @@ import { AGENTS } from '../registry/owner.ts';
 import type { PluginSource } from './claude-plugin.ts';
 import { CLAUDE_SETTINGS, claudePluginInstall, describePluginSource, jsonObjectAt } from './claude-plugin.ts';
 import type { FilePlan } from './init.ts';
-import { planInit } from './init.ts';
+import { planFile, planInit } from './init.ts';
 import type { Skill } from './skills.ts';
 import { listSkills, SKILLS_DIR } from './skills.ts';
 import type { Edit, Json } from './wiring.ts';
@@ -61,6 +61,14 @@ function problem(file: FilePlan): string {
   }
 }
 
+/** The part of a file's plan that the agent's own edits make, so its line names only what `init --agents <agent>` changes. */
+function ownShare(root: string, file: FilePlan, agent: Agent): FilePlan[] {
+  const own = file.edits.filter(e => e.agent === agent);
+  if (own.length === 0) return [];
+  if (own.length === file.edits.length) return [file];
+  return planFile(root, file.file, own).filter(f => f.status !== 'unchanged');
+}
+
 function check(name: string, problems: readonly FilePlan[], fine: string, fix: string): WiringCheck {
   return problems.length === 0
     ? { name, ok: true, warning: false, detail: fine, fix: '' }
@@ -111,7 +119,7 @@ export function agentWiringChecks(
         ),
       );
     for (const agent of agents) {
-      const mine = off.filter(f => f.edits.some(e => e.agent === agent));
+      const mine = off.flatMap(f => ownShare(root, f, agent));
       const plugin = agent === 'claude' ? plan.claudePlugin : null;
       const fine = plugin ? `through the plugin: ${describePluginSource(plugin)}` : 'MCP server and hooks in place';
       const line = check(`wiring ${agent}`, mine, fine, `${CLI} init --agents ${agent}`);

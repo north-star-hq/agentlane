@@ -71,9 +71,12 @@ export function timeoutShortfall(agent: Agent, value: unknown): string | null {
   const host = hostTimeout(agent);
   if (!host || coversCalls(host, value)) return null;
   const needs = `${host.key} ${String(timeoutValue(host))} (${host.unit === 'ms' ? 'milliseconds' : 'seconds'}, ${duration(neededSec(host))})`;
+  const stops = `${AGENT_NAMES[agent]} stops a call after ${duration(host.callSec)}`;
   const has =
-    inEffect(host, value) === value
-      ? `its ${host.key} is ${JSON.stringify(value)}`
-      : `it has no ${host.key}, so ${AGENT_NAMES[agent]} stops a call after ${duration(host.callSec)}`;
+    value === undefined
+      ? `it has no ${host.key}, so ${stops}`
+      : inEffect(host, value) === value
+        ? `its ${host.key} is ${JSON.stringify(value)}`
+        : `its ${host.key} is 0, which keeps the default, so ${stops}`;
   return `${has}; ${TOOL} needs ${needs}`;
 }

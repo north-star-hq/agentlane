@@ -213,20 +213,23 @@ export function planInit(root: string, agents: readonly Agent[], skills: readonl
   }
   const byFile = new Map<string, Edit[]>();
   for (const edit of edits) byFile.set(edit.file, [...(byFile.get(edit.file) ?? []), edit]);
-  const files = [...byFile].flatMap(([file, group]): FilePlan[] => {
-    const [first] = group;
-    if (first?.kind === 'stub') return [planStub(root, first)];
-    if (first?.kind === 'link') return [planLink(root, first)];
-    if (first?.kind === 'unlink') {
-      const removal = planUnlink(root, first);
-      return removal ? [removal] : [];
-    }
-    if (first?.kind === 'toml') return [planToml(root, file, group)];
-    const plan = planJson(root, file, group);
-    const cleanupOnly = group.every(edit => edit.kind === 'json' && edit.cleanup === true);
-    return cleanupOnly && plan.status === 'unchanged' ? [] : [plan];
-  });
+  const files = [...byFile].flatMap(([file, group]) => planFile(root, file, group));
   return { root, agents: [...agents], claudePlugin, files };
+}
+
+/** What init would do to one file with these edits, all of which name that file. */
+export function planFile(root: string, file: string, group: Edit[]): FilePlan[] {
+  const [first] = group;
+  if (first?.kind === 'stub') return [planStub(root, first)];
+  if (first?.kind === 'link') return [planLink(root, first)];
+  if (first?.kind === 'unlink') {
+    const removal = planUnlink(root, first);
+    return removal ? [removal] : [];
+  }
+  if (first?.kind === 'toml') return [planToml(root, file, group)];
+  const plan = planJson(root, file, group);
+  const cleanupOnly = group.every(edit => edit.kind === 'json' && edit.cleanup === true);
+  return cleanupOnly && plan.status === 'unchanged' ? [] : [plan];
 }
 
 function backup(root: string, file: string, into: string): void {
