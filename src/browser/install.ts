@@ -80,7 +80,6 @@ export type InstallState =
 interface Marker {
   version: string;
   hash: string;
-  installedAt: string;
 }
 
 const MARKER = '.agentlane-installed';
@@ -360,7 +359,7 @@ class Installer {
     const ran = await runCommand('tar', ['-xzf', file, '-C', into], { timeoutMs: 10 * 60_000 });
     if (ran.code !== 0)
       throw new DriverError(`tar could not unpack ${path.basename(file)}: ${tail(ran.stderr, 5)}`, `retry ${INSTALL_FIX}`);
-    writeMarker(into, { version: pin.version, hash: pin.sha512, installedAt: new Date().toISOString() });
+    writeMarker(into, { version: pin.version, hash: pin.sha512 });
     replace(home, into, this.work);
     this.log(`installed ${what} in ${home}`);
   }
@@ -385,7 +384,7 @@ class Installer {
     if (!isFile(executable)) throw refuse(what, `${path.basename(file)} has no ${archive.executable.join('/')}`);
     fs.chmodSync(executable, 0o755);
     fs.writeFileSync(path.join(into, 'INSTALLATION_COMPLETE'), '');
-    writeMarker(into, { version: build.revision, hash: archive.sha256, installedAt: new Date().toISOString() });
+    writeMarker(into, { version: build.revision, hash: archive.sha256 });
     replace(path.join(base, browserFolder(build)), into, this.work);
     this.log(`installed ${what} in ${path.join(base, browserFolder(build))}`);
   }
