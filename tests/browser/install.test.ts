@@ -188,6 +188,35 @@ test("the pinned driver and its browsers install into the toolkit's data folder 
   assert.deepEqual(s.fetched.slice(fetchedOnce), ['agent-browser-1.1.1.tgz'], 'the second driver downloaded the browsers again');
 });
 
+test('two installs of the same pins write the same files, so a Docker build reuses its browser layer', async () => {
+  const s = served();
+  const trees = await Promise.all(
+    ['one', 'two'].map(async name => {
+      const home = path.join(s.root, name);
+      const env = {
+        ...s.env,
+        HOME: home,
+        XDG_DATA_HOME: path.join(home, '.local', 'share'),
+        XDG_STATE_HOME: path.join(home, '.local', 'state'),
+        AGENTLANE_STATE_DIR: path.join(home, '.local', 'state', 'agentlane'),
+      };
+      await ensureBrowserDriver('agent-browser', s.options({ env }));
+      const data = path.join(home, '.local', 'share', 'agentlane');
+      return Object.fromEntries(
+        fs
+          .readdirSync(data, { recursive: true, encoding: 'utf8' })
+          .sort()
+          .map(file => {
+            const stat = fs.statSync(path.join(data, file));
+            const content = stat.isFile() ? fs.readFileSync(path.join(data, file), 'utf8').replaceAll(data, '<data>') : '';
+            return [file.replace(/(\.links\/)[0-9a-f]{40}$/, '$1<link>'), `${(stat.mode & 0o7777).toString(8)} ${content}`];
+          }),
+      );
+    }),
+  );
+  assert.deepEqual(trees[0], trees[1]);
+});
+
 test('a download that does not match its pin is refused and leaves nothing installed', async () => {
   const s = served();
   const flipped: Fetcher = (url, file) => {

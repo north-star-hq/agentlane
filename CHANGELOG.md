@@ -2,6 +2,12 @@
 
 Newest first.
 
+## Unreleased
+
+### Added
+
+- **A Docker image, published as `ghcr.io/north-star-hq/agentlane`.** It holds agentlane, Node 24 and the pinned Playwright with Chrome for Testing and the system libraries it needs, for linux/amd64 and linux/arm64. `docker run -i --rm ghcr.io/north-star-hq/agentlane` is an MCP server over stdio. With a project mounted at `/work`, the image runs the CLI and brings the web app up in a lane inside the container, for CI jobs and cloud agents' sandboxes. It runs as a non-root user under tini, and any `--user` works. The docs' new page, Docker image, has the commands. Releases push the image from this version on.
+
 ## 0.6.1
 
 The first look or screenshot no longer fails when the XCTest runner takes over a minute to start, and a simctl timeout and a failed Maestro download now say what happened.

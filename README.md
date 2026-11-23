@@ -128,6 +128,8 @@ Claude Code's `--worktree`, the Codex app's worktrees and Cursor's worktrees eac
 
 agentlane needs Node 24 or newer, and Xcode or the Android SDK for mobile apps. It drives simulators, emulators and browsers, not physical devices. On Linux, Chrome needs system libraries that agentlane can't pin; `agentlane doctor` names any that are missing and gives the command that installs them. [Where it runs](https://north-star-hq.github.io/agentlane/docs/requirements.html) on the docs site lists what each platform needs.
 
+On Linux and in CI, the [Docker image](https://north-star-hq.github.io/agentlane/docs/docker.html) runs web lanes, the CLI and the MCP server with Node and the browser already installed.
+
 ## Security and telemetry
 
 agentlane runs on your machine. It has no account, no hosted service and no telemetry of its own.
