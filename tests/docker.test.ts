@@ -151,6 +151,8 @@ function git(dir: string, ...args: string[]) {
   assert.equal(ran.status, 0, ran.stderr.toString());
 }
 
+const REAL_GIT = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+
 function tagCheckout(version: string, tags: string[]): { runner: Runner; origin: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-publish-'));
   const origin = path.join(dir, 'origin');
@@ -172,6 +174,22 @@ function tagCheckout(version: string, tags: string[]): { runner: Runner; origin:
     { mode: 0o755 },
   );
   fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\necho "$@" >> "$RUNNER_TEMP/docker-args"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\necho "$@" >> "$RUNNER_TEMP/sleeps"\n', { mode: 0o755 });
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      'failures="$(cat "$RUNNER_TEMP/git-failures" 2>/dev/null || echo 0)"',
+      'if [ "$failures" -gt 0 ]; then',
+      '  echo $((failures - 1)) > "$RUNNER_TEMP/git-failures"',
+      '  echo "fatal: unable to access origin: Could not resolve host" >&2',
+      '  exit 128',
+      'fi',
+      `exec ${REAL_GIT} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
   const runner = {
     PATH: [bin, path.dirname(process.execPath), process.env.PATH ?? ''].join(path.delimiter),
     HOME: process.env.HOME ?? dir,
@@ -184,6 +202,7 @@ function tagCheckout(version: string, tags: string[]): { runner: Runner; origin:
 
 const BUILD = 'docker/build-push-action';
 const TAG_LATEST = 'Tag the pushed image latest if it is the highest stable version';
+const CHECK_PUSHED = 'Check the pushed image answers --version on each platform';
 
 function publishRun(version: string, tags: string[], meanwhile?: (origin: string) => void) {
   const publish = workflow('publish.yml');
@@ -207,6 +226,10 @@ function publishRun(version: string, tags: string[], meanwhile?: (origin: string
   assert.ok(
     order.indexOf(findStep(docker, 'publish', TAG_LATEST)) > order.indexOf(findStep(docker, 'publish', BUILD)),
     'latest is decided after the build has pushed the version',
+  );
+  assert.ok(
+    order.indexOf(findStep(docker, 'publish', TAG_LATEST)) > order.indexOf(findStep(docker, 'publish', CHECK_PUSHED)),
+    'latest is moved only after the pushed image has answered --version',
   );
 
   meanwhile?.(origin);
@@ -256,19 +279,65 @@ test('latest is decided from the tags as they are when the image is tagged and t
   assert.deepEqual(run, { tags: [`${IMAGE}:0.6.1`], release: ['--latest=false'] });
 });
 
+function deciders(version: string) {
+  return {
+    image: (runner: Runner) => runStep(workflow('docker.yml'), 'publish', TAG_LATEST, { inputs: { version }, steps: {} }, runner),
+    release: (runner: Runner) =>
+      runStep(
+        workflow('publish.yml'),
+        'release',
+        'Create the GitHub Release',
+        { needs: { publish: { outputs: { version } } }, github: { token: 't' } },
+        runner,
+      ),
+  };
+}
+
+function written(runner: Runner, file: string): string[] {
+  const at = path.join(runner.RUNNER_TEMP, file);
+  return fs.existsSync(at) ? fs.readFileSync(at, 'utf8').split('\n').filter(Boolean) : [];
+}
+
 test('a step that cannot read the tags fails rather than deciding latest without them', () => {
   const { runner, origin } = tagCheckout('0.5.9', [...EARLIER, 'v0.6.1', 'v0.5.9']);
   fs.rmSync(origin, { recursive: true });
-  const version = { inputs: { version: '0.5.9' }, steps: {} };
-  const release = { needs: { publish: { outputs: { version: '0.5.9' } } }, github: { token: 't' } };
-  assert.throws(
-    () => runStep(workflow('docker.yml'), 'publish', TAG_LATEST, version, runner),
-    /does not appear to be a git repository/,
-  );
-  assert.throws(
-    () => runStep(workflow('publish.yml'), 'release', 'Create the GitHub Release', release, runner),
-    /does not appear to be a git repository/,
-  );
-  assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'docker-args')), 'no image is tagged');
+  const { image, release } = deciders('0.5.9');
+  assert.throws(() => image(runner), /does not appear to be a git repository/);
+  assert.throws(() => release(runner), /does not appear to be a git repository/);
+  assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
   assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+});
+
+test('a tag read that fails once is tried again, and latest is still decided', () => {
+  const { runner } = tagCheckout('0.6.1', [...EARLIER, 'v0.6.1']);
+  const { image, release } = deciders('0.6.1');
+  for (const step of [image, release]) {
+    fs.writeFileSync(path.join(runner.RUNNER_TEMP, 'git-failures'), '1');
+    step(runner);
+  }
+  assert.deepEqual(written(runner, 'docker-args'), [`buildx imagetools create --tag ${IMAGE}:latest ${IMAGE}:0.6.1`]);
+  assert.ok(written(runner, 'gh-args').includes('--latest=true'));
+  assert.deepEqual(written(runner, 'sleeps'), ['10', '10'], 'each step paused once before trying again');
+});
+
+test('a tag read that keeps failing fails the step after three tries', () => {
+  const { runner } = tagCheckout('0.6.1', [...EARLIER, 'v0.6.1']);
+  const { image, release } = deciders('0.6.1');
+  for (const step of [image, release]) {
+    fs.writeFileSync(path.join(runner.RUNNER_TEMP, 'git-failures'), '3');
+    assert.throws(() => step(runner), /Could not read origin's v\* tags after 3 tries/);
+  }
+  assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
+  assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+});
+
+test('tags read from origin without the version fail the step rather than call it latest', () => {
+  for (const tags of [[], ['maestro-v2.11.0-agentlane.1'], ['v0.5.1', 'v0.6.0']]) {
+    const { runner } = tagCheckout('0.6.1', tags);
+    const { image, release } = deciders('0.6.1');
+    assert.throws(() => image(runner), /do not include v0\.6\.1/);
+    assert.throws(() => release(runner), /do not include v0\.6\.1/);
+    assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
+    assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+  }
 });

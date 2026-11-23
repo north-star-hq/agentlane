@@ -26,8 +26,12 @@ function between(start: string, end: string): string {
   return changelog.slice(from, changelog.indexOf(end, from)).trim() + '\n';
 }
 
+function latestRun(version: string, tags: string[]) {
+  return spawnSync(latestScript, [version], { encoding: 'utf8', input: tags.join('\n') + '\n' });
+}
+
 function latest(version: string, tags: string[]): string {
-  const run = spawnSync(latestScript, [version], { encoding: 'utf8', input: tags.join('\n') + '\n' });
+  const run = latestRun(version, tags);
   assert.equal(run.status, 0, run.stderr);
   return run.stdout;
 }
@@ -140,14 +144,27 @@ test('a stable version is Latest only when it is the highest stable tag', () => 
   assert.equal(latest('0.6.1', tags), 'true\n');
   assert.equal(latest('0.5.2', [...tags, 'v0.5.2']), 'false\n');
   assert.equal(latest('0.6.10', [...tags, 'v0.6.10']), 'true\n');
-  assert.equal(latest('0.7.0', ['v0.7.0-rc.1', ...tags]), 'true\n');
+  assert.equal(latest('0.7.0', ['v0.7.0-rc.1', ...tags, 'v0.7.0']), 'true\n');
   assert.equal(latest('0.6.1', [...tags, 'v0.10.0']), 'false\n');
-  assert.equal(latest('0.6.1', []), 'true\n');
 });
 
 test('a pre-release is never Latest', () => {
-  assert.equal(latest('0.7.0-rc.1', ['v0.6.1', 'v0.7.0-rc.1']), 'false\n');
-  assert.equal(latest('0.7.0-rc.1', []), 'false\n');
+  assert.equal(latest('0.7.0-rc.1', ['v0.6.1', 'v0.7.0-rc.1', 'v0.7.0-rc.10']), 'false\n');
+});
+
+test('Latest fails, deciding nothing, when the tags do not include the version', () => {
+  for (const [version, tags] of [
+    ['0.6.1', []],
+    ['0.6.1', ['']],
+    ['0.6.1', ['v0.5.1', 'v0.6.0', 'v0.6.1-rc.1', 'v0.6.10']],
+    ['0.7.0-rc.1', []],
+    ['0.7.0-rc.1', ['v0.6.1', 'v0.7.0-rc.10']],
+  ] as const) {
+    const run = latestRun(version, [...tags]);
+    assert.equal(run.status, 1, `${version} with [${tags.join(', ')}]: ${run.stdout}`);
+    assert.equal(run.stdout, '');
+    assert.equal(run.stderr, `The tags read do not include v${version}, so they cannot say whether it is the highest.\n`);
+  }
 });
 
 test('Latest reads the lines git ls-remote prints for the tags', () => {

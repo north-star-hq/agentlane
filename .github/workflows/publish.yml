@@ -99,7 +99,7 @@ jobs:
             exit 0
           fi
           .github/scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
-          tags="$(git ls-remote --tags --refs origin 'v*')"
+          tags="$(.github/scripts/origin-tags.sh)"
           latest="$(printf '%s\n' "$tags" | .github/scripts/release-latest.sh "$VERSION")"
           set -- --latest="$latest"
           case "$VERSION" in

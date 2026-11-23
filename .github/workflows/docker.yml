@@ -116,7 +116,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          tags="$(git ls-remote --tags --refs origin 'v*')"
+          tags="$(.github/scripts/origin-tags.sh)"
           latest="$(printf '%s\n' "$tags" | .github/scripts/release-latest.sh "$VERSION")"
           if [ "$latest" = true ]; then
             docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
