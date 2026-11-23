@@ -101,6 +101,8 @@ jobs:
           push: true
           tags: ${{ steps.version.outputs.tags }}
           build-args: VERSION=${{ inputs.version }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
           annotations: |
             index:org.opencontainers.image.source=https://github.com/north-star-hq/agentlane
             index:org.opencontainers.image.licenses=MIT
