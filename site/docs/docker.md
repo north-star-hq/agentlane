@@ -8,14 +8,14 @@ summary: "The Docker image holds agentlane, Node 24 and the browser agentlane dr
 
 | Part              | What                                                                                          |
 | ----------------- | --------------------------------------------------------------------------------------------- |
-| Base              | `node:24-trixie-slim`, Debian 13, pinned by digest                                            |
+| Base              | `node:24.22.3-trixie-slim`, Debian 13, pinned by digest                                       |
 | agentlane         | The package as npm publishes it, with its production dependencies, on the `PATH` as `agentlane` |
 | Browser           | Playwright 1.64.0 with Chrome for Testing, its headless shell and ffmpeg, as `agentlane browser install` puts them |
 | System libraries  | The ones Playwright's `install-deps chromium` installs, so `doctor`'s `browser libraries` check passes |
-| Tools             | git, `ps`, `lsof`, unzip, and pnpm through Corepack                                           |
+| Tools             | git, `ps`, `lsof`, unzip, and pnpm through Corepack, with agentlane's own pnpm version already downloaded |
 | Platforms         | linux/amd64 and linux/arm64                                                                   |
 
-The image runs `agentlane` under [tini](https://github.com/krallin/tini), which passes signals on to it and reaps the orphaned processes that dev servers and browsers leave, so `docker run` needs no `--init`. With no command it runs `agentlane mcp`. It runs as the `node` user, uid 1000, in `/work`, where you mount the project. Any other uid works too with `--user`, because every user can read the browser and each one keeps its own registry under the shared home, `/home/node`.
+The image runs `agentlane` under [tini](https://github.com/krallin/tini), which passes signals on to it and reaps the orphaned processes that dev servers and browsers leave, so `docker run` needs no `--init`. With no command it runs `agentlane mcp`. It runs as the `node` user, uid 1000, in `/work`, where you mount the project. Any other uid works too with `--user`, because every user can read the browser and write to the home, `/home/node`. agentlane keeps its registry at `/home/node/.local/state/agentlane`, readable only by the user who first runs it, so run every agentlane command in one container as the same user.
 
 ## Get the image
 
@@ -59,7 +59,7 @@ docker run --rm --init --user "$(id -u):$(id -g)" --volume "$PWD:/work" \
 - On Linux, `--user "$(id -u):$(id -g)"` lets the container write to the project, as `up`'s setup hook does when it installs dependencies. GitHub's hosted runners run as uid 1001. Docker Desktop on a Mac maps the files' owner itself and needs no `--user`.
 - The lane belongs to the shell, so it parks once the shell is gone, which here is when the container stops.
 
-The project's web services start inside the container, so they need what their `start` commands run. pnpm and npm are there; add anything else in an image of your own. agentlane's CI brings its example app up this way on amd64 and arm64, then checks `doctor` and takes a screenshot.
+The project's web services start inside the container, so they need what their `start` commands run. npm is there, and so is pnpm, which works offline at agentlane's own pnpm version and downloads any other version a project's `packageManager` names on first use. Add anything else in an image of your own. agentlane's CI brings its example app up this way on amd64 and arm64, then checks `doctor` and takes a screenshot.
 
 ## The base of an agent's sandbox
 
@@ -72,7 +72,12 @@ RUN npm install --global @anthropic-ai/claude-code
 USER node
 ```
 
-The image installs Playwright only. A project whose `agentlane.json` picks agent-browser installs it in the same file, with `RUN agentlane browser install --driver agent-browser` as `node`.
+The image installs Playwright only. A project whose `agentlane.json` picks agent-browser installs it in the same file, as `node`, and lets every user read it, so that any `--user` finds it installed:
+
+```dockerfile title="Dockerfile"
+RUN agentlane browser install --driver agent-browser \
+ && chmod -R a+rX /home/node/.local/share/agentlane
+```
 
 ## The MCP server
 
