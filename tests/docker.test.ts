@@ -44,6 +44,8 @@ test('the build context lets in every file the published package holds but dist,
 interface Step {
   id?: string;
   name?: string;
+  uses?: string;
+  with?: Record<string, unknown>;
   env?: Record<string, unknown>;
   run?: string;
 }
@@ -68,18 +70,34 @@ function workflow(name: string): Workflow {
   return parse(fs.readFileSync(path.join(ROOT, '.github', 'workflows', name), 'utf8')) as Workflow;
 }
 
+function asNumber(value: unknown): number {
+  if (value === null) return 0;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+  if (typeof value === 'number') return value;
+  if (value === '') return 0;
+  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) return Number(value);
+  return NaN;
+}
+
+// GitHub's `==`: strings compare ignoring case, and mismatched types are both coerced to numbers.
+// https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#operators
+function equals(value: unknown, literal: string): boolean {
+  if (typeof value === 'string') return value.toLowerCase() === literal.toLowerCase();
+  return asNumber(value) === asNumber(literal);
+}
+
 function lookup(expression: string, context: Context): unknown {
   const [, reference = '', literal] = /^([\w.-]+)(?: == '([^']*)')?$/.exec(expression) ?? [];
   assert.ok(reference, `the stand-in evaluates \${{ ${expression} }}`);
   let value: unknown = context;
   for (const key of reference.split('.')) value = (value as Record<string, unknown> | undefined)?.[key];
-  value ??= '';
-  return literal === undefined ? value : String(value) === literal;
+  if (literal !== undefined) return equals(value ?? null, literal);
+  return value ?? '';
 }
 
 function evaluate(value: unknown, context: Context): unknown {
   if (typeof value !== 'string') return value;
-  const whole = /^\$\{\{\s*(.*?)\s*\}\}$/.exec(value);
+  const whole = /^\$\{\{\s*([^}]*?)\s*\}\}$/.exec(value);
   if (whole) return lookup(whole[1] ?? '', context);
   return value.replace(/\$\{\{\s*(.*?)\s*\}\}/g, (_, expression: string) => String(lookup(expression, context)));
 }
@@ -88,9 +106,27 @@ function evaluateAll(values: Record<string, unknown> | undefined, context: Conte
   return Object.fromEntries(Object.entries(values ?? {}).map(([key, value]) => [key, evaluate(value, context)]));
 }
 
+test('the stand-in for ${{ }} compares as GitHub does', () => {
+  const context = { inputs: { push: true, off: false }, needs: { publish: { outputs: { latest: 'true' } } } };
+  assert.equal(lookup("inputs.push == 'true'", context), false, 'a boolean is never equal to a word');
+  assert.equal(lookup("inputs.push == '1'", context), true);
+  assert.equal(lookup("inputs.off == ''", context), true);
+  assert.equal(lookup("needs.publish.outputs.latest == 'TRUE'", context), true, 'strings compare ignoring case');
+  assert.equal(lookup("needs.publish.outputs.latest == 'false'", context), false);
+  assert.equal(lookup("inputs.missing == ''", context), true, 'a missing value is null, which is 0, as is an empty string');
+  assert.throws(() => lookup("inputs.push != 'true'", context), /the stand-in evaluates/);
+  assert.throws(() => lookup('fromJSON(inputs.push)', context), /the stand-in evaluates/);
+});
+
+function findStep(file: Workflow, job: string, step: string): Step {
+  const found = file.jobs[job]?.steps?.find(s => s.id === step || s.name === step || s.uses?.split('@')[0] === step);
+  assert.ok(found, `${job} has a step ${step}`);
+  return found;
+}
+
 function runStep(file: Workflow, job: string, step: string, context: Context, runner: Runner): Record<string, string> {
-  const found = file.jobs[job]?.steps?.find(s => s.id === step || s.name === step);
-  assert.ok(found?.run, `${job} has a run step ${step}`);
+  const found = findStep(file, job, step);
+  assert.ok(found.run, `${job}'s ${step} is a run step`);
   const output = path.join(runner.RUNNER_TEMP, 'github-output');
   fs.writeFileSync(output, '');
   const env: Record<string, string> = { ...runner, GITHUB_OUTPUT: output };
@@ -110,19 +146,26 @@ function runStep(file: Workflow, job: string, step: string, context: Context, ru
   );
 }
 
-function tagCheckout(version: string, tags: string[]): Runner {
+function git(dir: string, ...args: string[]) {
+  const ran = spawnSync('git', ['-C', dir, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args]);
+  assert.equal(ran.status, 0, ran.stderr.toString());
+}
+
+const REAL_GIT = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+
+function tagCheckout(version: string, tags: string[]): { runner: Runner; origin: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-publish-'));
+  const origin = path.join(dir, 'origin');
+  fs.mkdirSync(origin);
+  git(origin, 'init', '-q');
+  git(origin, 'commit', '-q', '--allow-empty', '-m', 'release');
+  for (const tag of tags) git(origin, 'tag', tag);
   const workspace = path.join(dir, 'workspace');
   fs.cpSync(path.join(ROOT, '.github', 'scripts'), path.join(workspace, '.github', 'scripts'), { recursive: true });
   fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({ version, description: PACKAGE.description }));
   fs.writeFileSync(path.join(workspace, 'CHANGELOG.md'), `## ${version.replace(/-.*/, '')}\n\n- Notes.\n`);
-  const git = (...args: string[]) => {
-    const ran = spawnSync('git', ['-C', workspace, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args]);
-    assert.equal(ran.status, 0, ran.stderr.toString());
-  };
-  git('init', '-q');
-  git('commit', '-q', '--allow-empty', '-m', 'release');
-  for (const tag of tags) git('tag', tag);
+  git(workspace, 'init', '-q');
+  git(workspace, 'remote', 'add', 'origin', origin);
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
   fs.writeFileSync(
@@ -130,19 +173,41 @@ function tagCheckout(version: string, tags: string[]): Runner {
     '#!/bin/sh\nif [ "$1 $2" = "release view" ]; then exit 1; fi\nprintf \'%s\\n\' "$@" > "$RUNNER_TEMP/gh-args"\n',
     { mode: 0o755 },
   );
-  return {
+  fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\necho "$@" >> "$RUNNER_TEMP/docker-args"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\necho "$@" >> "$RUNNER_TEMP/sleeps"\n', { mode: 0o755 });
+  fs.writeFileSync(
+    path.join(bin, 'git'),
+    [
+      '#!/bin/sh',
+      'failures="$(cat "$RUNNER_TEMP/git-failures" 2>/dev/null || echo 0)"',
+      'if [ "$failures" -gt 0 ]; then',
+      '  echo $((failures - 1)) > "$RUNNER_TEMP/git-failures"',
+      '  echo "fatal: unable to access origin: Could not resolve host" >&2',
+      '  exit 128',
+      'fi',
+      `exec ${REAL_GIT} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  const runner = {
     PATH: [bin, path.dirname(process.execPath), process.env.PATH ?? ''].join(path.delimiter),
     HOME: process.env.HOME ?? dir,
     GITHUB_REF_NAME: `v${version}`,
     GITHUB_WORKSPACE: workspace,
     RUNNER_TEMP: dir,
   };
+  return { runner, origin };
 }
 
-function publishRun(version: string, tags: string[]) {
+const BUILD = 'docker/build-push-action';
+const TAG_LATEST = 'Tag the pushed image latest if it is the highest stable version';
+const CHECK_PUSHED = 'Check the pushed image answers --version on each platform';
+
+function publishRun(version: string, tags: string[], meanwhile?: (origin: string) => void) {
   const publish = workflow('publish.yml');
   const docker = workflow('docker.yml');
-  const runner = tagCheckout(version, tags);
+  const { runner, origin } = tagCheckout(version, tags);
 
   const outputs = evaluateAll(publish.jobs.publish?.outputs, {
     steps: { version: { outputs: runStep(publish, 'publish', 'version', {}, runner) } },
@@ -154,7 +219,30 @@ function publishRun(version: string, tags: string[]) {
   for (const [name, value] of Object.entries(passed))
     assert.equal(typeof value, declared[name]?.type, `publish.yml passes docker.yml's ${name} as its declared type`);
   const inputs = { ...Object.fromEntries(Object.entries(declared).map(([name, d]) => [name, d.default])), ...passed };
-  const image = runStep(docker, 'publish', 'version', { inputs }, runner);
+  const steps = { version: { outputs: runStep(docker, 'publish', 'version', { inputs }, runner) } };
+  const build = evaluateAll(findStep(docker, 'publish', BUILD).with, { inputs, steps, env: docker.env });
+  const pushed = String(build.tags).split(/[,\n]/).filter(Boolean);
+  const order = docker.jobs.publish?.steps ?? [];
+  assert.ok(
+    order.indexOf(findStep(docker, 'publish', TAG_LATEST)) > order.indexOf(findStep(docker, 'publish', BUILD)),
+    'latest is decided after the build has pushed the version',
+  );
+  assert.ok(
+    order.indexOf(findStep(docker, 'publish', TAG_LATEST)) > order.indexOf(findStep(docker, 'publish', CHECK_PUSHED)),
+    'latest is moved only after the pushed image has answered --version',
+  );
+
+  meanwhile?.(origin);
+
+  runStep(docker, 'publish', TAG_LATEST, { inputs, steps }, runner);
+  const added = fs.existsSync(path.join(runner.RUNNER_TEMP, 'docker-args'))
+    ? fs.readFileSync(path.join(runner.RUNNER_TEMP, 'docker-args'), 'utf8').split('\n').filter(Boolean)
+    : [];
+  for (const line of added) {
+    const [, tag = '', source = ''] = /^buildx imagetools create --tag (\S+) (\S+)$/.exec(line) ?? [];
+    assert.ok(pushed.includes(source), `${line} tags an image the build pushed`);
+    pushed.push(tag);
+  }
 
   runStep(publish, 'release', 'Create the GitHub Release', { needs, github: { token: 't' } }, runner);
   const release = fs
@@ -163,22 +251,93 @@ function publishRun(version: string, tags: string[]) {
     .filter(arg => arg.startsWith('--latest') || arg === '--prerelease')
     .sort();
 
-  return { tags: image.tags?.split(','), release };
+  return { tags: pushed, release };
 }
 
+const IMAGE = String(workflow('docker.yml').env?.IMAGE);
+const EARLIER = ['maestro-v2.11.0-agentlane.1', 'v0.5.1', 'v0.6.0', 'v0.6.1-rc.1'];
+
 test('a published image is tagged latest, as its GitHub Release is Latest, only when it is the highest stable version', () => {
-  const image = String(workflow('docker.yml').env?.IMAGE);
-  const earlier = ['maestro-v2.11.0-agentlane.1', 'v0.5.1', 'v0.6.0', 'v0.6.1-rc.1'];
   assert.deepEqual(
     {
-      '0.6.1': publishRun('0.6.1', [...earlier, 'v0.6.1']),
-      '0.5.9 after v0.6.1': publishRun('0.5.9', [...earlier, 'v0.6.1', 'v0.5.9']),
-      '0.6.2-rc.1': publishRun('0.6.2-rc.1', [...earlier, 'v0.6.1', 'v0.6.2-rc.1']),
+      '0.6.1': publishRun('0.6.1', [...EARLIER, 'v0.6.1']),
+      '0.5.9 after v0.6.1': publishRun('0.5.9', [...EARLIER, 'v0.6.1', 'v0.5.9']),
+      '0.6.2-rc.1': publishRun('0.6.2-rc.1', [...EARLIER, 'v0.6.1', 'v0.6.2-rc.1']),
     },
     {
-      '0.6.1': { tags: [`${image}:0.6.1`, `${image}:latest`], release: ['--latest=true'] },
-      '0.5.9 after v0.6.1': { tags: [`${image}:0.5.9`], release: ['--latest=false'] },
-      '0.6.2-rc.1': { tags: [`${image}:0.6.2-rc.1`], release: ['--latest=false', '--prerelease'] },
+      '0.6.1': { tags: [`${IMAGE}:0.6.1`, `${IMAGE}:latest`], release: ['--latest=true'] },
+      '0.5.9 after v0.6.1': { tags: [`${IMAGE}:0.5.9`], release: ['--latest=false'] },
+      '0.6.2-rc.1': { tags: [`${IMAGE}:0.6.2-rc.1`], release: ['--latest=false', '--prerelease'] },
     },
   );
+});
+
+test('latest is decided from the tags as they are when the image is tagged and the Release made, not when the run began', () => {
+  const run = publishRun('0.6.1', [...EARLIER, 'v0.6.1'], origin => {
+    git(origin, 'tag', 'v0.6.2');
+  });
+  assert.deepEqual(run, { tags: [`${IMAGE}:0.6.1`], release: ['--latest=false'] });
+});
+
+function deciders(version: string) {
+  return {
+    image: (runner: Runner) => runStep(workflow('docker.yml'), 'publish', TAG_LATEST, { inputs: { version }, steps: {} }, runner),
+    release: (runner: Runner) =>
+      runStep(
+        workflow('publish.yml'),
+        'release',
+        'Create the GitHub Release',
+        { needs: { publish: { outputs: { version } } }, github: { token: 't' } },
+        runner,
+      ),
+  };
+}
+
+function written(runner: Runner, file: string): string[] {
+  const at = path.join(runner.RUNNER_TEMP, file);
+  return fs.existsSync(at) ? fs.readFileSync(at, 'utf8').split('\n').filter(Boolean) : [];
+}
+
+test('a step that cannot read the tags fails rather than deciding latest without them', () => {
+  const { runner, origin } = tagCheckout('0.5.9', [...EARLIER, 'v0.6.1', 'v0.5.9']);
+  fs.rmSync(origin, { recursive: true });
+  const { image, release } = deciders('0.5.9');
+  assert.throws(() => image(runner), /does not appear to be a git repository/);
+  assert.throws(() => release(runner), /does not appear to be a git repository/);
+  assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
+  assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+});
+
+test('a tag read that fails once is tried again, and latest is still decided', () => {
+  const { runner } = tagCheckout('0.6.1', [...EARLIER, 'v0.6.1']);
+  const { image, release } = deciders('0.6.1');
+  for (const step of [image, release]) {
+    fs.writeFileSync(path.join(runner.RUNNER_TEMP, 'git-failures'), '1');
+    step(runner);
+  }
+  assert.deepEqual(written(runner, 'docker-args'), [`buildx imagetools create --tag ${IMAGE}:latest ${IMAGE}:0.6.1`]);
+  assert.ok(written(runner, 'gh-args').includes('--latest=true'));
+  assert.deepEqual(written(runner, 'sleeps'), ['10', '10'], 'each step paused once before trying again');
+});
+
+test('a tag read that keeps failing fails the step after three tries', () => {
+  const { runner } = tagCheckout('0.6.1', [...EARLIER, 'v0.6.1']);
+  const { image, release } = deciders('0.6.1');
+  for (const step of [image, release]) {
+    fs.writeFileSync(path.join(runner.RUNNER_TEMP, 'git-failures'), '3');
+    assert.throws(() => step(runner), /Could not read origin's v\* tags after 3 tries/);
+  }
+  assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
+  assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+});
+
+test('tags read from origin without the version fail the step rather than call it latest', () => {
+  for (const tags of [[], ['maestro-v2.11.0-agentlane.1'], ['v0.5.1', 'v0.6.0']]) {
+    const { runner } = tagCheckout('0.6.1', tags);
+    const { image, release } = deciders('0.6.1');
+    assert.throws(() => image(runner), /do not include v0\.6\.1/);
+    assert.throws(() => release(runner), /do not include v0\.6\.1/);
+    assert.deepEqual(written(runner, 'docker-args'), [], 'no image is tagged');
+    assert.ok(!fs.existsSync(path.join(runner.RUNNER_TEMP, 'gh-args')), 'no Release is made');
+  }
 });

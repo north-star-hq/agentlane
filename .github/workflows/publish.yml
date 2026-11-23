@@ -20,11 +20,9 @@ jobs:
       id-token: write
     outputs:
       version: ${{ steps.version.outputs.version }}
-      latest: ${{ steps.version.outputs.latest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -41,13 +39,12 @@ jobs:
             exit 1
           fi
           case "$version" in
-            *-*) dist_tag=next latest=false ;;
-            *) dist_tag=latest latest="$(git tag -l 'v*' | .github/scripts/release-latest.sh "$version")" ;;
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
           esac
           {
             echo "version=$version"
             echo "dist_tag=$dist_tag"
-            echo "latest=$latest"
           } >> "$GITHUB_OUTPUT"
       - name: Lint
         run: pnpm run lint
@@ -81,7 +78,6 @@ jobs:
     with:
       push: true
       version: ${{ needs.publish.outputs.version }}
-      latest: ${{ needs.publish.outputs.latest == 'true' }}
 
   release:
     needs: publish
@@ -97,14 +93,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.publish.outputs.version }}
-          LATEST: ${{ needs.publish.outputs.latest }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "A Release for $GITHUB_REF_NAME already exists; leaving it as it is."
             exit 0
           fi
           .github/scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
-          set -- --latest="$LATEST"
+          tags="$(.github/scripts/origin-tags.sh)"
+          latest="$(printf '%s\n' "$tags" | .github/scripts/release-latest.sh "$VERSION")"
+          set -- --latest="$latest"
           case "$VERSION" in
             *-*) set -- "$@" --prerelease ;;
           esac
