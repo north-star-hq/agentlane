@@ -5,7 +5,8 @@ ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable pnpm
 WORKDIR /src
 COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile \
+ && node -p 'require("./package.json").packageManager' > /package-manager
 COPY . .
 RUN pnpm run build \
  && pnpm pack --out /tmp/agentlane.tgz \
@@ -17,8 +18,50 @@ WORKDIR /production
 RUN pnpm install --prod --frozen-lockfile --ignore-scripts \
  && mv node_modules /package/
 
+FROM ${NODE_IMAGE} AS browser
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends procps unzip \
+ && rm -rf /var/lib/apt/lists/*
+USER node
+RUN --mount=type=bind,from=build,source=/package,target=/opt/agentlane \
+    node /opt/agentlane/dist/cli.js browser install \
+ && chmod -R a+rX /home/node/.local/share/agentlane
+
 FROM ${NODE_IMAGE}
-ARG VERSION=0.6.1
+ARG DEBIAN_FRONTEND=noninteractive
+ENV HOME=/home/node \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git lsof procps tini unzip \
+ && rm -rf /var/lib/apt/lists/* \
+ && git config --system safe.directory '*' \
+ && corepack enable pnpm \
+ && rm -rf /tmp/node-compile-cache \
+ && ln -s /opt/agentlane/dist/cli.js /usr/local/bin/agentlane \
+ && mkdir -m 1777 /work
+
+COPY --from=browser --chown=node:node /home/node/.local/share/agentlane /home/node/.local/share/agentlane
+RUN node /home/node/.local/share/agentlane/playwright/*/package/cli.js install-deps chromium \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /home/node/.cache \
+ && chown node:node /home/node/.local /home/node/.local/share /home/node/.cache \
+ && chmod 1777 /home/node /home/node/.local /home/node/.local/share /home/node/.cache
+
+USER node
+RUN --mount=type=bind,from=build,source=/package-manager,target=/tmp/package-manager \
+    corepack install --global "$(cat /tmp/package-manager)" \
+ && pnpm --version \
+ && rm -rf /tmp/node-compile-cache \
+ && chmod 1777 /home/node/.cache/node /home/node/.cache/node/corepack /home/node/.cache/node/corepack/v1 \
+      /home/node/.cache/node/corepack/v1/pnpm
+
+COPY --from=build /package /opt/agentlane
+WORKDIR /work
+ENTRYPOINT ["/usr/bin/tini", "--", "agentlane"]
+CMD ["mcp"]
+
+ARG VERSION
 LABEL org.opencontainers.image.title="agentlane" \
       org.opencontainers.image.description="Run several AI coding agents on one machine, each with its own ports, dev servers, database and simulator, emulator or browser. Works with Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity, on web, iOS and Android." \
       org.opencontainers.image.version="${VERSION}" \
@@ -26,32 +69,3 @@ LABEL org.opencontainers.image.title="agentlane" \
       org.opencontainers.image.url="https://north-star-hq.github.io/agentlane/docs/docker.html" \
       org.opencontainers.image.documentation="https://north-star-hq.github.io/agentlane/docs/docker.html" \
       org.opencontainers.image.licenses="MIT"
-
-ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git lsof procps tini unzip \
- && rm -rf /var/lib/apt/lists/* \
- && git config --system safe.directory '*' \
- && corepack enable pnpm \
- && mkdir -m 1777 /work
-
-ENV HOME=/home/node \
-    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-
-COPY --from=build /package /opt/agentlane
-RUN ln -s /opt/agentlane/dist/cli.js /usr/local/bin/agentlane
-
-USER node
-RUN agentlane browser install --json > /tmp/browser-install.json \
- && chmod -R a+rX /home/node/.local/share/agentlane \
- && mkdir -p /home/node/.cache \
- && chmod 1777 /home/node /home/node/.local /home/node/.local/share /home/node/.cache
-
-USER root
-RUN node "$(node -p 'require("/tmp/browser-install.json").playwrightCore')/cli.js" install-deps chromium \
- && rm -rf /var/lib/apt/lists/* /tmp/browser-install.json
-
-USER node
-WORKDIR /work
-ENTRYPOINT ["/usr/bin/tini", "--", "agentlane"]
-CMD ["mcp"]

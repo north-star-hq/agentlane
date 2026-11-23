@@ -38,7 +38,7 @@ jobs:
         with:
           node-version-file: .nvmrc
       - name: Build the image
-        run: docker build --tag agentlane:ci .
+        run: docker build --build-arg VERSION="$(node -p 'require("./package.json").version')" --tag agentlane:ci .
       - name: Record the image's size
         run: docker image ls agentlane:ci --format 'agentlane:ci (${{ matrix.arch }}) is {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Check --version, the user, and the MCP server's tools over docker run -i
