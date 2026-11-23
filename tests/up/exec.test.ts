@@ -100,6 +100,10 @@ function lastUsedAt(lane: HeldLane): number | undefined {
 
 const STUBBORN = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
 
+function stubbornWritingPid(file: string): string {
+  return `${STUBBORN} require('fs').writeFileSync(${JSON.stringify(file)}, String(process.pid));`;
+}
+
 const TREE = `pids=$1
 sleep 300 &
 echo $! >> "$pids"
@@ -223,7 +227,7 @@ test('a command that ignores SIGTERM gets SIGKILL once the grace is over, and ex
       heartbeatMs: 20,
       log: line => lines.push(line),
     }),
-    [process.execPath, '-e', `${STUBBORN} require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`],
+    [process.execPath, '-e', stubbornWritingPid(pidFile)],
   );
   killLeftovers(t, () => recordedPids(pidFile));
   await until(() => recordedPids(pidFile).length === 1, 20_000);
@@ -248,16 +252,18 @@ test(
   LIMIT,
   async t => {
     const lane = await heldLane();
-    const pids = path.join(lane.worktree, 'pids');
+    const stubbornPid = path.join(lane.worktree, 'stubborn-pid');
+    const shellPid = path.join(lane.worktree, 'shell-pid');
     let gone = false;
     const graceMs = 2000;
     const running = execInLane(
       deps(lane, { parentPid: () => (gone ? 1 : process.ppid), callerPollMs: 20, stopGraceMs: graceMs }),
-      ['/bin/sh', '-c', '"$1" -e "$2" & echo $! > "$3"; echo $$ >> "$3"; wait', 'sh', process.execPath, STUBBORN, pids],
+      ['/bin/sh', '-c', '"$1" -e "$2" & echo $$ > "$3"; wait', 'sh', process.execPath, stubbornWritingPid(stubbornPid), shellPid],
     );
-    killLeftovers(t, () => recordedPids(pids));
-    await until(() => recordedPids(pids).length === 2, 20_000);
-    const [stubborn = 0, shell = 0] = recordedPids(pids);
+    killLeftovers(t, () => [...recordedPids(stubbornPid), ...recordedPids(shellPid)]);
+    await until(() => recordedPids(stubbornPid).length === 1 && recordedPids(shellPid).length === 1, 20_000);
+    const [stubborn = 0] = recordedPids(stubbornPid);
+    const [shell = 0] = recordedPids(shellPid);
 
     gone = true;
     await until(() => !alive(shell), graceMs - 500);
