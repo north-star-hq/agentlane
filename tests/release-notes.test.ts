@@ -144,3 +144,14 @@ test('a stable version is Latest only when it is the highest stable tag', () => 
   assert.equal(latest('0.6.1', [...tags, 'v0.10.0']), 'false\n');
   assert.equal(latest('0.6.1', []), 'true\n');
 });
+
+test('a pre-release is never Latest', () => {
+  assert.equal(latest('0.7.0-rc.1', ['v0.6.1', 'v0.7.0-rc.1']), 'false\n');
+  assert.equal(latest('0.7.0-rc.1', []), 'false\n');
+});
+
+test('Latest reads the lines git ls-remote prints for the tags', () => {
+  const lines = (...tags: string[]) => tags.map((tag, i) => `${String(i).padStart(40, '0')}\trefs/tags/${tag}`);
+  assert.equal(latest('0.6.1', lines('v0.5.1', 'v0.6.1')), 'true\n');
+  assert.equal(latest('0.5.9', lines('v0.5.9', 'v0.6.1')), 'false\n');
+});
