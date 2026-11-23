@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { parse } from 'yaml';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PACKAGE = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
@@ -36,4 +39,146 @@ test('the build context lets in every file the published package holds but dist,
   assert.ok(!allowed.includes('dist'), '.dockerignore keeps a local dist out of the build');
   for (const entry of PACKAGE.files.filter(f => f !== 'dist'))
     assert.ok(allowed.includes(entry), `.dockerignore lets in ${entry}`);
+});
+
+interface Step {
+  id?: string;
+  name?: string;
+  env?: Record<string, unknown>;
+  run?: string;
+}
+
+interface Workflow {
+  on: { workflow_call?: { inputs: Record<string, { type: string; default?: unknown }> } };
+  env?: Record<string, unknown>;
+  jobs: Record<string, { outputs?: Record<string, unknown>; with?: Record<string, unknown>; steps?: Step[] }>;
+}
+
+type Context = Record<string, unknown>;
+
+interface Runner {
+  PATH: string;
+  HOME: string;
+  GITHUB_REF_NAME: string;
+  GITHUB_WORKSPACE: string;
+  RUNNER_TEMP: string;
+}
+
+function workflow(name: string): Workflow {
+  return parse(fs.readFileSync(path.join(ROOT, '.github', 'workflows', name), 'utf8')) as Workflow;
+}
+
+function lookup(expression: string, context: Context): unknown {
+  const [, reference = '', literal] = /^([\w.-]+)(?: == '([^']*)')?$/.exec(expression) ?? [];
+  assert.ok(reference, `the stand-in evaluates \${{ ${expression} }}`);
+  let value: unknown = context;
+  for (const key of reference.split('.')) value = (value as Record<string, unknown> | undefined)?.[key];
+  value ??= '';
+  return literal === undefined ? value : String(value) === literal;
+}
+
+function evaluate(value: unknown, context: Context): unknown {
+  if (typeof value !== 'string') return value;
+  const whole = /^\$\{\{\s*(.*?)\s*\}\}$/.exec(value);
+  if (whole) return lookup(whole[1] ?? '', context);
+  return value.replace(/\$\{\{\s*(.*?)\s*\}\}/g, (_, expression: string) => String(lookup(expression, context)));
+}
+
+function evaluateAll(values: Record<string, unknown> | undefined, context: Context): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(values ?? {}).map(([key, value]) => [key, evaluate(value, context)]));
+}
+
+function runStep(file: Workflow, job: string, step: string, context: Context, runner: Runner): Record<string, string> {
+  const found = file.jobs[job]?.steps?.find(s => s.id === step || s.name === step);
+  assert.ok(found?.run, `${job} has a run step ${step}`);
+  const output = path.join(runner.RUNNER_TEMP, 'github-output');
+  fs.writeFileSync(output, '');
+  const env: Record<string, string> = { ...runner, GITHUB_OUTPUT: output };
+  for (const [name, value] of Object.entries(evaluateAll({ ...file.env, ...found.env }, context))) env[name] = String(value);
+  const run = spawnSync('bash', ['-e', '-c', String(evaluate(found.run, context))], {
+    cwd: runner.GITHUB_WORKSPACE,
+    encoding: 'utf8',
+    env,
+  });
+  assert.equal(run.status, 0, `${job}'s ${step}: ${run.stdout}${run.stderr}`);
+  return Object.fromEntries(
+    fs
+      .readFileSync(output, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line): [string, string] => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+  );
+}
+
+function tagCheckout(version: string, tags: string[]): Runner {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentlane-publish-'));
+  const workspace = path.join(dir, 'workspace');
+  fs.cpSync(path.join(ROOT, '.github', 'scripts'), path.join(workspace, '.github', 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({ version, description: PACKAGE.description }));
+  fs.writeFileSync(path.join(workspace, 'CHANGELOG.md'), `## ${version.replace(/-.*/, '')}\n\n- Notes.\n`);
+  const git = (...args: string[]) => {
+    const ran = spawnSync('git', ['-C', workspace, '-c', 'user.email=t@example.com', '-c', 'user.name=t', ...args]);
+    assert.equal(ran.status, 0, ran.stderr.toString());
+  };
+  git('init', '-q');
+  git('commit', '-q', '--allow-empty', '-m', 'release');
+  for (const tag of tags) git('tag', tag);
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(
+    path.join(bin, 'gh'),
+    '#!/bin/sh\nif [ "$1 $2" = "release view" ]; then exit 1; fi\nprintf \'%s\\n\' "$@" > "$RUNNER_TEMP/gh-args"\n',
+    { mode: 0o755 },
+  );
+  return {
+    PATH: [bin, path.dirname(process.execPath), process.env.PATH ?? ''].join(path.delimiter),
+    HOME: process.env.HOME ?? dir,
+    GITHUB_REF_NAME: `v${version}`,
+    GITHUB_WORKSPACE: workspace,
+    RUNNER_TEMP: dir,
+  };
+}
+
+function publishRun(version: string, tags: string[]) {
+  const publish = workflow('publish.yml');
+  const docker = workflow('docker.yml');
+  const runner = tagCheckout(version, tags);
+
+  const outputs = evaluateAll(publish.jobs.publish?.outputs, {
+    steps: { version: { outputs: runStep(publish, 'publish', 'version', {}, runner) } },
+  });
+  const needs = { publish: { outputs } };
+
+  const declared = docker.on.workflow_call?.inputs ?? {};
+  const passed = evaluateAll(publish.jobs.docker?.with, { needs });
+  for (const [name, value] of Object.entries(passed))
+    assert.equal(typeof value, declared[name]?.type, `publish.yml passes docker.yml's ${name} as its declared type`);
+  const inputs = { ...Object.fromEntries(Object.entries(declared).map(([name, d]) => [name, d.default])), ...passed };
+  const image = runStep(docker, 'publish', 'version', { inputs }, runner);
+
+  runStep(publish, 'release', 'Create the GitHub Release', { needs, github: { token: 't' } }, runner);
+  const release = fs
+    .readFileSync(path.join(runner.RUNNER_TEMP, 'gh-args'), 'utf8')
+    .split('\n')
+    .filter(arg => arg.startsWith('--latest') || arg === '--prerelease')
+    .sort();
+
+  return { tags: image.tags?.split(','), release };
+}
+
+test('a published image is tagged latest, as its GitHub Release is Latest, only when it is the highest stable version', () => {
+  const image = String(workflow('docker.yml').env?.IMAGE);
+  const earlier = ['maestro-v2.11.0-agentlane.1', 'v0.5.1', 'v0.6.0', 'v0.6.1-rc.1'];
+  assert.deepEqual(
+    {
+      '0.6.1': publishRun('0.6.1', [...earlier, 'v0.6.1']),
+      '0.5.9 after v0.6.1': publishRun('0.5.9', [...earlier, 'v0.6.1', 'v0.5.9']),
+      '0.6.2-rc.1': publishRun('0.6.2-rc.1', [...earlier, 'v0.6.1', 'v0.6.2-rc.1']),
+    },
+    {
+      '0.6.1': { tags: [`${image}:0.6.1`, `${image}:latest`], release: ['--latest=true'] },
+      '0.5.9 after v0.6.1': { tags: [`${image}:0.5.9`], release: ['--latest=false'] },
+      '0.6.2-rc.1': { tags: [`${image}:0.6.2-rc.1`], release: ['--latest=false', '--prerelease'] },
+    },
+  );
 });

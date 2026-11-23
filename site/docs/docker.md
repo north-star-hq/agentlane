@@ -19,7 +19,7 @@ The image runs `agentlane` under [tini](https://github.com/krallin/tini), which 
 
 ## Get the image
 
-The image is published to GitHub's container registry as `ghcr.io/north-star-hq/agentlane` from 0.6.2 onwards, tagged with each version and with `latest` for the newest release:
+The image is published to GitHub's container registry as `ghcr.io/north-star-hq/agentlane` from 0.6.2 onwards, tagged with each version and with `latest` for the highest stable version:
 
 ```sh
 docker pull ghcr.io/north-star-hq/agentlane:latest
