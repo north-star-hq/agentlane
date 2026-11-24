@@ -2,7 +2,7 @@
 
 Newest first.
 
-## Unreleased
+## 0.6.2
 
 ### Added
 
