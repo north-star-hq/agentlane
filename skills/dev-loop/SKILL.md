@@ -58,7 +58,15 @@ Its `features/` folder is the feature map: a README with the baseline every page
 
 ## What counts as proof <!-- upstream: pstack-create-verification-skill -->
 
+Proof comes from the place where a user meets the change: a screen, a command, a request. An internal function is not that place. Something calls it, and that caller ends at a screen, a command or a request, so follow it there. A test or script that never starts the app (a unit test, a call straight into a module, a harness that stubs the code around it) shows that one piece does what it was written to do. A flow breaks where pieces join, and only the running app joins them.
+
 Exercise the real user path. A seam may set up a precondition, such as a signed-in session, but never stands in for the behavior under test. Capture the action and the resulting state, not only the final screen, and read side effects back (rows written, files saved, messages sent) alongside what's visible. Mock only where a production boundary already isolates the outside system. When the safe path is a dry run or test mode, observe what it actually skips instead of trusting its name.
+
+When the claim is about what a user sees or does, read your steps back before you run them. If none of them starts the app and drives it, you have planned a second run of the checks CI already runs. Add the step that reaches the place a user meets the change, or report that you can't and what stops you.
+
+Seeing the change do what was claimed is the first half. Then push on it by hand in the same place, with the cases this change points at and no others: an empty or malformed value, the action done twice, an interruption halfway through, stale state underneath, the neighbouring case it didn't touch. Only a probe that breaks something needs writing down as a flow. Say what held as well as what broke, since a bare pass doesn't show what was tried.
+
+Say which of three things happened. You ran the app and the change did what it should where a user meets it. You ran it and it didn't, or something else broke. Or you couldn't get the app to a state where the change shows, which says nothing about the change: call it unverified and name where it stopped. A claim with one part still failing has failed. Output you can't read either way counts as a failure, with the capture attached, because calling a broken change working costs far more than a second look.
 
 Proof is an assertion the next reader can replay: a committed flow, test or script run through the project's own runner (Maestro flows for the mobile app, the project's Playwright tests for the web app), with the artifacts it writes. Interactive probing (`look`, the driver's CLI, a REPL, a one-off request) is how you find the steps, and its output never stands in for that run.
 
