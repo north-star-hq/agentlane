@@ -1,6 +1,6 @@
 {
   "name": "agentlane",
-  "version": "0.6.3-rc.1",
+  "version": "0.6.3",
   "description": "Run several AI coding agents on one machine, each with its own ports, dev servers, database and simulator, emulator or browser. Works with Claude Code, Codex, Cursor, GitHub Copilot, Gemini CLI and Antigravity, on web, iOS and Android.",
   "keywords": [
     "ai-agents",
