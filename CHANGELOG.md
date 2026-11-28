@@ -2,6 +2,12 @@
 
 Newest first.
 
+## Unreleased
+
+### Changed
+
+- **The dev-loop skill says where proof comes from.** Its "What counts as proof" section now sends an agent to the place a user meets the change (a screen, a command, a request), has it read its steps back before running them, probe around the change by hand, and report whether the change worked, failed or could not be reached. A test that never starts the app no longer reads as proof of what a user sees.
+
 ## 0.6.2
 
 ### Added
